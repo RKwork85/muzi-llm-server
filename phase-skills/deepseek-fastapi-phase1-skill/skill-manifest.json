@@ -1,0 +1,25 @@
+{
+  "name": "deepseek-fastapi-phase1",
+  "version": "1.0.0",
+  "created_date": "2026-11-06",
+  "language": "zh-CN",
+  "target": "Cursor Agent",
+  "phase": 1,
+  "scope": [
+    "DeepSeek Chat Completions",
+    "Async Provider",
+    "SSE streaming",
+    "Prompt management",
+    "Function Calling",
+    "error handling",
+    "pytest"
+  ],
+  "excluded": [
+    "DeepSeek Harness",
+    "MCP",
+    "RAG",
+    "Multi-Agent",
+    "Redis/RQ",
+    "long-term memory"
+  ]
+}
