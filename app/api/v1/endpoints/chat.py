@@ -24,6 +24,7 @@ from app.schemas.chat import (
     ToolCallRequest,
 )
 from app.services.chat_service import ChatService
+from app.tools.workspace_scope import scope_dirname
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -111,10 +112,14 @@ async def stream_completion(
     """
     if body.stream is False:
         raise InvalidRequestError("该接口只提供流式输出")
-    prepared = service.prepare_chat(body)
+    prepared = service.prepare_stream(body)
     service.ensure_ready()
     return StreamingResponse(
-        service.iter_sse(prepared, request.is_disconnected),
+        service.iter_sse(
+            prepared,
+            request.is_disconnected,
+            scope_dirname(request.headers.get("x-workspace-key")),
+        ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",

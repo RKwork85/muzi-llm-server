@@ -99,6 +99,7 @@ def parse_stream_chunk(chunk: Any) -> StreamChunk | None:
     content = None
     reasoning = None
     finish = None
+    tool_parts: list[tuple[int, str | None, str | None, str | None]] = []
     if choices:
         choice = choices[0]
         finish_reason = read_field(choice, "finish_reason")
@@ -109,7 +110,8 @@ def parse_stream_chunk(chunk: Any) -> StreamChunk | None:
             raw_reasoning = read_field(delta, "reasoning_content")
             content = raw_content if isinstance(raw_content, str) else None
             reasoning = raw_reasoning if isinstance(raw_reasoning, str) else None
-    if content is None and reasoning is None and finish is None and usage is None:
+            tool_parts = _parse_tool_parts(delta)
+    if content is None and reasoning is None and finish is None and usage is None and not tool_parts:
         return None
     model = read_field(chunk, "model")
     chunk_id = read_field(chunk, "id")
@@ -120,4 +122,29 @@ def parse_stream_chunk(chunk: Any) -> StreamChunk | None:
         usage=usage,
         model=str(model) if model else None,
         id=str(chunk_id) if chunk_id else None,
+        tool_call_parts=tool_parts or None,
     )
+
+
+def _parse_tool_parts(delta: Any) -> list[tuple[int, str | None, str | None, str | None]]:
+    raw_calls = read_field(delta, "tool_calls")
+    if not raw_calls:
+        return []
+    parts: list[tuple[int, str | None, str | None, str | None]] = []
+    for raw in list(raw_calls):
+        index = read_field(raw, "index")
+        if not isinstance(index, int):
+            index = 0
+        function = read_field(raw, "function")
+        call_id = read_field(raw, "id")
+        name = read_field(function, "name") if function is not None else None
+        arguments = read_field(function, "arguments") if function is not None else None
+        parts.append(
+            (
+                index,
+                call_id if isinstance(call_id, str) and call_id else None,
+                name if isinstance(name, str) and name else None,
+                arguments if isinstance(arguments, str) and arguments else None,
+            )
+        )
+    return parts

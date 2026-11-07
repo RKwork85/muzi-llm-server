@@ -23,6 +23,7 @@ from app.tools.file_tools import (
 from app.tools.registry import build_agent_registry, build_default_registry
 from app.tools.web_client import CURRENT_TOOL_BUDGET
 from app.tools.web_tools import CURRENT_SETTINGS
+from app.tools.workspace_scope import CURRENT_WORKSPACE_SCOPE, scope_dirname
 from tests.conftest import make_settings
 from tests.fakes import FakeProvider, make_result, make_tool_call
 
@@ -184,8 +185,51 @@ def test_symlink_escape_or_equivalent(tmp_path) -> None:
         _unbind(token)
 
 
+def test_users_do_not_share_one_workspace(tmp_path) -> None:
+    (tmp_path / "shared.txt").write_text("shared-secret", encoding="utf-8")
+    key_a = "a" * 43
+    key_b = "b" * 43
+    user_a = tmp_path / scope_dirname(key_a)
+    user_a.mkdir()
+    (user_a / "mine.txt").write_text("only-a", encoding="utf-8")
+    settings_token = CURRENT_SETTINGS.set(make_settings(tools_workspace_root=str(tmp_path)))
+    try:
+        scope_token = CURRENT_WORKSPACE_SCOPE.set(scope_dirname(key_a))
+        try:
+            listed = json.loads(list_directory(ListArgs()))
+            assert {item["name"] for item in listed["entries"]} == {"mine.txt"}
+            assert "shared-secret" not in json.dumps(listed)
+        finally:
+            CURRENT_WORKSPACE_SCOPE.reset(scope_token)
+        scope_token = CURRENT_WORKSPACE_SCOPE.set(scope_dirname(key_b))
+        try:
+            other = json.loads(list_directory(ListArgs()))
+            assert other["entries"] == []
+            stolen = json.loads(
+                read_text_file(ReadArgs(path="../" + scope_dirname(key_a) + "/mine.txt"))
+            )
+            assert stolen["error"]["code"] == "file_unavailable"
+            assert "only-a" not in json.dumps(stolen)
+        finally:
+            CURRENT_WORKSPACE_SCOPE.reset(scope_token)
+        scope_token = CURRENT_WORKSPACE_SCOPE.set(scope_dirname("../" + "a" * 41))
+        try:
+            blocked = json.loads(list_directory(ListArgs()))
+            assert blocked["error"]["code"] == "file_unavailable"
+            assert "shared-secret" not in json.dumps(blocked)
+            assert not (tmp_path / "-").exists()
+        finally:
+            CURRENT_WORKSPACE_SCOPE.reset(scope_token)
+    finally:
+        CURRENT_SETTINGS.reset(settings_token)
+
+
 def test_workspace_round_trip_hides_absolute_path(tmp_path) -> None:
-    (tmp_path / "note.txt").write_text("hello-file\n", encoding="utf-8")
+    key = "c" * 43
+    user_dir = tmp_path / scope_dirname(key)
+    user_dir.mkdir()
+    (user_dir / "note.txt").write_text("hello-file\n", encoding="utf-8")
+    (tmp_path / "secret.txt").write_text("PARENTSECRET", encoding="utf-8")
     provider = FakeProvider()
     provider.push(
         make_result(
@@ -199,6 +243,7 @@ def test_workspace_round_trip_hides_absolute_path(tmp_path) -> None:
     with TestClient(app) as http:
         created = http.post(
             "/api/v1/agents/runs",
+            headers={"X-Workspace-Key": key},
             json={"message": "读取 note.txt", "prompt_name": "default", "toolsets": ["workspace"]},
         )
         task_id = created.json()["task_id"]
@@ -212,6 +257,7 @@ def test_workspace_round_trip_hides_absolute_path(tmp_path) -> None:
     assert finished["status"] == "completed"
     rendered = json.dumps([call.messages for call in provider.calls], ensure_ascii=False)
     assert "hello-file" in rendered
+    assert "PARENTSECRET" not in rendered
     assert str(tmp_path) not in rendered
     assert str(ROOT) not in rendered
     assert "不是指令" in provider.calls[0].messages[0]["content"]

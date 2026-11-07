@@ -43,8 +43,8 @@ def _request(payload: dict[str, object] | None = None):
 
 def test_default_policy_matches_documented_limits() -> None:
     policy = default_server_policy(build_default_registry())
-    assert policy.max_steps == DEFAULT_MAX_STEPS == 4
-    assert policy.max_tool_calls == DEFAULT_MAX_TOOL_CALLS == 3
+    assert policy.max_steps == DEFAULT_MAX_STEPS == 11
+    assert policy.max_tool_calls == DEFAULT_MAX_TOOL_CALLS == 10
     assert policy.max_tool_calls_per_step == DEFAULT_MAX_TOOL_CALLS_PER_STEP == 3
     assert policy.max_wall_time_seconds == DEFAULT_MAX_WALL_TIME_SECONDS == 30
     assert policy.model_timeout_seconds == DEFAULT_MODEL_TIMEOUT_SECONDS == 60
@@ -67,7 +67,7 @@ def test_settings_policy_uses_phase1_ceilings() -> None:
     assert policy.model_timeout_seconds == 5
     assert policy.tool_timeout_seconds == 0.2
     assert policy.max_tool_result_chars == 1000
-    assert policy.max_steps == 4
+    assert policy.max_steps == 11
     view = registered_tool_view(build_default_registry().get("calculator"))
     assert view.enabled is True
     assert view.risk_level == "low"

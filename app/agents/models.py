@@ -86,7 +86,22 @@ class AgentRequest(BaseModel):
     prompt_name: str = Field(pattern=r"^[A-Za-z0-9_-]{1,64}$")
     allowed_tools: list[str] | None = Field(default=None, max_length=16)
     toolsets: list[str] | None = Field(default=None, max_length=4)
+    grants: list[Literal["write_file", "delete_file", "run_command"]] | None = Field(
+        default=None,
+        max_length=3,
+    )
     policy: RequestedPolicy | None = None
+
+    @field_validator("grants")
+    @classmethod
+    def _check_grants(
+        cls, value: list[Literal["write_file", "delete_file", "run_command"]] | None
+    ) -> list[str] | None:
+        if value is None:
+            return None
+        if len(value) != len(set(value)):
+            raise ValueError("grants 重复")
+        return list(value)
 
     @field_validator("toolsets")
     @classmethod

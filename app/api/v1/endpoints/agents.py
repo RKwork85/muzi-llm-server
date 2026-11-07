@@ -15,6 +15,7 @@ from app.core.context import get_request_id
 from app.core.exceptions import AgentTaskNotFoundError
 from app.core.sse import format_sse
 from app.schemas.agents import AgentTaskResponse
+from app.tools.workspace_scope import scope_dirname
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -32,9 +33,14 @@ _TERMINAL_EVENTS = frozenset(
 @router.post("/runs", response_model=AgentTaskResponse, summary="创建 Agent 运行")
 async def create_run(
     body: AgentRequest,
+    request: Request,
     runtime: AgentRuntime = Depends(get_agent_runtime),
 ) -> AgentTaskResponse:
-    view = await runtime.start(body, get_request_id())
+    view = await runtime.start(
+        body,
+        get_request_id(),
+        workspace_scope=scope_dirname(request.headers.get("x-workspace-key")),
+    )
     return AgentTaskResponse.model_validate(view)
 
 

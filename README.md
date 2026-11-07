@@ -1,5 +1,3 @@
-# qs_llm_dp
-
 DeepSeek 接入服务。代码版本见 `app/__init__.py`，当前是 `0.1.0`。
 
 它提供两条互不调用的路径：
@@ -50,8 +48,8 @@ Copy-Item .env.example .env
 | `DEEPSEEK_MAX_RETRIES` | 只对超时、连接失败和 5xx 重试 | `2` |
 | `DEEPSEEK_THINKING` | `enabled` 或 `disabled`。本服务默认显式关闭 | `disabled` |
 | `EXPOSE_REASONING` | 是否把思维链返回给客户端 | `false` |
-| `MAX_TOOL_ROUNDS` | 对话接口默认可执行的工具轮数 | `3` |
-| `TOOL_ROUND_HARD_LIMIT` | 对话接口轮数硬上限，最大 5 | `5` |
+| `MAX_TOOL_ROUNDS` | 对话接口默认可执行的工具轮数 | `10` |
+| `TOOL_ROUND_HARD_LIMIT` | 对话接口轮数硬上限，最大 10 | `10` |
 | `TOOL_TIMEOUT_SECONDS` | 第一阶段单个工具超时 | `2` |
 | `TOOL_RESULT_MAX_CHARS` | 回传给模型的工具结果长度上限 | `4000` |
 | `REQUIRE_API_KEY_ON_STARTUP` | 为 `true` 且没有 Key 时拒绝加载配置 | `false` |

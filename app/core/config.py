@@ -70,8 +70,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     require_api_key_on_startup: bool = False
     expose_reasoning: bool = False
-    max_tool_rounds: int = 3
-    tool_round_hard_limit: int = 5
+    max_tool_rounds: int = 10
+    tool_round_hard_limit: int = 10
     tool_timeout_seconds: float = Field(default=2, gt=0, le=30)
     tool_result_max_chars: int = Field(default=4000, ge=96, le=20000)
     agent_max_active_tasks: int = Field(default=8, ge=1, le=32)
@@ -80,6 +80,8 @@ class Settings(BaseSettings):
     agent_cancel_cleanup_seconds: float = Field(default=2, gt=0, le=30)
     tools_network_enabled: bool = False
     tools_workspace_root: str = ""
+    tools_sandbox_commands: str = ""
+    tools_sandbox_timeout_seconds: float = Field(default=10, gt=0, le=20)
     tools_network_concurrency: int = Field(default=4, ge=1, le=8)
     agent_max_artifacts: int = Field(default=5, ge=1, le=8)
     agent_max_artifact_chars: int = Field(default=20000, ge=256, le=20000)
@@ -91,8 +93,8 @@ class Settings(BaseSettings):
     web_fetch_allowed_domains: str = ""
     web_fetch_denied_domains: str = ""
     web_fetch_block_credential_query: bool = True
-    web_search_max_calls: int = Field(default=5, ge=1, le=8)
-    web_fetch_max_calls: int = Field(default=5, ge=1, le=8)
+    web_search_max_calls: int = Field(default=10, ge=1, le=10)
+    web_fetch_max_calls: int = Field(default=10, ge=1, le=10)
     data_store_root: str = "data_store"
     data_file_ttl_seconds: float = Field(default=3600, ge=60, le=86400)
     data_download_ttl_seconds: float = Field(default=600, ge=30, le=3600)
@@ -105,6 +107,27 @@ class Settings(BaseSettings):
     oss_upload_base_url: str = ""
     oss_upload_prefix: str = "agent-data"
     oss_upload_timeout_seconds: float = Field(default=20, gt=0, le=30)
+    # 数据库只服务本进程。地址来自环境变量，业务代码不写死主机名。
+    postgres_host: str = "127.0.0.1"
+    postgres_port: int = Field(default=5432, ge=1, le=65535)
+    postgres_db: str = "muzi_llm"
+    postgres_user: str = "muzi_admin"
+    postgres_password: str = Field(default="", repr=False)
+    redis_host: str = "127.0.0.1"
+    redis_port: int = Field(default=6379, ge=1, le=65535)
+    redis_db: int = Field(default=0, ge=0, le=15)
+    redis_password: str = Field(default="", repr=False)
+    database_startup_required: bool = False
+    db_pool_size: int = Field(default=5, ge=1, le=20)
+    db_max_overflow: int = Field(default=10, ge=0, le=40)
+    db_pool_timeout_seconds: float = Field(default=30, gt=0, le=120)
+    db_pool_recycle_seconds: int = Field(default=1800, ge=60, le=7200)
+    db_connect_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    db_command_timeout_seconds: float = Field(default=30, gt=0, le=120)
+    db_startup_attempts: int = Field(default=5, ge=1, le=10)
+    db_startup_retry_seconds: float = Field(default=0.5, ge=0, le=10)
+    redis_socket_timeout_seconds: float = Field(default=5, gt=0, le=30)
+    redis_max_connections: int = Field(default=20, ge=1, le=100)
 
     @field_validator("deepseek_base_url")
     @classmethod
@@ -137,6 +160,24 @@ class Settings(BaseSettings):
             raise ValueError("OSS_UPLOAD_PREFIX 不合法")
         return cleaned
 
+    @field_validator("postgres_host", "redis_host")
+    @classmethod
+    def _database_host(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned or "://" in cleaned or "@" in cleaned or "/" in cleaned:
+            raise ValueError("数据库主机必须是主机名或 IP，不能包含凭证")
+        return cleaned
+
+    @field_validator("postgres_db", "postgres_user")
+    @classmethod
+    def _database_identifier(cls, value: str) -> str:
+        import re
+
+        cleaned = value.strip()
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", cleaned) is None:
+            raise ValueError("数据库名称或用户名不合法")
+        return cleaned
+
     @field_validator("log_level")
     @classmethod
     def _normalize_log_level(cls, value: str) -> str:
@@ -162,10 +203,15 @@ class Settings(BaseSettings):
             raise ValueError("DEEPSEEK_MODEL_ALLOWLIST 不能为空")
         if self.deepseek_model not in allowlist:
             raise ValueError("默认模型不在 DEEPSEEK_MODEL_ALLOWLIST 中")
-        if not 1 <= self.tool_round_hard_limit <= 5:
-            raise ValueError("工具轮数硬上限必须在 1 到 5 之间")
+        if not 1 <= self.tool_round_hard_limit <= 10:
+            raise ValueError("工具轮数硬上限必须在 1 到 10 之间")
         if not 1 <= self.max_tool_rounds <= self.tool_round_hard_limit:
             raise ValueError("MAX_TOOL_ROUNDS 超出允许范围")
+        if self.database_startup_required:
+            if len(self.postgres_password) < 12:
+                raise ValueError("POSTGRES_PASSWORD 未配置或过短")
+            if len(self.redis_password) < 12:
+                raise ValueError("REDIS_PASSWORD 未配置或过短")
         return self
 
     def model_allowlist(self) -> list[str]:

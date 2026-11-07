@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import re
@@ -20,6 +21,7 @@ from app.core.exceptions import (
 )
 from app.providers.base import ToolCall
 from app.tools.registry import ToolRegistry, ToolSpec
+from app.tools.web_client import WebCallError
 
 logger = logging.getLogger("qs_llm")
 _CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -40,20 +42,28 @@ class ToolService:
                 specs.append(spec)
         return [spec.openai_schema() for spec in specs]
 
-    async def execute(self, calls: list[ToolCall]) -> list[dict[str, str]]:
+    async def execute(
+        self,
+        calls: list[ToolCall],
+        *,
+        allowed: frozenset[str] | None = None,
+    ) -> list[dict[str, str]]:
         if not calls or len(calls) > 5:
             raise InvalidModelResponseError()
-        validated = [self._validate(call) for call in calls]
-        messages: list[dict[str, str]] = []
-        for call, spec, args in validated:
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": call.id,
-                    "content": await self._run(spec, args),
-                }
-            )
-        return messages
+        validated = []
+        for call in calls:
+            item = self._validate(call)
+            if allowed is not None and item[1].name not in allowed:
+                raise ToolNotAllowedError()
+            validated.append(item)
+        async def run_one(call: ToolCall, spec: ToolSpec, args: Any) -> dict[str, str]:
+            return {
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": await self._run(spec, args),
+            }
+
+        return list(await asyncio.gather(*(run_one(call, spec, args) for call, spec, args in validated)))
 
     def _allowed(self, name: str) -> ToolSpec:
         spec = self.registry.get(name)
@@ -78,11 +88,14 @@ class ToolService:
         return call, spec, args
 
     async def _run(self, spec: ToolSpec, args: Any) -> str:
+        timeout = spec.timeout_s if spec.timeout_s is not None else self._settings.tool_timeout_seconds
         try:
-            raw = await asyncio.wait_for(
-                asyncio.to_thread(spec.handler, args),
-                timeout=self._settings.tool_timeout_seconds,
-            )
+            if inspect.iscoroutinefunction(spec.handler):
+                raw = await asyncio.wait_for(spec.handler(args), timeout=timeout)
+            else:
+                raw = await asyncio.wait_for(asyncio.to_thread(spec.handler, args), timeout=timeout)
+        except WebCallError as exc:
+            raw = exc.code
         except TimeoutError:
             logger.error(
                 "tool timeout request_id=%s name=%s",

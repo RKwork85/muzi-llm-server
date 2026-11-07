@@ -39,6 +39,7 @@ class StreamChunk:
     usage: UsageStats | None = None
     model: str | None = None
     id: str | None = None
+    tool_call_parts: list[tuple[int, str | None, str | None, str | None]] | None = None
 
 
 @dataclass

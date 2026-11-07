@@ -16,6 +16,7 @@ from app.api.health import router as health_router
 from app.api.v1.router import router as api_router
 from app.core.config import ROOT, Settings, load_settings
 from app.core.context import get_request_id, normalize_request_id, reset_request_id, set_request_id
+from app.core.database.lifecycle import shutdown_data_backends, startup_data_backends
 from app.core.exceptions import AppError, InternalError, InvalidRequestError, error_payload
 from app.core.logging import setup_logging
 from app.agents.runtime import AgentRuntime
@@ -24,6 +25,7 @@ from app.providers.manager import ProviderManager
 from app.services.chat_service import ChatService
 from app.services.prompt_service import PromptService
 from app.services.tool_service import ToolService
+from app.data.oss_client import oss_client_from_settings
 from app.data.store import DataStore, resolve_store_root
 from app.tools.registry import build_agent_registry, build_default_registry
 from app.tools.web_client import DeepSeekWebClient
@@ -58,6 +60,10 @@ def create_app(
         )
         web_client = DeepSeekWebClient(runtime_settings, transport=web_transport)
         await web_client.startup()
+        agent_registry = build_agent_registry(
+            search_calls=runtime_settings.web_search_max_calls,
+            fetch_calls=runtime_settings.web_fetch_max_calls,
+        )
         store_root = resolve_store_root(runtime_settings)
         if store_root != ROOT:
             store_root.mkdir(parents=True, exist_ok=True)
@@ -68,21 +74,28 @@ def create_app(
             settings=runtime_settings,
             provider=manager.provider,
             prompts=prompts,
-            registry=build_agent_registry(
-                search_calls=runtime_settings.web_search_max_calls,
-                fetch_calls=runtime_settings.web_fetch_max_calls,
-            ),
+            registry=agent_registry,
             web_client=web_client,
             data_store=data_store,
         )
         app.state.agent_runtime = agent_runtime
         app.state.web_client = web_client
+        app.state.chat_service.ask_tools = ToolService(agent_registry, runtime_settings)
+        app.state.chat_service.web_client = web_client
+        app.state.chat_service.data_store = data_store
+        app.state.chat_service.oss_client = oss_client_from_settings(runtime_settings)
+        app.state.database_ready = False
+        app.state.redis_ready = False
         try:
+            ready = await startup_data_backends(runtime_settings)
+            app.state.database_ready = ready
+            app.state.redis_ready = ready
             yield
         finally:
             await agent_runtime.aclose()
             await web_client.aclose()
             await manager.shutdown()
+            await shutdown_data_backends(enabled=runtime_settings.database_startup_required)
 
     app = FastAPI(
         title=runtime_settings.app_name,

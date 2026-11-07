@@ -109,6 +109,30 @@ class InvalidRequestError(AppError):
     default_message = "请求参数无效"
 
 
+class AuthFailedError(AppError):
+    code = "AUTH_FAILED"
+    status_code = 401
+    default_message = "邮箱或密码错误"
+
+
+class AccountDisabledError(AppError):
+    code = "ACCOUNT_DISABLED"
+    status_code = 403
+    default_message = "账户已停用"
+
+
+class AccountExistsError(AppError):
+    code = "ACCOUNT_EXISTS"
+    status_code = 409
+    default_message = "邮箱或用户名已被使用"
+
+
+class DatabaseUnavailableError(AppError):
+    code = "DATABASE_UNAVAILABLE"
+    status_code = 503
+    default_message = "数据库未就绪"
+
+
 class AgentTaskNotFoundError(AppError):
     code = "AGENT_TASK_NOT_FOUND"
     status_code = 404

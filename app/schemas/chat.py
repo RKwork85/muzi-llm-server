@@ -153,7 +153,7 @@ class StreamChatRequest(ChatRequestBase):
 
 
 class ToolCallRequest(ChatRequestBase):
-    max_tool_rounds: int | None = Field(default=None, ge=1, le=5)
+    max_tool_rounds: int | None = Field(default=None, ge=1, le=10)
     tool_names: list[str] | None = Field(default=None, max_length=10)
 
     @field_validator("tool_names")

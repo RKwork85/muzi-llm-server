@@ -21,6 +21,8 @@ agent_workspace/*
 !agent_workspace/.gitkeep
 data_store/*
 !data_store/.gitkeep
+deploy/docker/backups/*
+!deploy/docker/backups/.gitkeep
 phase-skills.zip
 phase-skills/data-processing-package-delivery-SKILL.md
 phase-skills/data-processing-package-delivery-skill/

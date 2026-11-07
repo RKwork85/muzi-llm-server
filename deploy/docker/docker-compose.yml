@@ -1,0 +1,71 @@
+# qs_llm_dp 已弃用。这组 PostgreSQL / Redis 只给 muzi-llm-server 使用。
+name: muzi-llm
+
+services:
+  postgres:
+    image: postgres:18
+    container_name: muzi-postgres
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      TZ: ${TZ}
+      PGTZ: ${TZ}
+    command:
+      - postgres
+      - -c
+      - timezone=Asia/Shanghai
+      - -c
+      - log_timezone=Asia/Shanghai
+    ports:
+      - "127.0.0.1:${POSTGRES_HOST_PORT}:5432"
+    volumes:
+      # PostgreSQL 18 的数据目录在这个挂载点下的版本子目录。
+      # 不要改挂到 17 及更早镜像使用的默认数据目录。
+      - muzi-postgres-data:/var/lib/postgresql
+    networks:
+      - muzi-backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  redis:
+    image: redis:7
+    container_name: muzi-redis
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDISCLI_AUTH: ${REDIS_PASSWORD}
+      TZ: ${TZ}
+    entrypoint: ["/bin/sh", "/usr/local/bin/muzi-redis-entrypoint.sh"]
+    ports:
+      - "127.0.0.1:${REDIS_HOST_PORT}:6379"
+    volumes:
+      - muzi-redis-data:/data
+      - ./redis/entrypoint.sh:/usr/local/bin/muzi-redis-entrypoint.sh:ro
+    networks:
+      - muzi-backend
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 5s
+
+networks:
+  muzi-backend:
+    name: muzi-backend
+
+volumes:
+  muzi-postgres-data:
+    name: muzi-postgres-data
+  muzi-redis-data:
+    name: muzi-redis-data

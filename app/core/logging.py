@@ -43,7 +43,15 @@ def setup_logging(settings: Settings) -> None:
     logger.setLevel(settings.log_level)
     logger.propagate = True
     logger.filters.clear()
-    logger.addFilter(RedactingFilter([settings.deepseek_api_key]))
+    logger.addFilter(
+        RedactingFilter(
+            [
+                settings.deepseek_api_key,
+                settings.postgres_password,
+                settings.redis_password,
+            ]
+        )
+    )
     if not any(getattr(handler, "_qs_llm", False) for handler in logger.handlers):
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))

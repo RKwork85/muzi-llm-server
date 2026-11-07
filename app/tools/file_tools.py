@@ -23,6 +23,7 @@ from app.tools.file_sandbox import (
 )
 from app.tools.web_client import CURRENT_TOOL_BUDGET
 from app.tools.web_tools import CURRENT_SETTINGS
+from app.tools.workspace_scope import CURRENT_WORKSPACE_SCOPE, is_user_scope
 
 _UNAVAILABLE = "路径不可用"
 
@@ -65,7 +66,22 @@ def workspace_root(settings: Settings | None) -> Path:
         raise FileDenied() from exc
     if resolved == ROOT or not resolved.is_dir():
         raise FileDenied()
-    return resolved
+    scope = CURRENT_WORKSPACE_SCOPE.get()
+    if scope is None:
+        return resolved
+    if not is_user_scope(scope):
+        raise FileDenied()
+    try:
+        target = resolved.joinpath(scope).resolve()
+    except OSError as exc:
+        raise FileDenied() from exc
+    if not confined(resolved, target):
+        raise FileDenied()
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise FileDenied() from exc
+    return target
 
 
 def list_directory(args: ListArgs) -> str:

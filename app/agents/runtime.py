@@ -18,7 +18,7 @@ from app.agents.policy import (
     merge_execution_policy,
     server_policy_from_settings,
 )
-from app.agents.toolsets import resolve_tool_names
+from app.agents.toolsets import agent_tool_names
 from app.agents.provider_adapter import redact_exception
 from app.agents.task_manager import TaskManager, TaskRecord
 from app.core.config import Settings
@@ -31,7 +31,10 @@ from app.services.prompt_service import PromptService
 from app.tools.registry import ToolRegistry
 from app.tools.url_policy import UrlLedger
 from app.tools.web_client import DeepSeekWebClient
+from app.tools.file_sandbox import FileDenied
+from app.tools.file_tools import workspace_root
 from app.tools.web_tools import CURRENT_SETTINGS, CURRENT_URL_LEDGER, UNTRUSTED_PROMPT
+from app.tools.workspace_scope import CURRENT_WORKSPACE_SCOPE, is_user_scope
 
 logger = logging.getLogger("qs_llm")
 
@@ -76,9 +79,20 @@ class AgentRuntime:
     def tasks(self) -> TaskManager:
         return self._tasks
 
-    async def start(self, request: AgentRequest, request_id: str) -> dict[str, object]:
+    async def start(
+        self,
+        request: AgentRequest,
+        request_id: str,
+        *,
+        workspace_scope: str | None = None,
+    ) -> dict[str, object]:
         try:
-            granted = resolve_tool_names(self._registry, self._settings, request.toolsets)
+            granted = agent_tool_names(
+                self._registry,
+                self._settings,
+                request.toolsets,
+                request.grants,
+            )
             server = server_policy_from_settings(self._settings, self._registry)
             policy = merge_execution_policy(
                 server.model_copy(update={"allowed_tools": granted}),
@@ -88,7 +102,17 @@ class AgentRuntime:
             raise AgentPolicyRejectedError(exc.code) from None
         prompt = self._prompts.render(request.prompt_name)
         selected = set(request.toolsets or [])
-        if selected & {"research", "workspace", "data"}:
+        sensitive = {
+            "web_search",
+            "web_fetch",
+            "weather_query",
+            "read_text_file",
+            "search_text",
+            "write_text_file",
+            "write_docx",
+            "delete_file",
+        }
+        if selected & {"research", "workspace", "data", "weather"} or set(granted) & sensitive:
             prompt = f"{prompt}\n\n{UNTRUSTED_PROMPT}"
         record = self._tasks.create(request_id)
         record.publisher = EventPublisher(
@@ -97,7 +121,7 @@ class AgentRuntime:
             max_queue_size=policy.max_event_queue_size,
         )
         worker = asyncio.create_task(
-            self._execute(record, request.message, prompt, policy),
+            self._execute(record, request.message, prompt, policy, workspace_scope),
             name=f"agent:{record.task_id}",
         )
         record.worker = worker
@@ -140,7 +164,14 @@ class AgentRuntime:
             await asyncio.wait(workers, timeout=self._cleanup_timeout)
         self._pool.shutdown(wait=False, cancel_futures=True)
 
-    async def _execute(self, record: TaskRecord, message: str, prompt: str, policy: ExecutionPolicy) -> None:
+    async def _execute(
+        self,
+        record: TaskRecord,
+        message: str,
+        prompt: str,
+        policy: ExecutionPolicy,
+        workspace_scope: str | None = None,
+    ) -> None:
         publisher = record.publisher
         if publisher is None:
             publisher = EventPublisher(
@@ -156,14 +187,31 @@ class AgentRuntime:
         task_token = CURRENT_TASK_ID.set(record.task_id)
         store_token = CURRENT_DATA_STORE.set(self._data_store)
         oss_token = CURRENT_OSS_CLIENT.set(self._oss_client)
+        scope_token = (
+            CURRENT_WORKSPACE_SCOPE.set(workspace_scope) if workspace_scope is not None else None
+        )
+        if workspace_scope is not None:
+            self._prepare_workspace(record.request_id, workspace_scope)
         try:
             await self._run_loop(record, message, prompt, policy, publisher)
         finally:
+            if scope_token is not None:
+                CURRENT_WORKSPACE_SCOPE.reset(scope_token)
             CURRENT_OSS_CLIENT.reset(oss_token)
             CURRENT_DATA_STORE.reset(store_token)
             CURRENT_TASK_ID.reset(task_token)
             CURRENT_SETTINGS.reset(settings_token)
             CURRENT_URL_LEDGER.reset(ledger_token)
+
+    def _prepare_workspace(self, request_id: str, workspace_scope: str) -> None:
+        if is_user_scope(workspace_scope):
+            logger.info("workspace bound request_id=%s scope=%s", request_id, workspace_scope)
+        else:
+            logger.info("workspace unbound request_id=%s", request_id)
+        try:
+            workspace_root(self._settings)
+        except FileDenied:
+            return
 
     async def _run_loop(self, record: TaskRecord, message: str, prompt: str, policy: ExecutionPolicy, publisher: EventPublisher) -> None:
         clock = RunClock.start(policy)

@@ -12,7 +12,12 @@ from pydantic import BaseModel
 
 from app.tools.calculator import CalculatorArgs, calculator_handler
 from app.tools.clock import EmptyArgs, current_time_handler
+from app.tools.deliver_file import DeliverArgs, deliver_file
+from app.tools.docx_tool import WriteDocxArgs, write_docx
+from app.tools.file_changes import DeleteArgs, WriteArgs, delete_file, write_text_file
 from app.tools.file_tools import ListArgs, ReadArgs, SearchArgs as FileSearchArgs, list_directory, read_text_file, search_text
+from app.tools.sandbox_command import CommandArgs, run_command
+from app.tools.weather import WeatherArgs, weather_query
 from app.tools.local_tools import DateDiffArgs, FormatJsonArgs, TextStatsArgs, date_diff, format_json, text_stats
 from app.tools.mermaid import (
     FlowchartArgs,
@@ -27,9 +32,23 @@ from app.tools.data_tools import register_data_tools
 from app.tools.web_tools import FetchArgs, SearchArgs, web_fetch, web_search
 
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-KNOWN_TOOLSETS = frozenset({"basic", "utility", "diagram", "research", "workspace", "data"})
-KNOWN_ACCESS = frozenset({"read_local", "read_network", "read_files", "write_data", "write_remote"})
+KNOWN_TOOLSETS = frozenset(
+    {"basic", "utility", "diagram", "research", "weather", "workspace", "data", "delivery"}
+)
+KNOWN_ACCESS = frozenset(
+    {
+        "read_local",
+        "read_network",
+        "read_files",
+        "write_data",
+        "write_remote",
+        "write_workspace",
+        "delete_workspace",
+        "sandbox_exec",
+    }
+)
 REJECTED_ACCESS = frozenset({"write_local", "write_external"})
+MUTABLE_ACCESS = frozenset({"write_workspace", "delete_workspace", "sandbox_exec"})
 
 
 @dataclass
@@ -71,8 +90,8 @@ class ToolRegistry:
             raise ValueError("工具访问级别不合法")
         if spec.toolset not in KNOWN_TOOLSETS:
             raise ValueError("工具集不合法")
-        if not spec.idempotent:
-            raise ValueError("本阶段只允许只读工具")
+        if spec.idempotent == (spec.access in MUTABLE_ACCESS):
+            raise ValueError("写入、删除和命令工具必须标记为非幂等，其余工具必须是只读")
         if spec.requires_network != (spec.access in {"read_network", "write_remote"}):
             raise ValueError("联网标记与访问级别不一致")
         if spec.requires_network and not inspect.iscoroutinefunction(spec.handler):
@@ -155,7 +174,7 @@ def build_agent_registry(search_calls: int = 5, fetch_calls: int = 5) -> ToolReg
     registry.register(
         ToolSpec(
             name="create_flowchart",
-            description="用结构化节点和边生成流程图源码。不保证客户端一定能渲染。",
+            description="用结构化节点和边生成流程图。成功后把结果里的 mermaid 原文放进 mermaid 代码块展示给用户。不要说自己不会画流程图。",
             args_model=FlowchartArgs,
             handler=create_flowchart,
             toolset="diagram",
@@ -242,6 +261,84 @@ def build_agent_registry(search_calls: int = 5, fetch_calls: int = 5) -> ToolReg
             toolset="workspace",
             max_calls_per_run=5,
             timeout_s=10,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="weather_query",
+            description="按地名查询当前天气。不接受网址。结果是待核对的数据。",
+            args_model=WeatherArgs,
+            handler=weather_query,
+            access="read_network",
+            requires_network=True,
+            toolset="weather",
+            max_calls_per_run=5,
+            timeout_s=15,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="write_text_file",
+            description="在工作区内写入 UTF-8 文本，例如 md、txt、csv、json。不能写目录、隐藏文件或越出工作区。Word 文档必须改用 write_docx。",
+            args_model=WriteArgs,
+            handler=write_text_file,
+            access="write_workspace",
+            idempotent=False,
+            toolset="workspace",
+            max_calls_per_run=5,
+            timeout_s=10,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="write_docx",
+            description="生成真正的 Word .docx 并写入工作区。用户要 Word、doc 或 docx 时必须用这个工具，不要改用 write_text_file，也不要说只能输出 Markdown。写完后调用 deliver_file，把 download_url 原样发给用户。blocks 的 kind 只能是 heading、paragraph、bullet。",
+            args_model=WriteDocxArgs,
+            handler=write_docx,
+            access="write_workspace",
+            idempotent=False,
+            toolset="workspace",
+            max_calls_per_run=5,
+            timeout_s=10,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="delete_file",
+            description="删除工作区内的一个文件。不能删除目录。Ask 不可用，Agent 需要删除授权。",
+            args_model=DeleteArgs,
+            handler=delete_file,
+            access="delete_workspace",
+            idempotent=False,
+            toolset="workspace",
+            max_calls_per_run=5,
+            timeout_s=10,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="deliver_file",
+            description="把工作区内的文件上传到对象存储。成功后必须把结果中的 download_url 原样发给用户。不要说自己无法发送文件。",
+            args_model=DeliverArgs,
+            handler=deliver_file,
+            access="write_remote",
+            requires_network=True,
+            toolset="delivery",
+            max_calls_per_run=5,
+            timeout_s=25,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="run_command",
+            description="在工作区目录运行已授权的命令。没有 shell，不能使用绝对路径。Ask 不可用。",
+            args_model=CommandArgs,
+            handler=run_command,
+            access="sandbox_exec",
+            idempotent=False,
+            toolset="workspace",
+            max_calls_per_run=3,
+            timeout_s=20,
         )
     )
     register_data_tools(registry)
