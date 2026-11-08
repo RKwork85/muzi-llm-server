@@ -38,6 +38,7 @@ from app.mcp.service import overlay_tools
 from app.tools.stdio_access import CURRENT_MCP_USER
 from app.tools.web_tools import CURRENT_SETTINGS, CURRENT_URL_LEDGER, UNTRUSTED_PROMPT
 from app.tools.workspace_scope import CURRENT_WORKSPACE_SCOPE, is_user_scope
+from app.skills.tools import CURRENT_SKILL_PRINCIPAL, CURRENT_SKILL_RUNTIME, SKILL_USAGE_INSTRUCTION
 
 logger = logging.getLogger("qs_llm")
 
@@ -120,6 +121,8 @@ class AgentRuntime:
         except PolicyError as exc:
             raise AgentPolicyRejectedError(exc.code) from None
         prompt = self._prompts.render(request.prompt_name)
+        if self.skill_runtime is not None and "discover_skills" in granted and request.skill_mode != "explicit":
+            prompt = f"{prompt}\n\n{SKILL_USAGE_INSTRUCTION}"
         selected = set(request.toolsets or [])
         sensitive = {
             "web_search",
@@ -247,11 +250,20 @@ class AgentRuntime:
             mcp_token = CURRENT_MCP_SCOPE.set(
                 McpScope(user_id=mcp_user_id, request_id=record.request_id, agent_run_id=record.task_id)
             )
+        skill_token = None
+        skill_principal_token = None
+        if self.skill_runtime is not None:
+            skill_token = CURRENT_SKILL_RUNTIME.set(self.skill_runtime)
+            skill_principal_token = CURRENT_SKILL_PRINCIPAL.set(mcp_user_id or "")
         if workspace_scope is not None:
             self._prepare_workspace(record.request_id, workspace_scope)
         try:
             await self._run_loop(record, message, prompt, policy, publisher, registry or self._registry)
         finally:
+            if skill_principal_token is not None:
+                CURRENT_SKILL_PRINCIPAL.reset(skill_principal_token)
+            if skill_token is not None:
+                CURRENT_SKILL_RUNTIME.reset(skill_token)
             if mcp_token is not None:
                 CURRENT_MCP_SCOPE.reset(mcp_token)
             CURRENT_MCP_USER.reset(user_token)

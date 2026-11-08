@@ -47,6 +47,7 @@ from app.tools.file_tools import workspace_root
 from app.tools.url_policy import UrlLedger
 from app.tools.web_tools import CURRENT_SETTINGS, CURRENT_URL_LEDGER, CURRENT_WEB_CLIENT, UNTRUSTED_PROMPT
 from app.tools.workspace_scope import CURRENT_WORKSPACE_SCOPE, is_user_scope
+from app.skills.tools import CURRENT_SKILL_PRINCIPAL, CURRENT_SKILL_RUNTIME, SKILL_USAGE_INSTRUCTION
 
 logger = logging.getLogger("qs_llm")
 ChatBody = ChatCompletionRequest | StreamChatRequest | ToolCallRequest
@@ -61,6 +62,7 @@ class PreparedChat:
     remote_tools: list[ToolSpec] = field(default_factory=list)
     allowed_tools: tuple[str, ...] = ()
     mcp_user_id: str | None = None
+    principal_id: str | None = None
 
 
 class ChatService:
@@ -162,8 +164,11 @@ class ChatService:
         prepared.remote_tools = remote
         prepared.allowed_tools = names
         prepared.mcp_user_id = mcp_user_id if mode == "agent" else None
+        prepared.principal_id = mcp_user_id
         system = prepared.provider_request.messages[0]
         extra = _mode_prompt(mode, list(body.skill_names))
+        if self.skill_runtime is not None and "discover_skills" in names and body.skill_mode != "explicit":
+            extra = f"{extra}\n\n{SKILL_USAGE_INSTRUCTION}" if extra else SKILL_USAGE_INSTRUCTION
         if use_tools and (remote or self._ask_needs_untrusted(names)):
             extra = f"{extra}\n\n{UNTRUSTED_PROMPT}" if extra else UNTRUSTED_PROMPT
         if extra:
@@ -335,6 +340,9 @@ class ChatService:
         from app.tools.stdio_access import CURRENT_MCP_USER
 
         tokens.append((CURRENT_MCP_USER, CURRENT_MCP_USER.set(prepared.mcp_user_id)))
+        if self.skill_runtime is not None:
+            tokens.append((CURRENT_SKILL_RUNTIME, CURRENT_SKILL_RUNTIME.set(self.skill_runtime)))
+            tokens.append((CURRENT_SKILL_PRINCIPAL, CURRENT_SKILL_PRINCIPAL.set(prepared.principal_id or "")))
         if prepared.mcp_user_id:
             from app.mcp.execution import CURRENT_MCP_SCOPE, McpScope
 
@@ -841,6 +849,17 @@ def _result_preview(content: str) -> str:
                 lines.append(title)
         if lines:
             return _clip("\n".join(lines))
+    # 技能工具：discover_skills / load_skill / read_skill_resource
+    if isinstance(payload.get("skills"), list):
+        names = [str(item["name"]) for item in payload["skills"] if isinstance(item, dict) and item.get("name")]
+        if names:
+            total = payload.get("count")
+            suffix = f"，共 {total} 个技能" if isinstance(total, int) and total > len(names) else ""
+            return _clip("发现技能：" + "、".join(names[:5]) + suffix)
+    if isinstance(payload.get("instructions"), str) and payload.get("name"):
+        return _clip(f"已加载技能：{payload['name']}")
+    if isinstance(payload.get("size_bytes"), int) and payload.get("path"):
+        return _clip(f"{payload['path']} · {payload['size_bytes']} 字节")
     title = payload.get("title")
     body = payload.get("untrusted_content")
     if isinstance(title, str) or isinstance(body, str):

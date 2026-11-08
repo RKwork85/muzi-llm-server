@@ -6,7 +6,10 @@ import hashlib
 import io
 import json
 import os
+import re
 import secrets
+import shutil
+import tempfile
 import zipfile
 from pathlib import Path
 
@@ -18,6 +21,7 @@ from app.skills.models import (
     Skill,
     SkillAction,
     SkillActor,
+    SkillBundle,
     SkillManifest,
     SkillMetadata,
     SkillQuery,
@@ -61,6 +65,8 @@ class _Record(BaseModel):
     instruction_sha256: str
     active_count: int = 0
     versions: list[_VersionEntry]
+    bundle_id: str | None = None
+    bundle_name: str | None = None
 
 
 class FileSkillRegistry:
@@ -79,6 +85,8 @@ class FileSkillRegistry:
         actor: SkillActor,
         source: SkillSource,
         scope: SkillScope,
+        bundle_id: str | None = None,
+        bundle_name: str | None = None,
     ) -> Skill:
         self._check_body(manifest, instructions)
         assert_scope_writable(scope)
@@ -108,6 +116,8 @@ class FileSkillRegistry:
                     sequence=1,
                 )
             ],
+            bundle_id=bundle_id,
+            bundle_name=bundle_name,
         )
         self._write_package(record, instructions)
         self._save(record)
@@ -222,7 +232,16 @@ class FileSkillRegistry:
         finally:
             archive.close()
 
-    def scan_directory(self, directory: Path, *, actor: SkillActor, label: str, scope: SkillScope) -> list[Skill]:
+    def scan_directory(
+        self,
+        directory: Path,
+        *,
+        actor: SkillActor,
+        label: str,
+        scope: SkillScope,
+        bundle_id: str | None = None,
+        bundle_name: str | None = None,
+    ) -> list[Skill]:
         root = directory.resolve()
         if not root.is_dir():
             raise SkillValidationError("SKILL_SOURCE_INVALID", "技能目录无效")
@@ -238,10 +257,121 @@ class FileSkillRegistry:
                 actor=actor,
                 source=SkillSource(kind=SkillSourceKind.LOCAL_DIRECTORY, label=label),
                 scope=scope,
+                bundle_id=bundle_id,
+                bundle_name=bundle_name,
             )
             self._copy_tree(resolved.parent, skill.metadata.skill_id, skill.metadata.version)
             imported.append(skill)
         return imported
+
+    def import_bundle(
+        self,
+        payload: bytes,
+        *,
+        actor: SkillActor,
+        name: str,
+        scope: SkillScope,
+    ) -> SkillBundle:
+        """上传一个技能包 zip：整体安装，内含一个或多个技能。
+
+        解压到临时目录后按目录扫描，所有技能共享同一个 bundle_id。
+        校验通过后自动安装并启用，用户看到的只是一个技能包。
+        """
+        clean_name = _bundle_name(name)
+        base = _extract_bundle(payload)
+        try:
+            bundle_id = "bu_" + secrets.token_hex(6)
+            skills = self.scan_directory(
+                base,
+                actor=actor,
+                label=clean_name,
+                scope=scope,
+                bundle_id=bundle_id,
+                bundle_name=clean_name,
+            )
+            if not skills:
+                raise SkillValidationError("SKILL_PACKAGE_INVALID", "技能包缺少说明")
+            for skill in skills:
+                self.apply(skill.metadata.skill_id, SkillAction.INSTALL, actor=actor)
+                self.apply(skill.metadata.skill_id, SkillAction.ENABLE, actor=actor)
+            return self._bundle(bundle_id, actor=actor)
+        finally:
+            import shutil
+
+            shutil.rmtree(base, ignore_errors=True)
+
+    def list_bundles(self, *, actor: SkillActor) -> list[SkillBundle]:
+        groups: dict[str, SkillBundle] = {}
+        for record in self._records():
+            if record.status == SkillStatus.UNINSTALLED:
+                continue
+            if not self._can_see(record, actor):
+                continue
+            bundle_id = record.bundle_id
+            if not bundle_id:
+                continue
+            bundle = groups.get(bundle_id)
+            if bundle is None:
+                groups[bundle_id] = SkillBundle(
+                    bundle_id=bundle_id,
+                    name=record.bundle_name or record.source_label,
+                    scope=record.scope,
+                    owner_id=record.owner_id,
+                    source_label=record.source_label,
+                    skill_count=1,
+                    skills=(self._metadata(record),),
+                )
+            else:
+                groups[bundle_id] = bundle.model_copy(
+                    update={
+                        "skill_count": bundle.skill_count + 1,
+                        "skills": bundle.skills + (self._metadata(record),),
+                    }
+                )
+        return sorted(groups.values(), key=lambda item: item.name)
+
+    def uninstall_bundle(self, bundle_id: str, *, actor: SkillActor) -> SkillBundle:
+        records = [
+            record
+            for record in self._records()
+            if record.bundle_id == bundle_id and record.status != SkillStatus.UNINSTALLED
+        ]
+        if not records:
+            raise SkillError("BUNDLE_NOT_FOUND", "技能包不存在")
+        bundle = self._bundle(bundle_id, actor=actor)
+        for record in records:
+            if not self._can_see(record, actor):
+                continue
+            self.apply(record.skill_id, SkillAction.UNINSTALL, actor=actor)
+        return bundle
+
+    def _bundle(self, bundle_id: str, *, actor: SkillActor) -> SkillBundle:
+        metas: list[SkillMetadata] = []
+        name = ""
+        scope = SkillScope.USER
+        owner: str | None = None
+        label = ""
+        for record in self._records():
+            if record.bundle_id != bundle_id or record.status == SkillStatus.UNINSTALLED:
+                continue
+            if not self._can_see(record, actor):
+                continue
+            name = name or (record.bundle_name or record.source_label)
+            scope = record.scope
+            owner = record.owner_id
+            label = record.source_label
+            metas.append(self._metadata(record))
+        if not metas:
+            raise SkillError("BUNDLE_NOT_FOUND", "技能包不存在")
+        return SkillBundle(
+            bundle_id=bundle_id,
+            name=name,
+            scope=scope,
+            owner_id=owner,
+            source_label=label,
+            skill_count=len(metas),
+            skills=tuple(metas),
+        )
 
     def read_instructions(self, skill_id: str, version: str, *, actor: SkillActor) -> str:
         record = self._visible(skill_id, actor)
@@ -392,6 +522,8 @@ class FileSkillRegistry:
             compatibility=record.compatibility,
             category=record.category,
             tags=_tags(record.metadata),
+            bundle_id=record.bundle_id,
+            bundle_name=record.bundle_name,
         )
 
 
@@ -498,3 +630,65 @@ def _zip_relative(name: str, prefix: str) -> str | None:
     except SkillValidationError:
         return None
     return checked
+
+
+def _bundle_name(raw: str) -> str:
+    """从上传文件名推导技能包展示名。"""
+    name = raw.strip().replace("\\", "/").rsplit("/", 1)[-1]
+    name = re.sub(r"\.zip$", "", name, flags=re.IGNORECASE)
+    name = re.sub(r"[^A-Za-z0-9 _.\-\u4e00-\u9fff]+", "", name).strip()
+    if len(name) > 64:
+        name = name[:64].strip()
+    if not name:
+        raise SkillValidationError("SKILL_PACKAGE_INVALID", "技能包名称无效")
+    return name
+
+
+def _bundle_entry_path(name: str) -> str | None:
+    normal = name.replace("\\", "/")
+    if normal.startswith("/") or ":" in normal or "\x00" in normal:
+        raise SkillValidationError("SKILL_PATH_INVALID", "资源路径无效")
+    parts = [part for part in normal.split("/") if part not in {"", "."}]
+    if any(part == ".." for part in parts):
+        raise SkillValidationError("SKILL_PATH_INVALID", "资源路径无效")
+    if not parts:
+        return None
+    return "/".join(parts)
+
+
+def _extract_bundle(payload: bytes) -> Path:
+    """把技能包 zip 安全解压到临时目录，返回目录路径（调用方负责清理）。"""
+    if len(payload) > _MAX_PACKAGE:
+        raise SkillValidationError("SKILL_PACKAGE_TOO_LARGE", "技能包过大")
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(payload))
+    except zipfile.BadZipFile as exc:
+        raise SkillValidationError("SKILL_PACKAGE_INVALID", "技能包无效") from exc
+    base = Path(tempfile.mkdtemp(prefix="skill_bundle_"))
+    try:
+        total = 0
+        for info in archive.infolist():
+            total += info.file_size
+            if total > _MAX_PACKAGE:
+                raise SkillValidationError("SKILL_PACKAGE_TOO_LARGE", "技能包过大")
+        base_resolved = base.resolve()
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            relative = _bundle_entry_path(info.filename)
+            if relative is None:
+                continue
+            data = archive.read(info)
+            if len(data) > _MAX_RESOURCE:
+                raise SkillValidationError("SKILL_RESOURCE_TOO_LARGE", "技能资源过大")
+            target = base / Path(*relative.split("/"))
+            if os.path.commonpath([str(base_resolved), str(target.resolve())]) != str(base_resolved):
+                raise SkillValidationError("SKILL_PATH_INVALID", "资源路径无效")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        return base
+    except Exception:
+        shutil.rmtree(base, ignore_errors=True)
+        raise
+    finally:
+        archive.close()

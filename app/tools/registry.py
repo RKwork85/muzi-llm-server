@@ -32,10 +32,18 @@ from app.tools.prompts import tool_prompt
 from app.tools.schemas import parameters_schema
 from app.tools.data_tools import register_data_tools
 from app.tools.web_tools import FetchArgs, SearchArgs, web_fetch, web_search
+from app.skills.tools import (
+    DiscoverSkillsArgs,
+    LoadSkillArgs,
+    ReadSkillResourceArgs,
+    discover_skills,
+    load_skill,
+    read_skill_resource,
+)
 
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 KNOWN_TOOLSETS = frozenset(
-    {"basic", "utility", "diagram", "research", "weather", "workspace", "code", "data", "delivery", "mcp"}
+    {"basic", "utility", "diagram", "research", "weather", "workspace", "code", "data", "delivery", "mcp", "skills"}
 )
 KNOWN_ACCESS = frozenset(
     {
@@ -344,6 +352,49 @@ def build_agent_registry(search_calls: int = 5, fetch_calls: int = 5) -> ToolReg
             toolset="code",
             max_calls_per_run=3,
             timeout_s=20,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="discover_skills",
+            description=(
+                "列出当前已安装且可用的技能及其简要说明。开始一项任务前先调用它。"
+                "建议第一次不带 query 调用以浏览全部技能，再自行判断哪个技能与当前任务最相关；"
+                "query 仅用于技能较多时按关键词过滤（匹配技能名、描述、分类或标签）。"
+            ),
+            args_model=DiscoverSkillsArgs,
+            handler=discover_skills,
+            risk_level="low",
+            toolset="skills",
+            max_calls_per_run=8,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="load_skill",
+            description=(
+                "加载一个技能的完整操作说明（SKILL.md 正文）。先用 discover_skills 找到 skill_id，"
+                "再调用本工具把它的详细指令读进上下文并严格按其中的步骤执行。"
+            ),
+            args_model=LoadSkillArgs,
+            handler=load_skill,
+            risk_level="low",
+            toolset="skills",
+            max_calls_per_run=16,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="read_skill_resource",
+            description=(
+                "读取某个技能包内的引用资源（references/assets/templates 目录下的 .md/.txt/.json 文件）。"
+                "当技能说明提到需要参考某个资源时使用，path 为相对该技能目录的路径。"
+            ),
+            args_model=ReadSkillResourceArgs,
+            handler=read_skill_resource,
+            risk_level="low",
+            toolset="skills",
+            max_calls_per_run=16,
         )
     )
     register_data_tools(registry)

@@ -122,6 +122,8 @@ class SkillMetadata(BaseModel):
     compatibility: str | None = Field(default=None, max_length=240)
     category: str | None = Field(default=None, max_length=32)
     tags: tuple[str, ...] = ()
+    bundle_id: str | None = Field(default=None, max_length=64)
+    bundle_name: str | None = Field(default=None, max_length=64)
 
     @field_validator("name")
     @classmethod
@@ -403,3 +405,28 @@ class ValidationReport(BaseModel):
 
     ok: bool
     errors: tuple[str, ...] = ()
+
+
+class SkillBundle(BaseModel):
+    """一个技能包：一次上传的 zip 或目录作为整体实体，内部可含多个技能。
+
+    用户安装的是 bundle，而不是逐个技能。模型在运行时通过发现层自行
+    决定加载其中哪一个技能。
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    bundle_id: str = Field(pattern=r"^bu_[a-z0-9]{8,32}$")
+    name: str = Field(min_length=1, max_length=64)
+    scope: SkillScope
+    owner_id: str | None = Field(default=None, max_length=64)
+    source_label: str = Field(min_length=1, max_length=120)
+    skill_count: int = Field(ge=0)
+    skills: tuple[SkillMetadata, ...] = ()
+
+    @field_validator("owner_id")
+    @classmethod
+    def _check_owner(cls, value: str | None) -> str | None:
+        if value is not None and _ID.fullmatch(value) is None:
+            raise ValueError("所有者标识不合法")
+        return value

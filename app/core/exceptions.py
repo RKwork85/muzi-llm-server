@@ -112,11 +112,23 @@ class SkillFlowError(AppError):
         self.code = code
         self.status_code = {
             "SKILL_NOT_FOUND": 404,
+            "BUNDLE_NOT_FOUND": 404,
             "SKILL_NOT_ACCESSIBLE": 403,
+            "SKILL_SCOPE_UNAVAILABLE": 403,
             "SKILL_RESOURCE_NOT_ALLOWED": 403,
             "SKILL_PACKAGE_INVALID": 422,
+            "SKILL_PACKAGE_TOO_LARGE": 422,
+            "SKILL_RESOURCE_TOO_LARGE": 422,
+            "SKILL_PATH_INVALID": 422,
+            "SKILL_DIGEST_MISMATCH": 422,
+            "SKILL_FRONTMATTER_INVALID": 422,
+            "SKILL_BODY_EMPTY": 422,
             "SKILL_CONTENT_TOO_LARGE": 422,
             "SKILL_CONTEXT_BUDGET_EXCEEDED": 422,
+            "SKILL_NAME_CONFLICT": 409,
+            "SKILL_STATE_INVALID": 409,
+            "SKILL_IN_USE": 409,
+            "SKILL_RUNTIME_UNAVAILABLE": 503,
         }.get(code, 409)
         super().__init__(message or self.default_message)
 

@@ -149,6 +149,8 @@ def _toolset_available(name: str, settings: Settings) -> bool:
         return store_is_ready(settings)
     if name == "mcp":
         return settings.mcp_enabled and mcp_is_available()
+    if name == "skills":
+        return bool(settings.skills_root.strip())
     return False
 
 

@@ -15,6 +15,8 @@ PLAN_TOOLS = frozenset(
         "create_flowchart",
         "create_sequence_diagram",
         "validate_mermaid",
+        # Plan 只做渐进式加载的 Level 1：发现技能元数据用于制定计划，不加载 SKILL.md 正文、不读资源。
+        "discover_skills",
     }
 )
 
@@ -35,6 +37,9 @@ ASK_TOOLS = frozenset(
         "create_sequence_diagram",
         "validate_mermaid",
         "run_python",
+        "discover_skills",
+        "load_skill",
+        "read_skill_resource",
     }
 )
 
