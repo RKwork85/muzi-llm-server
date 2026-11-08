@@ -27,6 +27,10 @@ from app.services.prompt_service import PromptService
 from app.services.tool_service import ToolService
 from app.data.oss_client import oss_client_from_settings
 from app.data.store import DataStore, resolve_store_root
+from app.mcp.grants import MemoryGrantStore, SqlGrantStore, bind_grants
+from app.mcp.keys import validate_key_config
+from app.mcp.pool import production_pool
+from app.tools.mcp_client import McpSession, register_mcp_tools
 from app.tools.registry import build_agent_registry, build_default_registry
 from app.tools.web_client import DeepSeekWebClient
 
@@ -64,35 +68,68 @@ def create_app(
             search_calls=runtime_settings.web_search_max_calls,
             fetch_calls=runtime_settings.web_fetch_max_calls,
         )
-        store_root = resolve_store_root(runtime_settings)
-        if store_root != ROOT:
-            store_root.mkdir(parents=True, exist_ok=True)
-        data_store = DataStore.from_settings(runtime_settings)
-        data_store.cleanup_expired()
-        app.state.data_store = data_store
-        agent_runtime = AgentRuntime(
-            settings=runtime_settings,
-            provider=manager.provider,
-            prompts=prompts,
-            registry=agent_registry,
-            web_client=web_client,
-            data_store=data_store,
-        )
-        app.state.agent_runtime = agent_runtime
-        app.state.web_client = web_client
-        app.state.chat_service.ask_tools = ToolService(agent_registry, runtime_settings)
-        app.state.chat_service.web_client = web_client
-        app.state.chat_service.data_store = data_store
-        app.state.chat_service.oss_client = oss_client_from_settings(runtime_settings)
-        app.state.database_ready = False
-        app.state.redis_ready = False
+        mcp_session: McpSession | None = None
+        agent_runtime: AgentRuntime | None = None
+        mcp_pool = production_pool(runtime_settings)
+        app.state.mcp_pool = mcp_pool
         try:
+            if runtime_settings.mcp_enabled:
+                mcp_session = McpSession(runtime_settings)
+                try:
+                    mcp_tools = await mcp_session.start()
+                    register_mcp_tools(agent_registry, mcp_session, mcp_tools, runtime_settings)
+                except Exception:
+                    logger.error("mcp startup failed")
+                    await mcp_session.aclose()
+                    mcp_session = None
+            store_root = resolve_store_root(runtime_settings)
+            if store_root != ROOT:
+                store_root.mkdir(parents=True, exist_ok=True)
+            data_store = DataStore.from_settings(runtime_settings)
+            data_store.cleanup_expired()
+            app.state.data_store = data_store
+            agent_runtime = AgentRuntime(
+                settings=runtime_settings,
+                provider=manager.provider,
+                prompts=prompts,
+                registry=agent_registry,
+                web_client=web_client,
+                data_store=data_store,
+            )
+            app.state.agent_runtime = agent_runtime
+            app.state.web_client = web_client
+            app.state.chat_service.ask_tools = ToolService(agent_registry, runtime_settings)
+            app.state.chat_service.web_client = web_client
+            app.state.chat_service.data_store = data_store
+            app.state.chat_service.oss_client = oss_client_from_settings(runtime_settings)
+            app.state.database_ready = False
+            app.state.redis_ready = False
+            validate_key_config(runtime_settings)
+            production = runtime_settings.runtime_env.strip().lower() == "production"
+            if production and not runtime_settings.database_startup_required:
+                raise RuntimeError("生产环境必须开启数据库启动检查，拒绝使用内存授权")
             ready = await startup_data_backends(runtime_settings)
+            if production and not ready:
+                raise RuntimeError("生产环境数据库不可用，拒绝使用内存授权")
+            if ready:
+                from app.core.database.session import get_session_factory
+
+                grant_store = SqlGrantStore(get_session_factory())
+            else:
+                grant_store = MemoryGrantStore()
+            app.state.mcp_grants = grant_store
+            app.state.mcp_grants_durable = ready
+            bind_grants(grant_store, production=production)
             app.state.database_ready = ready
             app.state.redis_ready = ready
             yield
         finally:
-            await agent_runtime.aclose()
+            bind_grants(None)
+            await mcp_pool.aclose()
+            if mcp_session is not None:
+                await mcp_session.aclose()
+            if agent_runtime is not None:
+                await agent_runtime.aclose()
             await web_client.aclose()
             await manager.shutdown()
             await shutdown_data_backends(enabled=runtime_settings.database_startup_required)
@@ -103,7 +140,7 @@ def create_app(
         summary="DeepSeek Chat Completions 第一阶段服务",
         description=(
             "提供非流式对话、SSE、服务端提示词和受控 Function Calling。"
-            "本阶段不包含 Harness、MCP、RAG、长期记忆或 Responses API。"
+            "MCP 仅在服务端开启并列入白名单后可用。不包含 Harness、RAG、长期记忆或 Responses API。"
         ),
         lifespan=lifespan,
     )

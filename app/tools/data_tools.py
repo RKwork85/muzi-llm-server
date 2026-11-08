@@ -559,25 +559,24 @@ def register_data_tools(registry) -> None:
     from app.tools.registry import ToolSpec
 
     specs = (
-        ("import_dataset", "读入 JSON 或 CSV，返回数据集引用和最多几行样例。不要把整表放进对话。", ImportArgs, import_dataset),
-        ("clean_data", "按数据集引用清洗空行和空白。源数据保持不变，返回新引用。", CleanArgs, clean_data),
-        ("deduplicate_data", "按指定列或全部列去重。源数据保持不变，返回新引用。", DedupeArgs, deduplicate_data),
-        ("normalize_data", "重命名列，并整理空白、ISO 日期和数值。源数据保持不变。", NormalizeArgs, normalize_data),
-        ("classify_data", "按等于或包含规则给每行加分类列。标签必须由调用方给出。", ClassifyArgs, classify_data),
-        ("validate_data", "检查必填、类型和枚举。校验失败仍返回问题清单，不抛异常。", ValidateDataArgs, validate_data),
-        ("export_json", "把数据集导出为 JSON 文件并返回文件引用。", ExportArgs, export_json),
-        ("export_csv", "把数据集导出为 CSV。文本单元格会防止公式注入。", ExportCsvArgs, export_csv),
-        ("export_excel", "把数据集导出为 xlsx。文本单元格会防止公式注入。", ExportExcelArgs, export_excel),
-        ("export_markdown", "把数据集导出为 Markdown 表格。", ExportMarkdownArgs, export_markdown),
-        ("create_package", "把已有文件打成 zip。路径必须是相对安全路径。", PackageArgs, create_package),
-        ("list_package_files", "列出数据包内的路径、大小和 SHA-256。", PackageQuery, list_package_files),
-        ("get_download_url", "为当前任务的文件签发短期下载路径。", DownloadArgs, get_download_url),
+        ("import_dataset", ImportArgs, import_dataset),
+        ("clean_data", CleanArgs, clean_data),
+        ("deduplicate_data", DedupeArgs, deduplicate_data),
+        ("normalize_data", NormalizeArgs, normalize_data),
+        ("classify_data", ClassifyArgs, classify_data),
+        ("validate_data", ValidateDataArgs, validate_data),
+        ("export_json", ExportArgs, export_json),
+        ("export_csv", ExportCsvArgs, export_csv),
+        ("export_excel", ExportExcelArgs, export_excel),
+        ("export_markdown", ExportMarkdownArgs, export_markdown),
+        ("create_package", PackageArgs, create_package),
+        ("list_package_files", PackageQuery, list_package_files),
+        ("get_download_url", DownloadArgs, get_download_url),
     )
-    for name, description, model, handler in specs:
+    for name, model, handler in specs:
         registry.register(
             ToolSpec(
                 name=name,
-                description=description,
                 args_model=model,
                 handler=handler,
                 access="write_data",
@@ -586,14 +585,13 @@ def register_data_tools(registry) -> None:
                 timeout_s=20,
             )
         )
-    for name, description, model, handler in (
-        ("upload_to_oss", "把当前任务的一个文件上传到对象存储，并返回服务给出的地址。", OssFileArgs, upload_to_oss),
-        ("upload_files_to_oss", "把当前任务的多个文件上传到对象存储，并返回服务给出的地址。", OssFilesArgs, upload_files_to_oss),
+    for name, model, handler in (
+        ("upload_to_oss", OssFileArgs, upload_to_oss),
+        ("upload_files_to_oss", OssFilesArgs, upload_files_to_oss),
     ):
         registry.register(
             ToolSpec(
                 name=name,
-                description=description,
                 args_model=model,
                 handler=handler,
                 access="write_remote",

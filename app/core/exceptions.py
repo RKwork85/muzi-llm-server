@@ -127,6 +127,24 @@ class AccountExistsError(AppError):
     default_message = "邮箱或用户名已被使用"
 
 
+class LoginRequiredError(AppError):
+    code = "LOGIN_REQUIRED"
+    status_code = 401
+    default_message = "请先登录"
+
+
+class ConnectorNotFoundError(AppError):
+    code = "CONNECTOR_NOT_FOUND"
+    status_code = 404
+    default_message = "未找到该连接服务"
+
+
+class McpUnavailableError(AppError):
+    code = "MCP_UNAVAILABLE"
+    status_code = 503
+    default_message = "外部连接暂不可用"
+
+
 class DatabaseUnavailableError(AppError):
     code = "DATABASE_UNAVAILABLE"
     status_code = 503

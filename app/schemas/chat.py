@@ -150,6 +150,19 @@ class ChatCompletionRequest(ChatRequestBase):
 class StreamChatRequest(ChatRequestBase):
     stream: bool | None = True
     response_format: ResponseFormat | None = None
+    mode: Literal["ask", "plan", "agent"] = "ask"
+    skill_names: list[str] = Field(default_factory=list, max_length=8)
+
+    @field_validator("skill_names")
+    @classmethod
+    def _skill_names(cls, value: list[str]) -> list[str]:
+        cleaned: list[str] = []
+        for name in value:
+            if not _PROMPT_NAME.fullmatch(name) or len(name) > 32:
+                raise ValueError("技能名称无效")
+            if name not in cleaned:
+                cleaned.append(name)
+        return cleaned
 
 
 class ToolCallRequest(ChatRequestBase):

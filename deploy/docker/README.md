@@ -89,3 +89,12 @@ PostgreSQL 备份保存业务数据。Redis 的 RDB 和 AOF 只保证缓存卷�
 - 密码认证失败：服务端 `.env` 和 `deploy/docker/.env` 的密码不一致。重新运行 `init-env.ps1` 只会在文件缺失时生成密码，不会覆盖已有密码。
 - 卷是空的：确认挂载点是 `/var/lib/postgresql` 和 `/data`。
 - FastAPI 启动报数据库不可用：先看 `docker compose ps` 是否为 healthy，再确认 `DATABASE_STARTUP_REQUIRED`。
+
+
+## start
+```
+cd muzi-llm-server\deploy\docker
+docker compose up -d
+docker compose ps
+
+```

@@ -45,7 +45,7 @@ def test_source_has_no_dynamic_execution() -> None:
         text = path.read_text(encoding="utf-8")
         for token in banned:
             assert token not in text, f"{path} contains {token}"
-        if "subprocess" in text and path.name != "sandbox_command.py":
+        if "subprocess" in text and path.name not in {"sandbox_command.py", "code_runner.py", "mcp_client.py"}:
             raise AssertionError(f"{path} contains subprocess")
 
 

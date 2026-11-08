@@ -57,8 +57,11 @@ def test_unknown_and_disabled_toolsets() -> None:
     registry = build_default_registry()
     settings = make_settings()
     with pytest.raises(PolicyError) as unknown:
-        resolve_tool_names(registry, settings, ["mcp"])
+        resolve_tool_names(registry, settings, ["nope"])
     assert unknown.value.code == "TOOLSET_UNKNOWN"
+    with pytest.raises(PolicyError) as disabled:
+        resolve_tool_names(registry, settings, ["mcp"])
+    assert disabled.value.code == "TOOLSET_UNAVAILABLE"
     with pytest.raises(PolicyError) as offline:
         resolve_tool_names(registry, settings, ["basic", "research"])
     assert offline.value.code == "TOOLSET_UNAVAILABLE"

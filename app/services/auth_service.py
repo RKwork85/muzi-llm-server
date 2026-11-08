@@ -16,7 +16,7 @@ from app.core.exceptions import (
     AuthFailedError,
     InvalidRequestError,
 )
-from app.core.security import generate_refresh_token, hash_password, verify_password
+from app.core.security import generate_refresh_token, hash_password, hash_refresh_token, verify_password
 from app.models.mixins import utcnow
 from app.models.tables import RefreshToken, User, UserCredential
 
@@ -132,6 +132,23 @@ class AuthService:
         issued = await self._issue(user)
         await self.session.flush()
         return issued
+
+    async def user_for_token(self, raw_token: str) -> User | None:
+        if len(raw_token) < 16:
+            return None
+        digest = hash_refresh_token(raw_token)
+        row = await self.session.scalar(
+            select(RefreshToken).where(
+                RefreshToken.token_hash == digest,
+                RefreshToken.revoked_at.is_(None),
+            )
+        )
+        if row is None or row.expires_at <= utcnow():
+            return None
+        user = await self.session.get(User, row.user_id)
+        if user is None or user.status != "active":
+            return None
+        return user
 
     async def _email_taken(self, email: str) -> bool:
         found = await self.session.scalar(select(User.id).where(User.email == email))

@@ -33,6 +33,9 @@ from app.tools.url_policy import UrlLedger
 from app.tools.web_client import DeepSeekWebClient
 from app.tools.file_sandbox import FileDenied
 from app.tools.file_tools import workspace_root
+from app.mcp.execution import CURRENT_MCP_SCOPE, McpScope
+from app.mcp.service import overlay_tools
+from app.tools.stdio_access import CURRENT_MCP_USER
 from app.tools.web_tools import CURRENT_SETTINGS, CURRENT_URL_LEDGER, UNTRUSTED_PROMPT
 from app.tools.workspace_scope import CURRENT_WORKSPACE_SCOPE, is_user_scope
 
@@ -85,6 +88,8 @@ class AgentRuntime:
         request_id: str,
         *,
         workspace_scope: str | None = None,
+        mcp_user_id: str | None = None,
+        mcp_service: object | None = None,
     ) -> dict[str, object]:
         try:
             granted = agent_tool_names(
@@ -92,7 +97,19 @@ class AgentRuntime:
                 self._settings,
                 request.toolsets,
                 request.grants,
+                mcp_user_id,
             )
+            remote: list = []
+            want_remote = mcp_service is not None and mcp_user_id is not None
+            want_remote = want_remote and (request.toolsets is None or "mcp" in request.toolsets)
+            if want_remote:
+                try:
+                    remote = await mcp_service.tool_specs(mcp_user_id)  # type: ignore[attr-defined]
+                except Exception:
+                    logger.info("remote mcp tools skipped")
+                    remote = []
+            if remote:
+                granted = tuple(sorted(set(granted) | {spec.name for spec in remote}))
             server = server_policy_from_settings(self._settings, self._registry)
             policy = merge_execution_policy(
                 server.model_copy(update={"allowed_tools": granted}),
@@ -114,6 +131,7 @@ class AgentRuntime:
         }
         if selected & {"research", "workspace", "data", "weather"} or set(granted) & sensitive:
             prompt = f"{prompt}\n\n{UNTRUSTED_PROMPT}"
+        registry = overlay_tools(self._settings, self._registry, remote) if remote else self._registry
         record = self._tasks.create(request_id)
         record.publisher = EventPublisher(
             request_id=record.request_id,
@@ -121,7 +139,7 @@ class AgentRuntime:
             max_queue_size=policy.max_event_queue_size,
         )
         worker = asyncio.create_task(
-            self._execute(record, request.message, prompt, policy, workspace_scope),
+            self._execute(record, request.message, prompt, policy, workspace_scope, mcp_user_id, registry),
             name=f"agent:{record.task_id}",
         )
         record.worker = worker
@@ -139,7 +157,8 @@ class AgentRuntime:
         try:
             await asyncio.wait_for(asyncio.shield(worker), timeout=self._cleanup_timeout)
         except TimeoutError:
-            pass
+            if self._tasks.finish_cancelled(record) and record.publisher is not None:
+                record.publisher.publish("agent.cancelled", {"error_code": "AGENT_CANCELLED"})
         except asyncio.CancelledError:
             current = asyncio.current_task()
             if current is not None and current.cancelling():
@@ -171,6 +190,8 @@ class AgentRuntime:
         prompt: str,
         policy: ExecutionPolicy,
         workspace_scope: str | None = None,
+        mcp_user_id: str | None = None,
+        registry: ToolRegistry | None = None,
     ) -> None:
         publisher = record.publisher
         if publisher is None:
@@ -190,11 +211,20 @@ class AgentRuntime:
         scope_token = (
             CURRENT_WORKSPACE_SCOPE.set(workspace_scope) if workspace_scope is not None else None
         )
+        user_token = CURRENT_MCP_USER.set(mcp_user_id)
+        mcp_token = None
+        if mcp_user_id is not None:
+            mcp_token = CURRENT_MCP_SCOPE.set(
+                McpScope(user_id=mcp_user_id, request_id=record.request_id, agent_run_id=record.task_id)
+            )
         if workspace_scope is not None:
             self._prepare_workspace(record.request_id, workspace_scope)
         try:
-            await self._run_loop(record, message, prompt, policy, publisher)
+            await self._run_loop(record, message, prompt, policy, publisher, registry or self._registry)
         finally:
+            if mcp_token is not None:
+                CURRENT_MCP_SCOPE.reset(mcp_token)
+            CURRENT_MCP_USER.reset(user_token)
             if scope_token is not None:
                 CURRENT_WORKSPACE_SCOPE.reset(scope_token)
             CURRENT_OSS_CLIENT.reset(oss_token)
@@ -213,10 +243,18 @@ class AgentRuntime:
         except FileDenied:
             return
 
-    async def _run_loop(self, record: TaskRecord, message: str, prompt: str, policy: ExecutionPolicy, publisher: EventPublisher) -> None:
+    async def _run_loop(
+        self,
+        record: TaskRecord,
+        message: str,
+        prompt: str,
+        policy: ExecutionPolicy,
+        publisher: EventPublisher,
+        registry: ToolRegistry,
+    ) -> None:
         clock = RunClock.start(policy)
         context = ContextManager(system_prompt=prompt, user_message=message, policy=policy)
-        executor = ToolExecutor(self._registry, policy.allowed_tools)
+        executor = ToolExecutor(registry, policy.allowed_tools)
         executor.bind_sync_executor(self._pool)
         executor.bind_network_gate(self._network_gate)
         executor.bind_web_client(self._web_client)
@@ -226,7 +264,7 @@ class AgentRuntime:
             context=context,
             policy=policy,
             clock=clock,
-            registry=self._registry,
+            registry=registry,
             model=self._settings.deepseek_model,
             thinking=self._settings.deepseek_thinking,
             request_id=record.request_id,

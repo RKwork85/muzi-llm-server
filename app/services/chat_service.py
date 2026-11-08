@@ -8,11 +8,12 @@ import logging
 import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
 
-from app.agents.toolsets import ask_tool_names
+from app.agents.toolsets import chat_mode_tool_names
+from app.prompts.skills import skill_notes
 from app.core.config import Settings
 from app.core.context import get_request_id
 from app.core.exceptions import (
@@ -37,7 +38,9 @@ from app.schemas.chat import (
 from app.schemas.common import Usage
 from app.data.context import CURRENT_DATA_STORE, CURRENT_OSS_CLIENT, CURRENT_TASK_ID
 from app.services.prompt_service import PromptService
+from app.mcp.service import overlay_tools
 from app.services.tool_service import ToolService
+from app.tools.registry import ToolRegistry, ToolSpec
 from app.tools.deliver_file import USER_DOWNLOAD_KIND
 from app.tools.file_sandbox import FileDenied
 from app.tools.file_tools import workspace_root
@@ -55,6 +58,9 @@ class PreparedChat:
     provider_request: ProviderChatRequest
     expect_json: bool
     max_tool_rounds: int = 0
+    remote_tools: list[ToolSpec] = field(default_factory=list)
+    allowed_tools: tuple[str, ...] = ()
+    mcp_user_id: str | None = None
 
 
 class ChatService:
@@ -129,20 +135,38 @@ class ChatService:
             messages.append(_assistant_message(result))
             messages.extend(await self.tools.execute(result.tool_calls))
 
-    def prepare_stream(self, body: StreamChatRequest) -> PreparedChat:
-        """Ask：服务端挂上短工具，模型自己决定是否调用。页面不能扩大工具集合。"""
-        names = self._ask_names()
-        use_tools = bool(names) and not _wants_json(body)
-        tools = self.ask_tools.schemas_for(list(names)) if use_tools and self.ask_tools else None
+    def prepare_stream(
+        self,
+        body: StreamChatRequest,
+        remote_tools: list[ToolSpec] | None = None,
+        mcp_user_id: str | None = None,
+    ) -> PreparedChat:
+        """按对话模式挂上允许的工具。页面不能扩大工具集合。"""
+        mode = body.mode
+        remote = list(remote_tools or []) if mode == "agent" else []
+        names = self._mode_names(mode, mcp_user_id if mode == "agent" else None)
+        use_tools = bool(names or remote) and not _wants_json(body)
+        tools = None
+        if use_tools and self.ask_tools is not None and names:
+            tools = self.ask_tools.schemas_for(list(names))
+        if use_tools and remote:
+            tools = list(tools or [])
+            tools.extend(spec.openai_schema() for spec in remote)
         prepared = self.prepare_chat(
             body,
             tools=tools,
             tool_choice="auto" if tools else None,
         )
         prepared.max_tool_rounds = self._resolve_rounds(None)
-        if use_tools and self._ask_needs_untrusted(names):
-            system = prepared.provider_request.messages[0]
-            system["content"] = f"{system['content']}\n\n{UNTRUSTED_PROMPT}"
+        prepared.remote_tools = remote
+        prepared.allowed_tools = names
+        prepared.mcp_user_id = mcp_user_id if mode == "agent" else None
+        system = prepared.provider_request.messages[0]
+        extra = _mode_prompt(mode, list(body.skill_names))
+        if use_tools and (remote or self._ask_needs_untrusted(names)):
+            extra = f"{extra}\n\n{UNTRUSTED_PROMPT}" if extra else UNTRUSTED_PROMPT
+        if extra:
+            system["content"] = f"{system['content']}\n\n{extra}"
         return prepared
 
     def ensure_ready(self) -> None:
@@ -282,6 +306,20 @@ class ChatService:
             prepared.request_id,
             workspace_scope,
         )
+        from app.tools.stdio_access import CURRENT_MCP_USER
+
+        tokens.append((CURRENT_MCP_USER, CURRENT_MCP_USER.set(prepared.mcp_user_id)))
+        if prepared.mcp_user_id:
+            from app.mcp.execution import CURRENT_MCP_SCOPE, McpScope
+
+            tokens.append(
+                (
+                    CURRENT_MCP_SCOPE,
+                    CURRENT_MCP_SCOPE.set(
+                        McpScope(user_id=prepared.mcp_user_id, request_id=prepared.request_id)
+                    ),
+                )
+            )
         try:
             while True:
                 request = ProviderChatRequest(
@@ -376,18 +414,6 @@ class ChatService:
                                         "delta",
                                         {"request_id": prepared.request_id, "content": piece},
                                     )
-                        if saw_tools:
-                            if chunk.content and not consumed_content:
-                                parts.append(chunk.content)
-                                yield format_sse(
-                                    "note",
-                                    {
-                                        "request_id": prepared.request_id,
-                                        "round": rounds + 1,
-                                        "content": chunk.content,
-                                    },
-                                )
-                            continue
                         if chunk.usage is not None:
                             yield format_sse(
                                 "usage",
@@ -400,6 +426,18 @@ class ChatService:
                                     },
                                 },
                             )
+                        if saw_tools:
+                            if chunk.content and not consumed_content:
+                                parts.append(chunk.content)
+                                yield format_sse(
+                                    "note",
+                                    {
+                                        "request_id": prepared.request_id,
+                                        "round": rounds + 1,
+                                        "content": chunk.content,
+                                    },
+                                )
+                            continue
                         delta: dict[str, str] = {}
                         if chunk.content:
                             pending_answer.append(chunk.content)
@@ -463,12 +501,22 @@ class ChatService:
                         )
                     )
                 )
-                if self.ask_tools is None:
+                if self.ask_tools is None and not prepared.remote_tools:
                     yield _sse_error(prepared.request_id, InternalError())
                     return
-                tool_messages = await self.ask_tools.execute(
-                    calls, allowed=frozenset(self._ask_names())
-                )
+                allowed = set(prepared.allowed_tools)
+                runner = self.ask_tools
+                if prepared.remote_tools:
+                    base = self.ask_tools.registry if self.ask_tools is not None else ToolRegistry()
+                    runner = ToolService(
+                        overlay_tools(self.settings, base, prepared.remote_tools),
+                        self.settings,
+                    )
+                    allowed.update(spec.name for spec in prepared.remote_tools)
+                if runner is None:
+                    yield _sse_error(prepared.request_id, InternalError())
+                    return
+                tool_messages = await runner.execute(calls, allowed=frozenset(allowed))
                 messages.extend(tool_messages)
                 for slot_index, call, tool_message in zip(call_indexes, calls, tool_messages, strict=True):
                     detail, preview = _tool_public(call.name, call.arguments, tool_message["content"])
@@ -504,10 +552,10 @@ class ChatService:
             for var, token in reversed(tokens):
                 var.reset(token)
 
-    def _ask_names(self) -> tuple[str, ...]:
+    def _mode_names(self, mode: str, user_id: str | None = None) -> tuple[str, ...]:
         if self.ask_tools is None:
             return ()
-        return ask_tool_names(self.ask_tools.registry, self.settings)
+        return chat_mode_tool_names(self.ask_tools.registry, self.settings, mode, user_id)
 
     def _ask_needs_untrusted(self, names: tuple[str, ...]) -> bool:
         if self.ask_tools is None:
@@ -673,6 +721,20 @@ def _download_payload(content: Any) -> dict[str, Any] | None:
         "download_url": url,
         "file_size": size if isinstance(size, int) and size >= 0 else None,
     }
+
+
+def _mode_prompt(mode: str, skill_names: list[str]) -> str:
+    if mode == "plan":
+        note = skill_notes(skill_names, execute=False)
+        text = (
+            "你处于 Plan 模式。只能使用只读工具了解情况，然后输出计划：目标和有顺序的步骤。"
+            "不要写文件，不要声称已经修改了外部应用。"
+            "需要写入、发送文件或调用外部应用时，写明交给 Agent 执行。"
+        )
+        return f"{text}\n\n{note}" if note else text
+    if mode == "agent":
+        return skill_notes(skill_names, execute=True)
+    return ""
 
 
 def _wants_json(body: StreamChatRequest) -> bool:

@@ -107,6 +107,21 @@ class Settings(BaseSettings):
     oss_upload_base_url: str = ""
     oss_upload_prefix: str = "agent-data"
     oss_upload_timeout_seconds: float = Field(default=20, gt=0, le=30)
+    mcp_enabled: bool = False
+    mcp_server_name: str = "server"
+    mcp_command: str = ""
+    mcp_args: str = ""
+    mcp_tool_allowlist: str = ""
+    mcp_tools_network: bool = False
+    mcp_timeout_seconds: float = Field(default=10, gt=0, le=30)
+    mcp_token_key: str = Field(default="", repr=False)
+    mcp_key_id: str = "local"
+    mcp_key_source: str = "local"
+    mcp_previous_token_keys: str = Field(default="", repr=False)
+    runtime_env: str = "development"
+    mcp_public_base_url: str = "http://127.0.0.1:8000"
+    mcp_frontend_base_url: str = "http://127.0.0.1:5500"
+    mcp_allow_insecure: bool = False
     # 数据库只服务本进程。地址来自环境变量，业务代码不写死主机名。
     postgres_host: str = "127.0.0.1"
     postgres_port: int = Field(default=5432, ge=1, le=65535)
@@ -207,6 +222,11 @@ class Settings(BaseSettings):
             raise ValueError("工具轮数硬上限必须在 1 到 10 之间")
         if not 1 <= self.max_tool_rounds <= self.tool_round_hard_limit:
             raise ValueError("MAX_TOOL_ROUNDS 超出允许范围")
+        if self.mcp_enabled:
+            import re
+
+            if re.fullmatch(r"[A-Za-z0-9_]{1,16}", self.mcp_server_name.strip()) is None:
+                raise ValueError("MCP_SERVER_NAME 不合法")
         if self.database_startup_required:
             if len(self.postgres_password) < 12:
                 raise ValueError("POSTGRES_PASSWORD 未配置或过短")
@@ -224,6 +244,12 @@ class Settings(BaseSettings):
 
     def has_api_key(self) -> bool:
         return bool(self.deepseek_api_key.strip())
+
+    def mcp_arg_list(self) -> list[str]:
+        return [item.strip() for item in self.mcp_args.split(",") if item.strip()]
+
+    def mcp_allowlist(self) -> set[str]:
+        return {item.strip() for item in self.mcp_tool_allowlist.split(",") if item.strip()}
 
 
 @lru_cache

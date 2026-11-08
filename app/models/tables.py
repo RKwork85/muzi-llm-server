@@ -356,6 +356,119 @@ class RefreshToken(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     user: Mapped[User] = relationship(back_populates="refresh_tokens")
 
 
+class McpOAuthClient(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    __tablename__ = "mcp_oauth_clients"
+    __table_args__ = (
+        UniqueConstraint("connector_name", name="uq_mcp_oauth_clients_name"),
+        {"comment": "远程 MCP 动态注册得到的客户端。密钥只存密文。"},
+    )
+
+    connector_name: Mapped[str] = mapped_column(String(32), nullable=False)
+    client_id: Mapped[str] = mapped_column(String(256), nullable=False)
+    client_secret_encrypted: Mapped[str | None] = mapped_column(Text)
+
+
+class McpConnection(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "mcp_connections"
+    __table_args__ = (
+        UniqueConstraint("user_id", "connector_name", name="uq_mcp_connections_user_connector"),
+        CheckConstraint(
+            "status IN ('connected', 'needs_reauth')",
+            name="ck_mcp_connections_status",
+        ),
+        Index("ix_mcp_connections_user", "user_id"),
+        {"comment": "用户与远程 MCP 的授权。令牌只存密文。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_mcp_connections_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    connector_name: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="connected")
+    access_token_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    refresh_token_encrypted: Mapped[str | None] = mapped_column(Text)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    selected_tools: Mapped[Any] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+
+
+class McpOAuthState(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    __tablename__ = "mcp_oauth_states"
+    __table_args__ = (
+        UniqueConstraint("state_hash", name="uq_mcp_oauth_states_hash"),
+        CheckConstraint("state_hash ~ '^[0-9a-f]{64}$'", name="ck_mcp_oauth_states_hash"),
+        Index("ix_mcp_oauth_states_expires", "expires_at"),
+        {"comment": "一次性 OAuth state。验证码只存密文。"},
+    )
+
+    state_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_mcp_oauth_states_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    connector_name: Mapped[str] = mapped_column(String(32), nullable=False)
+    code_verifier_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class McpConnectorGrant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "mcp_connector_grants"
+    __table_args__ = (
+        UniqueConstraint("user_id", "connector_id", name="uq_mcp_connector_grants_user"),
+        Index("ix_mcp_connector_grants_user", "user_id"),
+        {"comment": "用户对某个 MCP 连接器的授权。不等于工具授权。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_mcp_connector_grants_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    connector_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class McpToolGrant(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "mcp_tool_grants"
+    __table_args__ = (
+        UniqueConstraint("user_id", "connector_id", "tool_name", name="uq_mcp_tool_grants_user_tool"),
+        Index("ix_mcp_tool_grants_user", "user_id", "connector_id"),
+        {"comment": "用户对某个连接器上单个工具的授权。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_mcp_tool_grants_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    connector_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class McpAuthorizationAudit(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    __tablename__ = "mcp_authorization_audits"
+    __table_args__ = (
+        Index("ix_mcp_authorization_audits_user", "user_id", "created_at"),
+        {"comment": "授权变更记录。不保存工具参数或令牌。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_mcp_authorization_audits_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    connector_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    tool_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    action: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
 def _register_listeners() -> None:
     from app.core.database.redaction import register_redaction_listeners
 

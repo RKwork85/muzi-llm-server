@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import get_chat_service
+from app.api.v1.endpoints.mcp import optional_mcp
+from app.mcp.service import McpService
 from app.api.errors import documented_errors, stream_preflight_errors
 from app.core.exceptions import InvalidRequestError
 from app.schemas.chat import (
@@ -26,6 +29,7 @@ from app.schemas.chat import (
 from app.services.chat_service import ChatService
 from app.tools.workspace_scope import scope_dirname
 
+logger = logging.getLogger("qs_llm")
 router = APIRouter(prefix="/chat", tags=["chat"])
 
 
@@ -100,6 +104,7 @@ async def stream_completion(
     ],
     request: Request,
     service: ChatService = Depends(get_chat_service),
+    mcp: McpService | None = Depends(optional_mcp),
 ) -> StreamingResponse:
     """与非流式接口共用提示词、模型和参数整理。
 
@@ -112,7 +117,20 @@ async def stream_completion(
     """
     if body.stream is False:
         raise InvalidRequestError("该接口只提供流式输出")
-    prepared = service.prepare_stream(body)
+    remote: list = []
+    user_id = None
+    if body.mode == "agent" and mcp is not None:
+        user_id = await mcp.user_id_from_request(request)
+        if user_id is not None:
+            try:
+                remote = await mcp.tool_specs(user_id)
+            except Exception:
+                logger.info("remote mcp tools skipped")
+                remote = []
+            from app.mcp.grants import sync_stdio
+
+            await sync_stdio(user_id, request.app.state.settings.mcp_server_name)
+    prepared = service.prepare_stream(body, remote, user_id)
     service.ensure_ready()
     return StreamingResponse(
         service.iter_sse(

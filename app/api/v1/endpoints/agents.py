@@ -11,6 +11,8 @@ from fastapi.responses import StreamingResponse
 from app.agents.models import AgentEventType, AgentRequest
 from app.agents.runtime import AgentRuntime
 from app.api.deps import get_agent_runtime
+from app.api.v1.endpoints.mcp import optional_mcp
+from app.mcp.service import McpService
 from app.core.context import get_request_id
 from app.core.exceptions import AgentTaskNotFoundError
 from app.core.sse import format_sse
@@ -35,11 +37,19 @@ async def create_run(
     body: AgentRequest,
     request: Request,
     runtime: AgentRuntime = Depends(get_agent_runtime),
+    mcp: McpService | None = Depends(optional_mcp),
 ) -> AgentTaskResponse:
+    user_id = await mcp.user_id_from_request(request) if mcp is not None else None
+    if mcp is not None and user_id is not None:
+        from app.mcp.grants import sync_stdio
+
+        await sync_stdio(user_id, request.app.state.settings.mcp_server_name)
     view = await runtime.start(
         body,
         get_request_id(),
         workspace_scope=scope_dirname(request.headers.get("x-workspace-key")),
+        mcp_user_id=user_id,
+        mcp_service=mcp,
     )
     return AgentTaskResponse.model_validate(view)
 
@@ -86,6 +96,7 @@ def _known_task(task_id: str) -> None:
 async def _frames(request: Request, publisher) -> object:
     queue = publisher.subscribe()
     try:
+        yield ": heartbeat\n\n"
         while True:
             if await request.is_disconnected():
                 break

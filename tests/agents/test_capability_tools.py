@@ -8,7 +8,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from app.agents.toolsets import agent_tool_names, ask_tool_names
+from app.agents.toolsets import agent_tool_names, ask_tool_names, plan_tool_names
 from app.services.chat_service import _download_files
 from app.tools.capabilities import supports_orchestration
 from app.data.context import CURRENT_OSS_CLIENT, CURRENT_TASK_ID
@@ -17,6 +17,7 @@ from app.tools.deliver_file import DeliverArgs, deliver_file
 from app.tools.docx_tool import DocBlock, WriteDocxArgs, write_docx
 from app.tools.file_changes import DeleteArgs, WriteArgs, delete_file, write_text_file
 from app.tools.registry import build_agent_registry
+from app.tools.code_runner import PythonArgs, run_python
 from app.tools.sandbox_command import CommandArgs, run_command
 from app.tools.weather import WeatherArgs, query_weather
 from app.tools.web_tools import CURRENT_SETTINGS
@@ -40,7 +41,14 @@ def test_capability_matrix_keeps_destructive_tools_behind_grants(tmp_path) -> No
     } <= ask
     assert "delete_file" not in ask
     assert "run_command" not in ask
+    assert "run_python" in ask
     assert supports_orchestration("ask") is False
+    plan = set(plan_tool_names(registry, settings))
+    assert {"web_search", "read_text_file", "calculator"} <= plan
+    assert "write_text_file" not in plan
+    assert "write_docx" not in plan
+    assert "deliver_file" not in plan
+    assert supports_orchestration("plan") is False
 
     agent = set(agent_tool_names(registry, settings, None, None))
     assert "weather_query" in agent
@@ -231,6 +239,35 @@ def test_sandbox_command_rejects_unlisted_and_escaping_arguments(tmp_path) -> No
             CommandArgs(command="cmd", args=["/c", "whoami"])
     finally:
         CURRENT_SETTINGS.reset(token)
+
+
+def test_run_python_executes_in_workspace_and_hides_local_paths(tmp_path) -> None:
+    marker = tmp_path / "note.txt"
+    marker.write_text("hello-code", encoding="utf-8")
+    token = CURRENT_SETTINGS.set(make_settings(tools_workspace_root=str(tmp_path), tools_sandbox_timeout_seconds=5))
+    try:
+        payload = json.loads(run_python(PythonArgs(code="print(6 * 7)\nprint(open('note.txt', encoding='utf-8').read())\n")))
+        missing = json.loads(run_python(PythonArgs(code="raise RuntimeError('boom')\n")))
+    finally:
+        CURRENT_SETTINGS.reset(token)
+    assert payload["exit_code"] == 0
+    assert "42" in payload["output"]
+    assert "hello-code" in payload["output"]
+    assert str(tmp_path) not in payload["output"]
+    assert missing["exit_code"] != 0
+    assert "boom" in missing["output"]
+    assert str(tmp_path) not in missing["output"]
+
+
+def test_run_python_times_out_and_needs_a_workspace(tmp_path) -> None:
+    token = CURRENT_SETTINGS.set(make_settings(tools_workspace_root=str(tmp_path), tools_sandbox_timeout_seconds=0.2))
+    try:
+        timed_out = json.loads(run_python(PythonArgs(code="import time\ntime.sleep(5)\n")))
+    finally:
+        CURRENT_SETTINGS.reset(token)
+    assert timed_out["error"]["code"] == "code_timeout"
+    denied = json.loads(run_python(PythonArgs(code="print(1)\n")))
+    assert denied["error"]["code"] == "code_unavailable"
 
 
 def test_sandbox_command_runs_allowlisted_name_in_workspace(tmp_path) -> None:

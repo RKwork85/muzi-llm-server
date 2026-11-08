@@ -66,11 +66,20 @@ def test_ask_stream_runs_tool_then_answers(app, provider: FakeProvider) -> None:
                 model="deepseek-flash",
                 finish_reason="tool_calls",
                 tool_call_parts=[(0, "call_calc", "calculator", '{"expression":"23 * 19"}')],
+                usage=UsageStats(10, 4, 14),
             )
         ]
     )
     provider.push(
-        [StreamChunk(content="437", id="s2", model="deepseek-flash", finish_reason="stop")]
+        [
+            StreamChunk(
+                content="437",
+                id="s2",
+                model="deepseek-flash",
+                finish_reason="stop",
+                usage=UsageStats(20, 2, 22),
+            )
+        ]
     )
     token = set_request_id("req-ask")
     try:
@@ -94,6 +103,8 @@ def test_ask_stream_runs_tool_then_answers(app, provider: FakeProvider) -> None:
     assert '"content":"437"' in body
     assert body.index("event: tool") < body.index("event: delta")
     assert "event: done" in body
+    assert '"total_tokens":14' in body
+    assert '"total_tokens":22' in body
     assert any(item.get("role") == "tool" for item in provider.calls[1].messages)
 
 

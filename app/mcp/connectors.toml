@@ -1,0 +1,8 @@
+# 远程 MCP 目录。由部署维护，请求不能增加项目。
+# transport 可以是 streamable_http 或 sse。allow_write 默认关闭。
+
+[notion]
+display_name = "Notion"
+transport = "streamable_http"
+url = "https://mcp.notion.com/mcp"
+allow_write = true

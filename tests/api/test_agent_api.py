@@ -97,7 +97,21 @@ def test_sse_delivers_terminal_without_reasoning(client: TestClient, provider: F
     assert _wait(client, task_id)["status"] == "completed"
 
 
-def test_deadline_cancel_and_disconnect(client: TestClient, provider: FakeProvider) -> None:
+def test_deadline_cancel_and_disconnect(provider: FakeProvider) -> None:
+    release = threading.Event()
+    try:
+        _deadline_cancel_and_disconnect(provider, release)
+    finally:
+        release.set()
+
+
+def _deadline_cancel_and_disconnect(provider: FakeProvider, release: threading.Event) -> None:
+    app = create_app(settings=make_settings(deepseek_timeout_seconds=30), provider=provider)
+    with TestClient(app) as client:
+        _assert_deadline_and_cancel(client, provider, release)
+
+
+def _assert_deadline_and_cancel(client: TestClient, provider: FakeProvider, release: threading.Event) -> None:
     async def slow(request):
         provider.calls.append(request)
         await asyncio.sleep(2)
@@ -117,7 +131,6 @@ def test_deadline_cancel_and_disconnect(client: TestClient, provider: FakeProvid
     assert finished["error_code"] == "AGENT_DEADLINE_EXCEEDED"
     assert finished["answer"] is None
 
-    release = threading.Event()
     entered = threading.Event()
 
     async def blocked(request):
@@ -133,8 +146,6 @@ def test_deadline_cancel_and_disconnect(client: TestClient, provider: FakeProvid
     )
     task_id = running.json()["task_id"]
     assert entered.wait(timeout=2)
-    with client.stream("GET", f"/api/v1/agents/runs/{task_id}/events") as stream:
-        assert stream.status_code == 200
     still_running = client.get(f"/api/v1/agents/runs/{task_id}").json()
     assert still_running["status"] in {"created", "running"}
     cancelled = client.post(f"/api/v1/agents/runs/{task_id}/cancel")
@@ -145,6 +156,33 @@ def test_deadline_cancel_and_disconnect(client: TestClient, provider: FakeProvid
     release.set()
     missing = client.get("/api/v1/agents/runs/not a task")
     assert missing.status_code == 404
+
+
+def test_sse_disconnect_ends_subscription_only() -> None:
+    """客户端断开只结束订阅。当前 ASGI 测试传输要等响应结束后才发出 disconnect。"""
+
+    async def scenario() -> None:
+        from app.agents.events import EventPublisher
+        from app.api.v1.endpoints.agents import _frames
+
+        publisher = EventPublisher(request_id="req", task_id="task", max_queue_size=10)
+        publisher.publish("agent.started", {})
+
+        class Request:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def is_disconnected(self) -> bool:
+                self.calls += 1
+                return self.calls > 1
+
+        frames: list[str] = []
+        async for frame in _frames(Request(), publisher):
+            frames.append(frame)
+        assert any(frame.startswith(": heartbeat") for frame in frames)
+        assert any("agent.started" in frame for frame in frames)
+
+    asyncio.run(scenario())
 
 
 def test_custom_runtime_settings_still_serve_health() -> None:
@@ -183,10 +221,16 @@ def test_default_agent_response_matches_m3_fields(client: TestClient, provider: 
 def test_unknown_and_offline_toolsets_use_new_error_codes(client: TestClient) -> None:
     unknown = client.post(
         "/api/v1/agents/runs",
-        json={"message": "搜索", "prompt_name": "default", "toolsets": ["mcp"]},
+        json={"message": "搜索", "prompt_name": "default", "toolsets": ["nope"]},
     )
     assert unknown.status_code == 422
     assert unknown.json()["error"]["code"] == "TOOLSET_UNKNOWN"
+    disabled = client.post(
+        "/api/v1/agents/runs",
+        json={"message": "搜索", "prompt_name": "default", "toolsets": ["mcp"]},
+    )
+    assert disabled.status_code == 403
+    assert disabled.json()["error"]["code"] == "TOOLSET_UNAVAILABLE"
     offline = client.post(
         "/api/v1/agents/runs",
         json={"message": "搜索", "prompt_name": "default", "toolsets": ["research"]},

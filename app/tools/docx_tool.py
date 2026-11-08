@@ -56,7 +56,7 @@ def write_docx(args: WriteDocxArgs) -> str:
                 "file_name": target.name,
                 "bytes": len(data),
                 "created": not existed,
-                "summary": "已生成 Word 文档。请调用 deliver_file，并把 download_url 原样发给用户。",
+                "summary": "已生成 Word 文档。请调用 deliver_file 取得文件位置。回答里只在最末尾写一次：另起一行「附件：文件名」，并把 download_url 作为 Markdown 链接原样接在后面。",
             },
             ensure_ascii=False,
         )

@@ -45,7 +45,7 @@ async def deliver_file(args: DeliverArgs) -> str:
                 "file_size": len(content),
                 "download_url": urls[0],
                 "kind": USER_DOWNLOAD_KIND,
-                "summary": "把 download_url 原样发给用户",
+                "summary": "文件位置只写在回答最末尾一次：另起一行「附件：文件名」，并把 download_url 作为 Markdown 链接原样接在后面。不要改写地址，也不要在正文里再写一遍。",
             },
             ensure_ascii=False,
         )

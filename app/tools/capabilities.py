@@ -2,6 +2,22 @@
 
 from __future__ import annotations
 
+PLAN_TOOLS = frozenset(
+    {
+        "calculator",
+        "get_current_time",
+        "web_search",
+        "web_fetch",
+        "weather_query",
+        "list_directory",
+        "read_text_file",
+        "search_text",
+        "create_flowchart",
+        "create_sequence_diagram",
+        "validate_mermaid",
+    }
+)
+
 ASK_TOOLS = frozenset(
     {
         "calculator",
@@ -18,6 +34,7 @@ ASK_TOOLS = frozenset(
         "create_flowchart",
         "create_sequence_diagram",
         "validate_mermaid",
+        "run_python",
     }
 )
 

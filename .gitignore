@@ -33,4 +33,4 @@ tests/agents/test_oss_upload.py
 dist/
 build/
 *.egg-info/ 
-./cursor/
+.cursor/

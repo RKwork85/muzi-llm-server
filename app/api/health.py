@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 
 from app.api.deps import get_settings_dep
 from app.core.config import Settings
+from app.mcp.keys import KeyConfigurationError, validate_key_config
 from app.schemas.common import HealthResponse, ReadyResponse
 
 router = APIRouter(tags=["health"])
@@ -23,11 +24,30 @@ def health() -> HealthResponse:
     response_model_exclude_none=True,
     summary="就绪检查",
 )
-def ready(settings: Settings = Depends(get_settings_dep)) -> ReadyResponse:
-    """只检查本进程是否已配置 API Key，不发起上游请求。"""
-    if settings.has_api_key():
+def ready(request: Request, settings: Settings = Depends(get_settings_dep)) -> ReadyResponse:
+    """开发环境只检查 API Key。生产环境同时要求数据库授权已经就绪。"""
+    if not settings.has_api_key():
+        return ReadyResponse(status="not_ready", reason="missing_api_key")
+    reason = production_readiness_reason(
+        settings,
+        database_ready=bool(getattr(request.app.state, "database_ready", False)),
+        grants_durable=bool(getattr(request.app.state, "mcp_grants_durable", False)),
+    )
+    if reason is None:
         return ReadyResponse(status="ready")
-    return ReadyResponse(status="not_ready", reason="missing_api_key")
+    return ReadyResponse(status="not_ready", reason=reason)
+
+
+def production_readiness_reason(settings: Settings, *, database_ready: bool, grants_durable: bool) -> str | None:
+    if settings.runtime_env.strip().lower() != "production":
+        return None
+    try:
+        validate_key_config(settings)
+    except KeyConfigurationError:
+        return "mcp_key_invalid"
+    if not database_ready or not grants_durable:
+        return "database_unavailable"
+    return None
 
 
 @router.get("/", include_in_schema=False)
