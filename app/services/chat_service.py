@@ -79,6 +79,7 @@ class ChatService:
         self.web_client: Any | None = None
         self.data_store: Any | None = None
         self.oss_client: Any | None = None
+        self.skill_runtime: Any | None = None
 
     async def complete(self, body: ChatCompletionRequest) -> ChatCompletionResponse:
         if body.stream:
@@ -167,7 +168,32 @@ class ChatService:
             extra = f"{extra}\n\n{UNTRUSTED_PROMPT}" if extra else UNTRUSTED_PROMPT
         if extra:
             system["content"] = f"{system['content']}\n\n{extra}"
+        self._apply_registered_skills(body, system, prepared.request_id, mcp_user_id)
         return prepared
+
+    def _apply_registered_skills(
+        self,
+        body: StreamChatRequest,
+        system: dict[str, Any],
+        request_id: str,
+        principal_id: str | None,
+    ) -> None:
+        if self.skill_runtime is None or not body.skill_mode:
+            return
+        from app.skills.discovery_models import DiscoveryMode
+
+        task = next((item.content for item in reversed(body.messages) if item.role == "user"), "")
+        prompt, _result = self.skill_runtime.apply(
+            system["content"],
+            principal_id=principal_id or "",
+            task_id=request_id,
+            task_text=task,
+            surface="chat",
+            mode=DiscoveryMode(body.skill_mode),
+            conversation_id=request_id,
+            explicit_skill_ids=tuple(body.explicit_skill_ids),
+        )
+        system["content"] = prompt
 
     def ensure_ready(self) -> None:
         ensure = getattr(self.provider, "ensure_ready", None)

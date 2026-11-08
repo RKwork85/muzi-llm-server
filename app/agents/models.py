@@ -91,6 +91,8 @@ class AgentRequest(BaseModel):
         max_length=3,
     )
     policy: RequestedPolicy | None = None
+    skill_mode: Literal["auto", "recommended", "explicit", "disabled"] | None = None
+    explicit_skill_ids: list[str] = Field(default_factory=list, max_length=3)
 
     @field_validator("grants")
     @classmethod
@@ -113,6 +115,16 @@ class AgentRequest(BaseModel):
         if any(_TOOLSET_NAME.fullmatch(item) is None for item in value):
             raise ValueError("toolset 名称不合法")
         return value
+
+    @field_validator("explicit_skill_ids")
+    @classmethod
+    def _explicit_skill_ids(cls, value: list[str]) -> list[str]:
+        seen: list[str] = []
+        for item in value:
+            if not re.fullmatch(r"sk_[a-z0-9]{8,32}", item) or item in seen:
+                raise ValueError("技能标识无效")
+            seen.append(item)
+        return seen
 
 
 class AgentRunState(BaseModel):

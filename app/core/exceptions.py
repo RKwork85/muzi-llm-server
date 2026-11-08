@@ -103,6 +103,24 @@ class PromptVariableError(AppError):
         super().__init__(f"提示词变量缺失: {names}")
 
 
+class SkillFlowError(AppError):
+    """技能发现或加载失败。安全拒绝不能当成普通的无匹配。"""
+
+    default_message = "技能暂时不可用"
+
+    def __init__(self, code: str, message: str | None = None) -> None:
+        self.code = code
+        self.status_code = {
+            "SKILL_NOT_FOUND": 404,
+            "SKILL_NOT_ACCESSIBLE": 403,
+            "SKILL_RESOURCE_NOT_ALLOWED": 403,
+            "SKILL_PACKAGE_INVALID": 422,
+            "SKILL_CONTENT_TOO_LARGE": 422,
+            "SKILL_CONTEXT_BUDGET_EXCEEDED": 422,
+        }.get(code, 409)
+        super().__init__(message or self.default_message)
+
+
 class InvalidRequestError(AppError):
     code = "REQUEST_VALIDATION_ERROR"
     status_code = 422

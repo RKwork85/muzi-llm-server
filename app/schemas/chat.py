@@ -152,6 +152,8 @@ class StreamChatRequest(ChatRequestBase):
     response_format: ResponseFormat | None = None
     mode: Literal["ask", "plan", "agent"] = "ask"
     skill_names: list[str] = Field(default_factory=list, max_length=8)
+    skill_mode: Literal["auto", "recommended", "explicit", "disabled"] | None = None
+    explicit_skill_ids: list[str] = Field(default_factory=list, max_length=3)
 
     @field_validator("skill_names")
     @classmethod
@@ -163,6 +165,16 @@ class StreamChatRequest(ChatRequestBase):
             if name not in cleaned:
                 cleaned.append(name)
         return cleaned
+
+    @field_validator("explicit_skill_ids")
+    @classmethod
+    def _explicit_skill_ids(cls, value: list[str]) -> list[str]:
+        seen: list[str] = []
+        for item in value:
+            if not re.fullmatch(r"sk_[a-z0-9]{8,32}", item) or item in seen:
+                raise ValueError("技能标识无效")
+            seen.append(item)
+        return seen
 
 
 class ToolCallRequest(ChatRequestBase):

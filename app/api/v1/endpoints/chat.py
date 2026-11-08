@@ -118,18 +118,16 @@ async def stream_completion(
     if body.stream is False:
         raise InvalidRequestError("该接口只提供流式输出")
     remote: list = []
-    user_id = None
-    if body.mode == "agent" and mcp is not None:
-        user_id = await mcp.user_id_from_request(request)
-        if user_id is not None:
-            try:
-                remote = await mcp.tool_specs(user_id)
-            except Exception:
-                logger.info("remote mcp tools skipped")
-                remote = []
-            from app.mcp.grants import sync_stdio
+    user_id = await mcp.user_id_from_request(request) if mcp is not None else None
+    if body.mode == "agent" and mcp is not None and user_id is not None:
+        try:
+            remote = await mcp.tool_specs(user_id)
+        except Exception:
+            logger.info("remote mcp tools skipped")
+            remote = []
+        from app.mcp.grants import sync_stdio
 
-            await sync_stdio(user_id, request.app.state.settings.mcp_server_name)
+        await sync_stdio(user_id, request.app.state.settings.mcp_server_name)
     prepared = service.prepare_stream(body, remote, user_id)
     service.ensure_ready()
     return StreamingResponse(

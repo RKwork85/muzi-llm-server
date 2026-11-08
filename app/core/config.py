@@ -104,6 +104,7 @@ class Settings(BaseSettings):
     data_sample_rows: int = Field(default=3, ge=0, le=5)
     data_max_package_files: int = Field(default=20, ge=1, le=50)
     data_max_package_bytes: int = Field(default=2_000_000, ge=1024, le=8_000_000)
+    skills_root: str = ""
     oss_upload_base_url: str = ""
     oss_upload_prefix: str = "agent-data"
     oss_upload_timeout_seconds: float = Field(default=20, gt=0, le=30)

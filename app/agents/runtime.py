@@ -77,6 +77,8 @@ class AgentRuntime:
         )
         self._network_gate = asyncio.Semaphore(settings.tools_network_concurrency)
         self._cleanup_timeout = settings.agent_cancel_cleanup_seconds
+        self.skill_runtime: object | None = None
+        self._skill_principals: dict[str, str] = {}
 
     @property
     def tasks(self) -> TaskManager:
@@ -138,12 +140,37 @@ class AgentRuntime:
             task_id=record.task_id,
             max_queue_size=policy.max_event_queue_size,
         )
+        prompt = self._apply_registered_skills(prompt, request, record.task_id, mcp_user_id)
         worker = asyncio.create_task(
             self._execute(record, request.message, prompt, policy, workspace_scope, mcp_user_id, registry),
             name=f"agent:{record.task_id}",
         )
         record.worker = worker
         return record.view()
+
+    def _apply_registered_skills(
+        self,
+        prompt: str,
+        request: AgentRequest,
+        task_id: str,
+        principal_id: str | None,
+    ) -> str:
+        if self.skill_runtime is None or not request.skill_mode:
+            return prompt
+        from app.skills.discovery_models import DiscoveryMode
+
+        updated, _result = self.skill_runtime.apply(  # type: ignore[attr-defined]
+            prompt,
+            principal_id=principal_id or "",
+            task_id=task_id,
+            task_text=request.message,
+            surface="agent",
+            mode=DiscoveryMode(request.skill_mode),
+            explicit_skill_ids=tuple(request.explicit_skill_ids),
+        )
+        if principal_id:
+            self._skill_principals[task_id] = principal_id
+        return updated
 
     def get(self, task_id: str) -> dict[str, object]:
         return self._tasks.get(task_id).view()
@@ -154,6 +181,9 @@ class AgentRuntime:
         if record.status in TERMINAL_TASK_STATUSES or not isinstance(worker, asyncio.Task):
             return record.view()
         worker.cancel()
+        principal = self._skill_principals.get(task_id)
+        if self.skill_runtime is not None and principal:
+            self.skill_runtime.orchestrator.cancel(task_id, principal_id=principal)  # type: ignore[attr-defined]
         try:
             await asyncio.wait_for(asyncio.shield(worker), timeout=self._cleanup_timeout)
         except TimeoutError:
@@ -275,9 +305,11 @@ class AgentRuntime:
         try:
             result = await loop.run()
             self._publish_terminal(record, result, publisher)
+            self._finish_registered_skills(record.task_id, failed=result.error_code)
         except asyncio.CancelledError:
             if self._tasks.finish_cancelled(record):
                 publisher.publish("agent.cancelled", {"error_code": "AGENT_CANCELLED"})
+            self._finish_registered_skills(record.task_id, cancelled=True)
             raise
         except Exception as exc:
             logger.error(
@@ -295,6 +327,7 @@ class AgentRuntime:
                 usage=None,
             )
             self._publish_terminal(record, failed, publisher)
+            self._finish_registered_skills(record.task_id, failed="AGENT_INTERNAL_ERROR")
 
     def _publish_terminal(self, record: TaskRecord, result: LoopResult, publisher: EventPublisher) -> None:
         accepted = self._tasks.finish(record, result)
@@ -307,3 +340,21 @@ class AgentRuntime:
         if publisher.dropped:
             data["dropped_events"] = publisher.dropped
         publisher.publish(_TERMINAL_EVENT[result.status], data)
+
+    def _finish_registered_skills(
+        self,
+        task_id: str,
+        *,
+        failed: str | None = None,
+        cancelled: bool = False,
+    ) -> None:
+        principal = self._skill_principals.get(task_id)
+        if self.skill_runtime is None or not principal:
+            return
+        orchestrator = self.skill_runtime.orchestrator  # type: ignore[attr-defined]
+        if cancelled:
+            orchestrator.cancel(task_id, principal_id=principal)
+        elif failed:
+            orchestrator.fail(task_id, principal_id=principal, error_code=failed)
+        else:
+            orchestrator.complete(task_id, principal_id=principal)
