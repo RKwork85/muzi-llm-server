@@ -34,3 +34,5 @@ dist/
 build/
 *.egg-info/ 
 .cursor/
+vendor/superpowers/
+skills_data/

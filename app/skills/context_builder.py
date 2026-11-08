@@ -34,7 +34,7 @@ class BuiltContext(BaseModel):
 
 
 class ContextBuilder:
-    def __init__(self, *, budget_chars: int = 8000) -> None:
+    def __init__(self, *, budget_chars: int = 72000) -> None:
         self._budget = budget_chars
 
     def build(
