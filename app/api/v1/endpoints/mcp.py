@@ -16,7 +16,7 @@ from app.mcp.pool import production_pool
 from app.mcp.service import McpService
 from app.mcp.store import SqlStore
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 router = APIRouter(prefix="/mcp", tags=["mcp"])
 
 

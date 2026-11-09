@@ -5,7 +5,7 @@
 | ID | 项 | 等级 | 结果 | 证据 |
 |---|---|---|---|---|
 | A04-01 | stdout 帧解析 | MUST | PASS | 支持换行 JSON 和 `Content-Length`。`test_framed_stdio_round_trip`、`test_handshake_allowlist_env_and_reverse` |
-| A04-02 | 日志不进 stdout | MUST | PASS | stderr 设为 `DEVNULL`。客户端日志走 `qs_llm` logger，不写子进程 stdout |
+| A04-02 | 日志不进 stdout | MUST | PASS | stderr 设为 `DEVNULL`。客户端日志走 `muzi_llm` logger，不写子进程 stdout |
 | A04-03 | 子进程退出与回收 | SHOULD | PARTIAL | `aclose` 能关闭和 kill。工具超时不结束子进程，测试明确断言进程对象不变 |
 | A04-04 | 环境与工作目录 | SHOULD | PARTIAL | 环境被裁剪。没有设置独立 `cwd`，子进程继承服务进程工作目录 |
 | A04-05 | 消息大小 | PROJECT | PASS | 单条上限 1_000_000 字节，超出抛 `mcp message invalid` |

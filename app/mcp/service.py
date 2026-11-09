@@ -31,7 +31,7 @@ from app.models.mixins import utcnow
 from app.tools.mcp_client import McpArgs, _description, _schema
 from app.tools.registry import ToolRegistry, ToolSpec
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 _WRITE = re.compile(r"(create|update|delete|insert|remove|write|append|patch|move|trash|destroy)", re.I)
 _REMOTE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 _LOCAL = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -664,7 +664,24 @@ class McpService:
                     {"name": _remote, "arguments": payload},
                 )
                 result = message.get("result")
-                if not isinstance(result, dict) or result.get("isError") is True:
+                if not isinstance(result, dict):
+                    scope = CURRENT_MCP_SCOPE.get()
+                    logger.warning(
+                        "mcp remote tool returned invalid result request_id=%s connector=%s tool=%s",
+                        scope.request_id if scope is not None else "-",
+                        _connector.name,
+                        _remote,
+                    )
+                    raise RuntimeError("mcp tool failed")
+                if result.get("isError") is True:
+                    scope = CURRENT_MCP_SCOPE.get()
+                    logger.warning(
+                        "mcp remote tool returned error request_id=%s connector=%s tool=%s category=%s",
+                        scope.request_id if scope is not None else "-",
+                        _connector.name,
+                        _remote,
+                        _remote_error_category(result),
+                    )
                     raise RuntimeError("mcp tool failed")
                 chunks: list[str] = []
                 content = result.get("content")
@@ -717,6 +734,30 @@ def overlay_tools(settings: Settings, base_registry: ToolRegistry, extras: list[
         registry.register(spec)
     del settings
     return registry
+
+
+def _remote_error_category(result: dict[str, Any]) -> str:
+    """Classify MCP error text without writing page content or raw errors to logs."""
+    content = result.get("content")
+    fragments = [
+        item["text"]
+        for item in content
+        if isinstance(item, dict) and item.get("type") == "text" and isinstance(item.get("text"), str)
+    ] if isinstance(content, list) else []
+    message = " ".join(fragments).lower()
+    if any(term in message for term in ("permission", "forbidden", "access denied", "not shared")):
+        return "permission_denied"
+    if any(term in message for term in ("unauthorized", "token expired", "reauthoriz")):
+        return "authentication_required"
+    if any(term in message for term in ("not found", "does not exist", "could not find")):
+        return "resource_not_found"
+    if any(term in message for term in ("rate limit", "too many requests")):
+        return "rate_limited"
+    if any(term in message for term in ("invalid", "required", "missing", "validation")):
+        return "invalid_arguments"
+    if "timeout" in message or "timed out" in message:
+        return "remote_timeout"
+    return "remote_tool_error"
 
 
 def _resource_metadata(header: str, resource: str) -> str | None:

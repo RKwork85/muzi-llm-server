@@ -1,0 +1,201 @@
+{
+  "$defs": {
+    "InteractionOption": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "label": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Label",
+          "type": "string"
+        },
+        "description": {
+          "anyOf": [
+            {
+              "maxLength": 500,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Description"
+        },
+        "recommended": {
+          "default": false,
+          "title": "Recommended",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "label"
+      ],
+      "title": "InteractionOption",
+      "type": "object"
+    },
+    "InteractionStatus": {
+      "enum": [
+        "pending",
+        "submitted",
+        "skipped",
+        "expired",
+        "superseded",
+        "cancelled"
+      ],
+      "title": "InteractionStatus",
+      "type": "string"
+    },
+    "InteractionType": {
+      "enum": [
+        "single_select",
+        "multi_select",
+        "text_input",
+        "confirmation",
+        "plan_review",
+        "progress",
+        "error"
+      ],
+      "title": "InteractionType",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "single_select",
+              "multi_select"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "options": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "type": {
+            "enum": [
+              "text_input",
+              "confirmation",
+              "plan_review",
+              "progress",
+              "error"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "options": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ],
+  "properties": {
+    "protocol_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Protocol Version",
+      "type": "string"
+    },
+    "interaction_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Interaction Id",
+      "type": "string"
+    },
+    "plan_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Plan Id",
+      "type": "string"
+    },
+    "plan_revision": {
+      "minimum": 0,
+      "title": "Plan Revision",
+      "type": "integer"
+    },
+    "type": {
+      "$ref": "#/$defs/InteractionType"
+    },
+    "prompt": {
+      "maxLength": 2000,
+      "minLength": 1,
+      "title": "Prompt",
+      "type": "string"
+    },
+    "description": {
+      "anyOf": [
+        {
+          "maxLength": 4000,
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Description"
+    },
+    "status": {
+      "$ref": "#/$defs/InteractionStatus"
+    },
+    "options": {
+      "items": {
+        "$ref": "#/$defs/InteractionOption"
+      },
+      "maxItems": 20,
+      "title": "Options",
+      "type": "array"
+    },
+    "constraints": {
+      "additionalProperties": true,
+      "title": "Constraints",
+      "type": "object"
+    },
+    "expires_at": {
+      "anyOf": [
+        {
+          "format": "date-time",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Expires At"
+    }
+  },
+  "required": [
+    "interaction_id",
+    "plan_id",
+    "plan_revision",
+    "type",
+    "prompt",
+    "status"
+  ],
+  "title": "Interaction",
+  "type": "object"
+}

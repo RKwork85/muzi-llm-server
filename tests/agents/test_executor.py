@@ -306,7 +306,7 @@ async def test_handler_exception_is_sanitized_and_not_retried(caplog: pytest.Log
 
     registry = _registry_of(_spec("boom", handler))
     policy = _policy(allowed_tools=("boom",))
-    with caplog.at_level(logging.ERROR, logger="qs_llm"):
+    with caplog.at_level(logging.ERROR, logger="muzi_llm"):
         result = await _executor(registry, ("boom",)).execute(
             tool_call_id="call_boom",
             tool_name="boom",

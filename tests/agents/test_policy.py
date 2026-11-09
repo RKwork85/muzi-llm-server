@@ -43,15 +43,15 @@ def _request(payload: dict[str, object] | None = None):
 
 def test_default_policy_matches_documented_limits() -> None:
     policy = default_server_policy(build_default_registry())
-    assert policy.max_steps == DEFAULT_MAX_STEPS == 11
-    assert policy.max_tool_calls == DEFAULT_MAX_TOOL_CALLS == 10
-    assert policy.max_tool_calls_per_step == DEFAULT_MAX_TOOL_CALLS_PER_STEP == 3
-    assert policy.max_wall_time_seconds == DEFAULT_MAX_WALL_TIME_SECONDS == 30
-    assert policy.model_timeout_seconds == DEFAULT_MODEL_TIMEOUT_SECONDS == 60
-    assert policy.tool_timeout_seconds == DEFAULT_TOOL_TIMEOUT_SECONDS == 2
-    assert policy.max_context_messages == DEFAULT_MAX_CONTEXT_MESSAGES == 20
-    assert policy.max_context_chars == DEFAULT_MAX_CONTEXT_CHARS == 32000
-    assert policy.max_tool_result_chars == DEFAULT_MAX_TOOL_RESULT_CHARS == 4000
+    assert policy.max_steps == DEFAULT_MAX_STEPS == 30
+    assert policy.max_tool_calls == DEFAULT_MAX_TOOL_CALLS == 60
+    assert policy.max_tool_calls_per_step == DEFAULT_MAX_TOOL_CALLS_PER_STEP == 8
+    assert policy.max_wall_time_seconds == DEFAULT_MAX_WALL_TIME_SECONDS == 180.0
+    assert policy.model_timeout_seconds == DEFAULT_MODEL_TIMEOUT_SECONDS == 120.0
+    assert policy.tool_timeout_seconds == DEFAULT_TOOL_TIMEOUT_SECONDS == 5.0
+    assert policy.max_context_messages == DEFAULT_MAX_CONTEXT_MESSAGES == 40
+    assert policy.max_context_chars == DEFAULT_MAX_CONTEXT_CHARS == 64000
+    assert policy.max_tool_result_chars == DEFAULT_MAX_TOOL_RESULT_CHARS == 6000
     assert policy.max_event_queue_size == DEFAULT_MAX_EVENT_QUEUE_SIZE == 100
     assert policy.allowed_tools == ("calculator", "get_current_time")
     assert policy.max_steps <= HARD_MAX_STEPS
@@ -67,7 +67,7 @@ def test_settings_policy_uses_phase1_ceilings() -> None:
     assert policy.model_timeout_seconds == 5
     assert policy.tool_timeout_seconds == 0.2
     assert policy.max_tool_result_chars == 1000
-    assert policy.max_steps == 11
+    assert policy.max_steps == 30
     view = registered_tool_view(build_default_registry().get("calculator"))
     assert view.enabled is True
     assert view.risk_level == "low"
@@ -251,16 +251,16 @@ def test_merge_is_deterministic_and_isolated_from_later_mutation() -> None:
 def test_run_clock_keeps_wall_model_and_tool_budgets_distinct() -> None:
     policy = default_server_policy(build_default_registry())
     clock = RunClock.start(policy, now=100.0)
-    assert clock.remaining(now=100.0) == 30
-    assert clock.model_timeout(now=100.0) == 30
-    assert clock.tool_timeout(now=100.0) == 2
-    assert clock.remaining(now=120.0) == 10
-    assert clock.model_timeout(now=120.0) == 10
-    assert clock.tool_timeout(now=125.0) == 2
-    assert clock.remaining(now=140.0) == -10
-    assert clock.tool_timeout(now=140.0) < 0
+    assert clock.remaining(now=100.0) == 180
+    assert clock.model_timeout(now=100.0) == 120
+    assert clock.tool_timeout(now=100.0) == 5
+    assert clock.remaining(now=200.0) == 80
+    assert clock.model_timeout(now=200.0) == 80
+    assert clock.tool_timeout(now=250.0) == 5
+    assert clock.remaining(now=300.0) == -20
+    assert clock.tool_timeout(now=300.0) < 0
     assert clock.elapsed(now=90.0) == 0
-    assert clock.model_timeout(now=90.0) == 30
+    assert clock.model_timeout(now=90.0) == 120
 
 
 def test_domain_status_values_are_closed() -> None:

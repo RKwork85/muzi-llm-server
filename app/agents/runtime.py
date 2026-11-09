@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from typing import Callable
 
 from app.agents.context import ContextManager
 from app.agents.events import EventPublisher
 from app.agents.executor import ToolExecutor
 from app.agents.loop import AgentLoop, LoopResult
-from app.agents.models import TERMINAL_TASK_STATUSES, AgentRequest, TaskStatus
+from app.agents.models import TERMINAL_TASK_STATUSES, AgentRequest, EventEnvelope, TaskStatus
 from app.agents.policy import (
     ExecutionPolicy,
     PolicyError,
@@ -40,7 +41,7 @@ from app.tools.web_tools import CURRENT_SETTINGS, CURRENT_URL_LEDGER, UNTRUSTED_
 from app.tools.workspace_scope import CURRENT_WORKSPACE_SCOPE, is_user_scope
 from app.skills.tools import CURRENT_SKILL_PRINCIPAL, CURRENT_SKILL_RUNTIME, SKILL_USAGE_INSTRUCTION
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 
 _TERMINAL_EVENT = {
     TaskStatus.COMPLETED: "agent.completed",
@@ -93,6 +94,8 @@ class AgentRuntime:
         workspace_scope: str | None = None,
         mcp_user_id: str | None = None,
         mcp_service: object | None = None,
+        task_id: str | None = None,
+        event_observer: Callable[[EventEnvelope], None] | None = None,
     ) -> dict[str, object]:
         try:
             granted = agent_tool_names(
@@ -137,11 +140,12 @@ class AgentRuntime:
         if selected & {"research", "workspace", "data", "weather"} or set(granted) & sensitive:
             prompt = f"{prompt}\n\n{UNTRUSTED_PROMPT}"
         registry = overlay_tools(self._settings, self._registry, remote) if remote else self._registry
-        record = self._tasks.create(request_id)
+        record = self._tasks.create(request_id, task_id=task_id)
         record.publisher = EventPublisher(
             request_id=record.request_id,
             task_id=record.task_id,
             max_queue_size=policy.max_event_queue_size,
+            observer=event_observer,
         )
         prompt = self._apply_registered_skills(prompt, request, record.task_id, mcp_user_id)
         worker = asyncio.create_task(
@@ -192,6 +196,7 @@ class AgentRuntime:
         except TimeoutError:
             if self._tasks.finish_cancelled(record) and record.publisher is not None:
                 record.publisher.publish("agent.cancelled", {"error_code": "AGENT_CANCELLED"})
+                await record.publisher.drain_observer()
         except asyncio.CancelledError:
             current = asyncio.current_task()
             if current is not None and current.cancelling():
@@ -317,10 +322,12 @@ class AgentRuntime:
         try:
             result = await loop.run()
             self._publish_terminal(record, result, publisher)
+            await publisher.drain_observer()
             self._finish_registered_skills(record.task_id, failed=result.error_code)
         except asyncio.CancelledError:
             if self._tasks.finish_cancelled(record):
                 publisher.publish("agent.cancelled", {"error_code": "AGENT_CANCELLED"})
+            await publisher.drain_observer()
             self._finish_registered_skills(record.task_id, cancelled=True)
             raise
         except Exception as exc:
@@ -339,6 +346,7 @@ class AgentRuntime:
                 usage=None,
             )
             self._publish_terminal(record, failed, publisher)
+            await publisher.drain_observer()
             self._finish_registered_skills(record.task_id, failed="AGENT_INTERNAL_ERROR")
 
     def _publish_terminal(self, record: TaskRecord, result: LoopResult, publisher: EventPublisher) -> None:

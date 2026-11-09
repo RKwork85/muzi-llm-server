@@ -1,4 +1,4 @@
-# qs_llm_dp 项目架构
+# muzi-llm-server 项目架构
 
 本文只描述当前仓库里已经存在的代码。类名、函数名和路径都来自 `app/` 与测试。设计文档里尚未编码的内容单独放在第 11 节。
 
@@ -6,7 +6,7 @@
 
 ## 1. 项目定位
 
-`qs_llm_dp` 是一个进程内的 FastAPI 服务。它把 DeepSeek Chat Completions 包成两类调用：
+`muzi-llm-server` 是一个进程内的 FastAPI 服务。它把 DeepSeek Chat Completions 包成两类调用：
 
 - Phase 1 对话：一次或少数几轮的 HTTP 补全、SSE，以及 `ChatService.run_tool_loop` 里的工具循环。
 - Phase 2/3 Agent：`AgentRuntime` 在后台任务里反复调用同一个模型，并按 toolset 执行工具。`data` 工具会在受控目录里生成新文件，不改项目源码。
@@ -18,7 +18,7 @@
 ## 2. 目录结构
 
 ```text
-qs_llm_dp/
+muzi-llm-server/
   app/
     main.py                      # create_app、lifespan、中间件、异常处理
     api/

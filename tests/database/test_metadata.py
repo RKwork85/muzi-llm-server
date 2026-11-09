@@ -14,6 +14,20 @@ EXPECTED_TABLES = {
     "tool_calls",
     "events",
     "refresh_tokens",
+    "mcp_oauth_clients",
+    "mcp_connections",
+    "mcp_oauth_states",
+    "mcp_connector_grants",
+    "mcp_tool_grants",
+    "mcp_authorization_audits",
+    "plans",
+    "plan_revisions",
+    "plan_decisions",
+    "plan_interactions",
+    "interaction_submissions",
+    "plan_events",
+    "plan_event_outbox",
+    "plan_actions",
 }
 
 ON_DELETE = {
@@ -27,10 +41,28 @@ ON_DELETE = {
     ("events", "task_id"): "CASCADE",
     ("events", "execution_id"): "CASCADE",
     ("refresh_tokens", "user_id"): "CASCADE",
+    ("mcp_connections", "user_id"): "CASCADE",
+    ("mcp_oauth_states", "user_id"): "CASCADE",
+    ("mcp_connector_grants", "user_id"): "CASCADE",
+    ("mcp_tool_grants", "user_id"): "CASCADE",
+    ("mcp_authorization_audits", "user_id"): "CASCADE",
+    ("plans", "conversation_id"): "CASCADE",
+    ("plans", "owner_id"): "CASCADE",
+    ("plan_revisions", "plan_id"): "CASCADE",
+    ("plan_decisions", "plan_id"): "CASCADE",
+    ("plan_interactions", "plan_id"): "CASCADE",
+    ("interaction_submissions", "plan_id"): "CASCADE",
+    ("interaction_submissions", "interaction_id"): "CASCADE",
+    ("interaction_submissions", "owner_id"): "CASCADE",
+    ("plan_events", "plan_id"): "CASCADE",
+    ("plan_events", "conversation_id"): "CASCADE",
+    ("plan_event_outbox", "event_id"): "CASCADE",
+    ("plan_actions", "plan_id"): "CASCADE",
+    ("plan_actions", "owner_id"): "CASCADE",
 }
 
 
-def test_nine_business_tables_exist() -> None:
+def test_business_tables_exist() -> None:
     assert set(Base.metadata.tables) == EXPECTED_TABLES
 
 

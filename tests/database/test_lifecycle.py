@@ -20,8 +20,8 @@ def test_log_redacts_database_password(caplog: pytest.LogCaptureFixture) -> None
     secret = "postgres-secret-value"
     settings = make_settings(postgres_password=secret, redis_password="redis-secret-value")
     setup_logging(settings)
-    caplog.set_level(logging.INFO, logger="qs_llm")
-    logging.getLogger("qs_llm").info("dsn %s", secret)
+    caplog.set_level(logging.INFO, logger="muzi_llm")
+    logging.getLogger("muzi_llm").info("dsn %s", secret)
     assert secret not in caplog.text
 
 

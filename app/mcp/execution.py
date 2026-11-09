@@ -114,14 +114,19 @@ async def _attempt(
             raise
         except PermissionError:
             raise
-        except Exception:
+        except Exception as exc:
             metrics.add("mcp_tool_errors_total")
             breaker_for(ctx.connector_id).failure()
             if attempt == 1 and ctx.idempotent:
                 metrics.add("mcp_retry_total")
                 mcp_log("mcp.tool.retry", **_fields(ctx, status="retry"))
                 continue
-            mcp_log("mcp.tool.failed", **_fields(ctx, status="failed" if ctx.idempotent else "unknown"))
+            mcp_log(
+                "mcp.tool.failed",
+                **_fields(ctx, status="failed" if ctx.idempotent else "unknown"),
+                error_type=type(exc).__name__,
+                error_reason=getattr(exc, "reason", ""),
+            )
             raise
         finally:
             metrics.bump("mcp_active_calls", -1)

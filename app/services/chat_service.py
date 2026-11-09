@@ -38,6 +38,7 @@ from app.schemas.chat import (
 from app.schemas.common import Usage
 from app.data.context import CURRENT_DATA_STORE, CURRENT_OSS_CLIENT, CURRENT_TASK_ID
 from app.services.prompt_service import PromptService
+from app.core.exceptions import PromptNotFoundError
 from app.mcp.service import overlay_tools
 from app.services.tool_service import ToolService
 from app.tools.registry import ToolRegistry, ToolSpec
@@ -49,7 +50,7 @@ from app.tools.web_tools import CURRENT_SETTINGS, CURRENT_URL_LEDGER, CURRENT_WE
 from app.tools.workspace_scope import CURRENT_WORKSPACE_SCOPE, is_user_scope
 from app.skills.tools import CURRENT_SKILL_PRINCIPAL, CURRENT_SKILL_RUNTIME, SKILL_USAGE_INSTRUCTION
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 ChatBody = ChatCompletionRequest | StreamChatRequest | ToolCallRequest
 
 
@@ -166,7 +167,7 @@ class ChatService:
         prepared.mcp_user_id = mcp_user_id if mode == "agent" else None
         prepared.principal_id = mcp_user_id
         system = prepared.provider_request.messages[0]
-        extra = _mode_prompt(mode, list(body.skill_names))
+        extra = _mode_prompt(mode, list(body.skill_names), self._plan_instructions())
         if self.skill_runtime is not None and "discover_skills" in names and body.skill_mode != "explicit":
             extra = f"{extra}\n\n{SKILL_USAGE_INSTRUCTION}" if extra else SKILL_USAGE_INSTRUCTION
         if use_tools and (remote or self._ask_needs_untrusted(names)):
@@ -269,7 +270,16 @@ class ChatService:
         last_finish = "stop"
         parts: list[str] = []
         try:
-            async for chunk in stream:
+            iterator = stream.__aiter__()
+            while True:
+                try:
+                    chunk = await asyncio.wait_for(
+                        iterator.__anext__(), self.settings.deepseek_timeout_seconds
+                    )
+                except StopAsyncIteration:
+                    break
+                except TimeoutError:
+                    raise UpstreamTimeoutError() from None
                 if await is_disconnected():
                     logger.info("stream client disconnected request_id=%s", prepared.request_id)
                     return
@@ -591,6 +601,16 @@ class ChatService:
             return ()
         return chat_mode_tool_names(self.ask_tools.registry, self.settings, mode, user_id)
 
+    def _plan_instructions(self) -> str:
+        """Plan 模式的行为说明来自 app/prompts/system/plan_mode.md。
+
+        文件缺失或为空时返回空字符串，由 _mode_prompt 退回内置的精简说明。
+        """
+        try:
+            return self.prompts.render("plan_mode").strip()
+        except PromptNotFoundError:
+            return ""
+
     def _ask_needs_untrusted(self, names: tuple[str, ...]) -> bool:
         if self.ask_tools is None:
             return False
@@ -757,14 +777,18 @@ def _download_payload(content: Any) -> dict[str, Any] | None:
     }
 
 
-def _mode_prompt(mode: str, skill_names: list[str]) -> str:
+_DEFAULT_PLAN_PROMPT = (
+    "你处于 Plan 模式。只能使用只读工具了解情况，然后输出计划：目标和有顺序的步骤。"
+    "不要写文件，不要声称已经修改了外部应用。"
+    "需要写入、发送文件或调用外部应用时，写明交给 Agent 执行。"
+)
+
+
+def _mode_prompt(mode: str, skill_names: list[str], plan_instructions: str = "") -> str:
     if mode == "plan":
         note = skill_notes(skill_names, execute=False)
-        text = (
-            "你处于 Plan 模式。只能使用只读工具了解情况，然后输出计划：目标和有顺序的步骤。"
-            "不要写文件，不要声称已经修改了外部应用。"
-            "需要写入、发送文件或调用外部应用时，写明交给 Agent 执行。"
-        )
+        # 优先使用 app/prompts/system/plan_mode.md 的完整说明
+        text = (plan_instructions or "").strip() or _DEFAULT_PLAN_PROMPT
         return f"{text}\n\n{note}" if note else text
     if mode == "agent":
         return skill_notes(skill_names, execute=True)

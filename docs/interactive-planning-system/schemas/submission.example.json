@@ -1,0 +1,6 @@
+{
+  "interaction_id": "int_1",
+  "expected_plan_revision": 3,
+  "client_submission_id": "uuid-or-ulid",
+  "value": "rbac"
+}

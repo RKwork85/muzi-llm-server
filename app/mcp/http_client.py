@@ -23,7 +23,7 @@ from app.mcp.protocol import (
     server_reply,
 )
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 
 
 @dataclass

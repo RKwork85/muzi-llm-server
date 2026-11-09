@@ -23,7 +23,7 @@ from app.providers.base import ToolCall
 from app.tools.registry import ToolRegistry, ToolSpec
 from app.tools.web_client import WebCallError
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 _CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 

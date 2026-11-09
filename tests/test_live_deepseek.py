@@ -70,7 +70,7 @@ def _assert_no_secret(*chunks: str) -> None:
 
 @pytest.fixture
 def live_logs(caplog: pytest.LogCaptureFixture):
-    caplog.set_level(logging.INFO, logger="qs_llm")
+    caplog.set_level(logging.INFO, logger="muzi_llm")
     return caplog
 
 

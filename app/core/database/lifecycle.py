@@ -11,7 +11,7 @@ from app.core.config import Settings
 from app.core.database.redis import close_redis, get_redis, init_redis
 from app.core.database.session import dispose_engine, get_session_factory, init_engine
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 
 
 async def startup_data_backends(settings: Settings) -> bool:

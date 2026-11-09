@@ -29,6 +29,37 @@ def test_named_template_and_missing_variable() -> None:
     assert "task" in caught.value.message
 
 
+def test_plan_mode_prompt_is_loaded() -> None:
+    service = PromptService()
+    text = service.render("plan_mode", {})
+    assert "你当前处于 Plan 模式" in text
+    assert "工作权限" in text
+    assert "{{" not in text
+    assert "plan_mode" in service.names()
+
+
+def test_plan_mode_prompt_is_injected_only_for_plan() -> None:
+    from app.services.chat_service import ChatService, _mode_prompt
+
+    service = object.__new__(ChatService)
+    service.prompts = PromptService()
+    plan_text = _mode_prompt("plan", [], service._plan_instructions())
+    assert "你当前处于 Plan 模式" in plan_text
+    assert "只读" in plan_text
+    # Ask 与 Agent 不应拼上 Plan 的说明
+    assert _mode_prompt("ask", [], service._plan_instructions()) == ""
+
+
+def test_plan_prompt_falls_back_when_file_missing(tmp_path: Path) -> None:
+    from app.services.chat_service import ChatService, _mode_prompt
+
+    service = object.__new__(ChatService)
+    service.prompts = PromptService(tmp_path)
+    assert service._plan_instructions() == ""
+    fallback = _mode_prompt("plan", [], service._plan_instructions())
+    assert "你处于 Plan 模式" in fallback
+
+
 def test_unknown_prompt_name() -> None:
     with pytest.raises(PromptNotFoundError):
         PromptService().render("missing_prompt", {})
@@ -36,11 +67,12 @@ def test_unknown_prompt_name() -> None:
 
 def test_prompt_files_do_not_contain_secrets() -> None:
     root = Path(__file__).resolve().parents[1] / "app" / "prompts"
-    for path in root.rglob("*.txt"):
+    paths = list(root.rglob("*.txt")) + list(root.rglob("*.md"))
+    for path in paths:
         text = path.read_text(encoding="utf-8").lower()
-        assert "sk-" not in text
-        assert "api_key" not in text
-        assert "authorization" not in text
+        assert "sk-" not in text, path
+        assert "api_key" not in text, path
+        assert "authorization" not in text, path
 
 
 def test_api_selects_prompt_without_hardcoding_it(client, provider: FakeProvider) -> None:

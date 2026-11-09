@@ -9,6 +9,8 @@ from app.core.exceptions import PromptNotFoundError, PromptVariableError
 
 _NAME = re.compile(r"^[a-z0-9_]+$")
 _VARIABLE = re.compile(r"\{\{\s*([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+# .txt 优先；.md 用于较长的模式说明（如 plan_mode.md）
+_SUFFIXES = (".txt", ".md")
 
 
 class PromptService:
@@ -19,7 +21,13 @@ class PromptService:
     def names(self) -> list[str]:
         if not self._root.is_dir():
             return []
-        return sorted(path.stem for path in self._root.glob("*.txt") if _NAME.fullmatch(path.stem))
+        stems = {
+            path.stem
+            for suffix in _SUFFIXES
+            for path in self._root.glob(f"*{suffix}")
+            if _NAME.fullmatch(path.stem)
+        }
+        return sorted(stems)
 
     def render(self, name: str, variables: dict[str, str] | None = None) -> str:
         variables = variables or {}
@@ -36,10 +44,11 @@ class PromptService:
     def _read(self, name: str) -> str:
         if not _NAME.fullmatch(name):
             raise PromptNotFoundError()
-        path = (self._root / f"{name}.txt").resolve()
-        if path.parent != self._root or not path.is_file():
-            raise PromptNotFoundError()
-        text = path.read_text(encoding="utf-8")
-        if not text.strip():
-            raise PromptNotFoundError()
-        return text
+        for suffix in _SUFFIXES:
+            path = (self._root / f"{name}{suffix}").resolve()
+            if path.parent != self._root or not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+            if text.strip():
+                return text
+        raise PromptNotFoundError()

@@ -10,6 +10,13 @@ from app.core.config import Settings
 _BEARER = re.compile(r"(?i)(authorization:\s*bearer\s+)(?!%(?:\([^)]+\))?[sdfr])\S+")
 _TOKEN = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}")
 
+# 后端工程名。所有模块的 logger 都用这一个名字，改工程名时只改这里。
+LOGGER_NAME = "muzi_llm"
+
+
+def get_logger(name: str = LOGGER_NAME) -> logging.Logger:
+    return logging.getLogger(name)
+
 
 class RedactingFilter(logging.Filter):
     def __init__(self, secrets: list[str]) -> None:
@@ -39,7 +46,7 @@ class RedactingFilter(logging.Filter):
 
 
 def setup_logging(settings: Settings) -> None:
-    logger = logging.getLogger("qs_llm")
+    logger = get_logger()
     logger.setLevel(settings.log_level)
     logger.propagate = True
     logger.filters.clear()
@@ -52,10 +59,10 @@ def setup_logging(settings: Settings) -> None:
             ]
         )
     )
-    if not any(getattr(handler, "_qs_llm", False) for handler in logger.handlers):
+    if not any(getattr(handler, "_muzi_llm", False) for handler in logger.handlers):
         handler = logging.StreamHandler()
         handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
-        handler._qs_llm = True  # type: ignore[attr-defined]
+        handler._muzi_llm = True  # type: ignore[attr-defined]
         logger.addHandler(handler)
     for name in ("httpx", "httpcore", "openai", "httpx2"):
         logging.getLogger(name).setLevel(logging.WARNING)

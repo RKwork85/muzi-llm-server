@@ -17,14 +17,14 @@ def test_log_filter_redacts_key_and_bearer(caplog) -> None:
     secret = "sk-log-secret-value"
     settings = make_settings(deepseek_api_key=secret)
     setup_logging(settings)
-    caplog.set_level(logging.INFO, logger="qs_llm")
-    logging.getLogger("qs_llm").info("Authorization: Bearer %s", secret)
+    caplog.set_level(logging.INFO, logger="muzi_llm")
+    logging.getLogger("muzi_llm").info("Authorization: Bearer %s", secret)
     assert secret not in caplog.text
     assert "***" in caplog.text
 
 
 def test_chat_logs_do_not_include_prompt_or_key(client: TestClient, provider: FakeProvider, caplog, settings) -> None:
-    caplog.set_level(logging.INFO, logger="qs_llm")
+    caplog.set_level(logging.INFO, logger="muzi_llm")
     marker = "用户隐私句子-TOKEN-7788"
     provider.push(make_result("可以"))
     response = client.post(

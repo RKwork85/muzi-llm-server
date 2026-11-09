@@ -34,7 +34,7 @@ from app.tools.mcp_client import McpSession, register_mcp_tools
 from app.tools.registry import build_agent_registry, build_default_registry
 from app.tools.web_client import DeepSeekWebClient
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 
 
 def create_app(

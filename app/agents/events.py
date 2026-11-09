@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from app.agents.models import AgentEventType, EventEnvelope
 
@@ -35,7 +35,14 @@ _MAX_VALUE = 120
 
 
 class EventPublisher:
-    def __init__(self, *, request_id: str, task_id: str, max_queue_size: int) -> None:
+    def __init__(
+        self,
+        *,
+        request_id: str,
+        task_id: str,
+        max_queue_size: int,
+        observer: Callable[[EventEnvelope], None] | None = None,
+    ) -> None:
         self._request_id = request_id
         self._task_id = task_id
         self._limit = max(1, max_queue_size)
@@ -44,6 +51,7 @@ class EventPublisher:
         self._retained: list[EventEnvelope] = []
         self._subscribers: list[asyncio.Queue[EventEnvelope]] = []
         self._closed = False
+        self._observer = observer
 
     def publish(self, event_type: str, data: dict[str, Any] | None = None) -> None:
         if self._closed:
@@ -58,6 +66,11 @@ class EventPublisher:
             type=kind,
             data=_sanitize(data or {}),
         )
+        if self._observer is not None:
+            try:
+                self._observer(envelope)
+            except Exception:
+                pass
         self._retain(envelope)
         for subscriber in list(self._subscribers):
             self._offer(subscriber, envelope)
@@ -76,6 +89,11 @@ class EventPublisher:
     def close(self) -> None:
         self._closed = True
         self._subscribers.clear()
+
+    async def drain_observer(self) -> None:
+        drain = getattr(self._observer, "drain", None)
+        if drain is not None:
+            await drain()
 
     def _retain(self, envelope: EventEnvelope) -> None:
         self._retained.append(envelope)

@@ -19,7 +19,7 @@ from app.agents.policy import RunClock
 from app.tools.registry import ToolRegistry, ToolSpec
 from app.tools.web_client import CURRENT_TOOL_BUDGET, CURRENT_WEB_CLIENT, WebCallError, web_error_content
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 
 _CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 _TOOL_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")

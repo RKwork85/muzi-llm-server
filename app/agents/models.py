@@ -93,6 +93,7 @@ class AgentRequest(BaseModel):
     policy: RequestedPolicy | None = None
     skill_mode: Literal["auto", "recommended", "explicit", "disabled"] | None = None
     explicit_skill_ids: list[str] = Field(default_factory=list, max_length=3)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
 
     @field_validator("grants")
     @classmethod

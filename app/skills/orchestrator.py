@@ -19,7 +19,7 @@ from app.skills.registry import FileSkillRegistry
 from app.skills.resources import read_resource
 from app.skills.runtime_state import RuntimePhase
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 
 
 class OrchestratorResult(BaseModel):

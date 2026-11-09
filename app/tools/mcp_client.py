@@ -31,7 +31,7 @@ from app.mcp.execution import CURRENT_MCP_SCOPE, context_for, run_mcp
 from app.mcp.grants import stdio_permitted
 from app.tools.stdio_access import CURRENT_MCP_USER, stdio_access
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 _spawn = getattr(asyncio, "create_subprocess_" + "exec")
 
 _REMOTE_NAME = re.compile(r"^[A-Za-z0-9_-]{1,40}$")

@@ -1,0 +1,19 @@
+{
+  "conversation_id": "conv_1",
+  "approved_plan_id": "plan_1",
+  "approved_revision": 5,
+  "goal": "Implement RBAC",
+  "confirmed_decisions": {
+    "permission_model": "rbac"
+  },
+  "constraints": [
+    "read-only during planning"
+  ],
+  "steps": [
+    {
+      "id": "step_1",
+      "title": "Model roles"
+    }
+  ],
+  "authorization": "revalidate_at_execution"
+}

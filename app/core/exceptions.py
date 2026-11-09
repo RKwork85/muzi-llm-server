@@ -16,6 +16,24 @@ class AppError(Exception):
         super().__init__(self.message)
 
 
+class PlanningResourceNotFoundError(AppError):
+    code = "PLANNING_RESOURCE_NOT_FOUND"
+    status_code = 404
+    default_message = "Conversation or plan not found"
+
+
+class PlanningConflictError(AppError):
+    code = "PLANNING_CONFLICT"
+    status_code = 409
+    default_message = "Plan state changed; refresh and retry"
+
+
+class PlanningPolicyErrorResponse(AppError):
+    code = "PLANNING_POLICY_REJECTED"
+    status_code = 422
+    default_message = "Planning action is not allowed"
+
+
 class ConfigurationError(AppError):
     code = "CONFIGURATION_ERROR"
     status_code = 500

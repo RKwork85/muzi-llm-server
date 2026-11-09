@@ -1,0 +1,96 @@
+{
+  "$defs": {
+    "HandoffStep": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "title": {
+          "maxLength": 200,
+          "minLength": 1,
+          "title": "Title",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "title"
+      ],
+      "title": "HandoffStep",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "properties": {
+    "protocol_version": {
+      "const": "1.0",
+      "default": "1.0",
+      "title": "Protocol Version",
+      "type": "string"
+    },
+    "conversation_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Conversation Id",
+      "type": "string"
+    },
+    "approved_plan_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Approved Plan Id",
+      "type": "string"
+    },
+    "approved_revision": {
+      "minimum": 0,
+      "title": "Approved Revision",
+      "type": "integer"
+    },
+    "goal": {
+      "maxLength": 4000,
+      "minLength": 1,
+      "title": "Goal",
+      "type": "string"
+    },
+    "confirmed_decisions": {
+      "additionalProperties": true,
+      "title": "Confirmed Decisions",
+      "type": "object"
+    },
+    "constraints": {
+      "items": {
+        "type": "string"
+      },
+      "maxItems": 100,
+      "title": "Constraints",
+      "type": "array"
+    },
+    "steps": {
+      "items": {
+        "$ref": "#/$defs/HandoffStep"
+      },
+      "maxItems": 100,
+      "minItems": 1,
+      "title": "Steps",
+      "type": "array"
+    },
+    "authorization": {
+      "const": "revalidate_at_execution",
+      "title": "Authorization",
+      "type": "string"
+    }
+  },
+  "required": [
+    "conversation_id",
+    "approved_plan_id",
+    "approved_revision",
+    "goal",
+    "steps",
+    "authorization"
+  ],
+  "title": "PlanHandoff",
+  "type": "object"
+}

@@ -1,0 +1,33 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "interaction_id": {
+      "maxLength": 128,
+      "minLength": 1,
+      "title": "Interaction Id",
+      "type": "string"
+    },
+    "expected_plan_revision": {
+      "minimum": 0,
+      "title": "Expected Plan Revision",
+      "type": "integer"
+    },
+    "client_submission_id": {
+      "maxLength": 128,
+      "minLength": 8,
+      "title": "Client Submission Id",
+      "type": "string"
+    },
+    "value": {
+      "title": "Value"
+    }
+  },
+  "required": [
+    "interaction_id",
+    "expected_plan_revision",
+    "client_submission_id",
+    "value"
+  ],
+  "title": "InteractionSubmission",
+  "type": "object"
+}

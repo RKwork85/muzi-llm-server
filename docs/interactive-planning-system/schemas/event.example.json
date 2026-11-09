@@ -1,0 +1,13 @@
+{
+  "protocol_version": "1.0",
+  "event_id": "evt_1",
+  "sequence": 42,
+  "conversation_id": "conv_1",
+  "plan_id": "plan_1",
+  "run_id": null,
+  "type": "interaction.required",
+  "payload": {
+    "interaction_id": "int_1"
+  },
+  "occurred_at": "2026-11-09T00:00:00Z"
+}

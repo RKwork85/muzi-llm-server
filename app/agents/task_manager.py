@@ -60,13 +60,13 @@ class TaskManager:
         for task_id in expired:
             del self._tasks[task_id]
 
-    def create(self, request_id: str) -> TaskRecord:
+    def create(self, request_id: str, *, task_id: str | None = None) -> TaskRecord:
         self.cleanup()
         if self.active_count() >= self._max_active:
             raise AgentTaskLimitError()
-        task_id = secrets.token_urlsafe(16)
-        while task_id in self._tasks:
-            task_id = secrets.token_urlsafe(16)
+        task_id = task_id or secrets.token_urlsafe(16)
+        if task_id in self._tasks:
+            raise AgentTaskLimitError()
         record = TaskRecord(task_id=task_id, request_id=request_id)
         self._tasks[task_id] = record
         return record

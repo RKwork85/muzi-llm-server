@@ -51,6 +51,28 @@ def test_sse_delta_usage_and_done(client: TestClient, provider: FakeProvider) ->
     assert provider.stream_closed == 1
 
 
+def test_plan_stream_injects_plan_mode_prompt(app, provider: FakeProvider) -> None:
+    from app.services.prompt_service import PromptService
+
+    service = _service(app, provider)
+    request = StreamChatRequest.model_validate(chat_payload(mode="plan"))
+    prepared = service.prepare_stream(request)
+
+    system = prepared.provider_request.messages[0]["content"]
+    assert "你当前处于 Plan 模式" in system
+    assert PromptService().render("plan_mode")[:40] in system
+    # 文件存在时不应再拼上内置的精简说明
+    assert "你处于 Plan 模式。只能使用只读工具了解情况" not in system
+
+
+def test_ask_stream_does_not_inject_plan_mode_prompt(app, provider: FakeProvider) -> None:
+    service = _service(app, provider)
+    prepared = service.prepare_stream(StreamChatRequest.model_validate(chat_payload()))
+
+    system = prepared.provider_request.messages[0]["content"]
+    assert "你当前处于 Plan 模式" not in system
+
+
 def test_ask_stream_runs_tool_then_answers(app, provider: FakeProvider) -> None:
     import asyncio
 

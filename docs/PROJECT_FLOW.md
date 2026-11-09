@@ -1,4 +1,4 @@
-# qs_llm_dp 运行时数据流
+# muzi-llm-server 运行时数据流
 
 本文只描述当前代码里的信息流动。模块职责和目录见 `docs/PROJECT_ARCHITECTURE.md`。
 

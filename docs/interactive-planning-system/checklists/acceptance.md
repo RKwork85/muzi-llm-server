@@ -1,0 +1,13 @@
+# Acceptance checklist
+- [ ] Repository audited and integration points verified
+- [ ] Ask/Plan/Agent same conversation and shared renderer
+- [ ] Read-only policy enforced server-side in Plan
+- [ ] Cards validated and accessible; no arbitrary UI code
+- [ ] Single/multi/text/confirmation/review/progress states tested
+- [ ] Decisions persist, edit, skip, conflict and resume
+- [ ] SSE replay, dedupe, reconnect and ordering tested
+- [ ] Approval and mode switch never auto-execute
+- [ ] Agent handoff snapshot immutable, permissions revalidated
+- [ ] Cross-user isolation, prompt injection, rate limit and audit tests
+- [ ] Regression suite and rollback documented
+- [ ] Production claim gated on real deployment validation

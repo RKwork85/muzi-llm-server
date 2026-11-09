@@ -151,6 +151,8 @@ class StreamChatRequest(ChatRequestBase):
     stream: bool | None = True
     response_format: ResponseFormat | None = None
     mode: Literal["ask", "plan", "agent"] = "ask"
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
+    client_run_id: str | None = Field(default=None, min_length=8, max_length=128)
     skill_names: list[str] = Field(default_factory=list, max_length=8)
     skill_mode: Literal["auto", "recommended", "explicit", "disabled"] | None = None
     explicit_skill_ids: list[str] = Field(default_factory=list, max_length=3)

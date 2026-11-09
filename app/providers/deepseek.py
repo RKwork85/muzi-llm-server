@@ -22,7 +22,7 @@ from app.core.exceptions import (
 from app.providers.base import CompletionResult, ProviderChatRequest
 from app.providers.parsing import parse_completion, parse_stream_chunk
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 T = TypeVar("T")
 
 

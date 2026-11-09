@@ -8,7 +8,7 @@ from collections import defaultdict
 from contextlib import contextmanager
 from typing import Iterator
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 _FORBIDDEN = ("token", "secret", "cookie", "password", "authorization", "verifier", "code")
 
 

@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from app.core.config import Settings
 
-logger = logging.getLogger("qs_llm")
+logger = logging.getLogger("muzi_llm")
 
 CURRENT_WEB_CLIENT: ContextVar["DeepSeekWebClient | None"] = ContextVar(
     "deepseek_web_client",
