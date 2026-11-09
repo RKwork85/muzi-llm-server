@@ -51,6 +51,17 @@ AGENT_GRANT_BY_TOOL = {
 }
 
 
+# Skill 工具（发现/加载/读取资源）。Ask 模式屏蔽 Skill，只在 Plan（仅发现元数据）
+# 与 Agent（完整能力）中开放。
+SKILL_TOOL_NAMES = frozenset(
+    {
+        "discover_skills",
+        "load_skill",
+        "read_skill_resource",
+    }
+)
+
+
 def supports_orchestration(mode: str) -> bool:
     """多步骤任务编排只存在于 Agent 运行，Ask 不能启动它。"""
     return mode == "agent"

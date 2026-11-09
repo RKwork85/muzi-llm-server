@@ -7,7 +7,7 @@ from pathlib import Path
 from app.agents.policy import PolicyError, basic_tool_names
 from app.core.config import ROOT, Settings
 from app.data.store import store_is_ready
-from app.tools.capabilities import AGENT_GRANT_BY_TOOL, ASK_TOOLS, PLAN_TOOLS
+from app.tools.capabilities import AGENT_GRANT_BY_TOOL, ASK_TOOLS, PLAN_TOOLS, SKILL_TOOL_NAMES
 from app.tools.mcp_client import mcp_is_available
 from app.tools.registry import KNOWN_TOOLSETS, ToolRegistry, ToolSpec
 from app.tools.stdio_access import stdio_access
@@ -50,7 +50,8 @@ def chat_mode_tool_names(
         return plan_tool_names(registry, settings)
     if mode == "agent":
         return agent_chat_tool_names(registry, settings, user_id)
-    return ask_tool_names(registry, settings)
+    # ask：屏蔽 Skill 工具（发现/加载/读取资源），只保留普通问答能力。
+    return tuple(name for name in ask_tool_names(registry, settings) if name not in SKILL_TOOL_NAMES)
 
 
 def _named_tools(registry: ToolRegistry, settings: Settings, allowed: frozenset[str]) -> tuple[str, ...]:

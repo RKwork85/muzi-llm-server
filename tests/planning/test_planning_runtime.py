@@ -276,3 +276,148 @@ def test_proposed_interaction_rejects_unimplemented_component() -> None:
     with pytest.raises(ValidationError):
         ProposedInteraction.model_validate({"type": "assumption_editor", "prompt": "请编辑这条假设"})
 
+
+class _RetryThenValidProvider:
+    """第一次返回非法 JSON，第二次返回合法提案，用于验证校正重试。"""
+
+    def __init__(self, valid_content: str) -> None:
+        self.valid_content = valid_content
+        self.calls = 0
+
+    async def create_chat_completion(self, request: ProviderChatRequest) -> CompletionResult:
+        self.calls += 1
+        content = self.valid_content if self.calls > 1 else "not json"
+        return CompletionResult(
+            id=f"completion_{self.calls}",
+            model=request.model,
+            content=content,
+            reasoning_content=None,
+            tool_calls=[],
+            finish_reason="stop",
+        )
+
+
+@pytest.mark.asyncio
+async def test_decision_engine_retries_on_invalid_proposal() -> None:
+    valid = json.dumps(
+        {
+            "protocol_version": "1.0",
+            "action": "respond",
+            "response": "我可以先用一个安全默认值并告诉你。",
+        },
+        ensure_ascii=False,
+    )
+    provider = _RetryThenValidProvider(valid)
+    plan = PlanningOrchestrator().create_plan(
+        owner_id="user-a", conversation_id="conv-a", goal="Plan a system"
+    )
+    proposal = await PlanningDecisionEngine(provider, model="test-model").propose(
+        goal="Plan a system", user_message="Start", plan=plan
+    )
+    assert proposal.action == DecisionAction.RESPOND
+    assert provider.calls == 2
+    # 重试请求应把失败输出与校验错误回喂给模型。
+    assert provider.calls >= 2
+
+
+def _form_proposal() -> DecisionProposal:
+    return DecisionProposal.model_validate(
+        {
+            "protocol_version": "1.0",
+            "action": "ask_user",
+            "response": "为了安排行程，我需要确认几个关键信息。",
+            "interaction": {
+                "type": "form",
+                "prompt": "请确认以下出行信息",
+                "constraints": {"decision_key": "travel_basics"},
+                "form": [
+                    {"key": "departure", "label": "出发地", "type": "text", "required": True},
+                    {"key": "transport", "label": "交通方式", "type": "single_select", "options": [
+                        {"id": "car", "label": "自驾"},
+                        {"id": "rail", "label": "高铁"},
+                    ]},
+                    {"key": "budget", "label": "预算（元）", "type": "number", "required": False},
+                    {"key": "party", "label": "同行人", "type": "multi_select", "options": [
+                        {"id": "solo", "label": "独自"},
+                        {"id": "family", "label": "带家人"},
+                        {"id": "friends", "label": "和朋友"},
+                    ]},
+                ],
+            },
+        }
+    )
+
+
+def test_decision_proposal_accepts_form_interaction() -> None:
+    proposal = _form_proposal()
+    assert proposal.interaction is not None
+    assert proposal.interaction.type == "form"
+    assert [field.key for field in proposal.interaction.form] == ["departure", "transport", "budget", "party"]
+
+
+def test_form_requires_fields_and_rejects_duplicate_keys() -> None:
+    with pytest.raises(ValidationError):
+        DecisionProposal.model_validate(
+            {
+                "protocol_version": "1.0",
+                "action": "ask_user",
+                "response": "x",
+                "interaction": {"type": "form", "prompt": "请填写", "form": []},
+            }
+        )
+    with pytest.raises(ValidationError):
+        DecisionProposal.model_validate(
+            {
+                "protocol_version": "1.0",
+                "action": "ask_user",
+                "response": "x",
+                "interaction": {
+                    "type": "form",
+                    "prompt": "请填写",
+                    "form": [
+                        {"key": "a", "label": "A"},
+                        {"key": "a", "label": "A again"},
+                    ],
+                },
+            }
+        )
+
+
+def test_form_submission_value_is_validated() -> None:
+    planner = PlanningOrchestrator()
+    plan = planner.create_plan(owner_id="user-a", conversation_id="conv-a", goal="Plan a trip")
+    updated = planner.apply_proposal(plan.plan_id, _form_proposal(), owner_id="user-a", expected_revision=plan.revision)
+    interaction_id = _pending_interaction_id(planner, plan.plan_id)
+
+    from app.planning.contracts import Interaction
+
+    interaction = planner.get_plan(plan.plan_id, owner_id="user-a")
+    assert interaction.status == PlanStatus.CLARIFYING
+
+    # 缺必填字段 → 拒绝
+    with pytest.raises(PlanningPolicyError):
+        planner.submit_interaction(
+            plan.plan_id,
+            InteractionSubmission(
+                interaction_id=interaction_id,
+                expected_plan_revision=updated.revision,
+                client_submission_id="submission_form_bad_01",
+                value={"transport": "car"},
+            ),
+            owner_id="user-a",
+        )
+
+    # 完整合法 → 接受，值清洗为 dict 决策
+    result = planner.submit_interaction(
+        plan.plan_id,
+        InteractionSubmission(
+            interaction_id=interaction_id,
+            expected_plan_revision=updated.revision,
+            client_submission_id="submission_form_ok_01",
+            value={"departure": "深圳", "transport": "rail", "budget": 1200, "party": ["friends", "family"]},
+        ),
+        owner_id="user-a",
+    )
+    decisions = {decision.key: decision.value for decision in result.decisions if decision.source == "user"}
+    assert decisions["travel_basics"] == {"departure": "深圳", "transport": "rail", "budget": 1200, "party": ["friends", "family"]}
+

@@ -282,6 +282,8 @@ class SqlPlanningStore:
         ):
             if event == "delta":
                 yield format_sse("delta", {"content": payload})
+            elif event == "interaction_pending":
+                yield format_sse("interaction_pending", {"action": payload})
             elif event == "error":
                 yield format_sse("error", {"error": {"code": payload, "message": _PLANNING_ERROR_MESSAGES.get(payload, "规划请求失败")}})
                 return
@@ -518,10 +520,14 @@ class SqlPlanningStore:
             )
         )
         conversation = await self._conversation(str(row.conversation_id), owner.id)
-        selected = value if isinstance(value, list) else [value]
-        answer_labels = [option.label + (f" — {option.description}" if option.description else "")
-                         for option in interaction.options if option.id in selected]
-        answer_text = "; ".join(answer_labels) if answer_labels else json.dumps(value, ensure_ascii=False)
+        if interaction.type == InteractionType.FORM and isinstance(value, dict):
+            field_labels = {field.key: field.label for field in (interaction.form or [])}
+            answer_text = "; ".join(f"{field_labels.get(key, key)}: {val}" for key, val in value.items())
+        else:
+            selected = value if isinstance(value, list) else [value]
+            answer_labels = [option.label + (f" — {option.description}" if option.description else "")
+                             for option in interaction.options if option.id in selected]
+            answer_text = "; ".join(answer_labels) if answer_labels else json.dumps(value, ensure_ascii=False)
         self._session.add(
             ConversationMessage(
                 session_id=conversation.id,
@@ -620,8 +626,9 @@ class SqlPlanningStore:
                 changes, affected = compute_revision_changes(current, action)
             except (ValueError, LookupError) as exc:
                 raise PlanningPolicyError(str(exc)) from None
-            planning_transition_path(current.status, PlanStatus.DRAFTING)  # 校验可达，否则抛冲突
-            updated = self._revise(current, status=PlanStatus.DRAFTING, **changes)
+            # 实时就地修订：只改内容、保留当前状态（审阅卡等待审批时继续等待审批，
+            # 用户改完即可直接“确认计划”）。不强制打回 drafting。
+            updated = self._revise(current, **changes)
             await self._store_revision(row, current, updated)
             await self._emit(
                 row,

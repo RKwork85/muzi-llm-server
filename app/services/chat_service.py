@@ -186,6 +186,9 @@ class ChatService:
     ) -> None:
         if self.skill_runtime is None or not body.skill_mode:
             return
+        # ask 模式屏蔽 Skill：不注入技能自动发现结果，模型也不能通过工具发现/加载技能。
+        if body.mode == "ask":
+            return
         from app.skills.discovery_models import DiscoveryMode
 
         task = next((item.content for item in reversed(body.messages) if item.role == "user"), "")

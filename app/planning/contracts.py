@@ -34,6 +34,8 @@ class InteractionType(StrEnum):
     SINGLE_SELECT = "single_select"
     MULTI_SELECT = "multi_select"
     TEXT_INPUT = "text_input"
+    TEXT_AREA = "text_area"
+    FORM = "form"
     CONFIRMATION = "confirmation"
     PLAN_REVIEW = "plan_review"
     PROGRESS = "progress"
@@ -177,6 +179,39 @@ class InteractionOption(StrictContract):
         return value
 
 
+class FormField(StrictContract):
+    """表单复合信息卡中的单个字段，用于一次收集多个相关的硬约束。
+
+    例如旅游场景下把「出发地 + 交通方式 + 预算 + 同行人」合并为一张 form 卡，
+    避免连点多张卡或把这些硬约束悄悄塞进假设。
+    """
+
+    key: str = Field(min_length=1, max_length=128)
+    label: str = Field(min_length=1, max_length=200)
+    type: Literal["text", "textarea", "single_select", "multi_select", "number"] = "text"
+    required: bool = True
+    placeholder: str | None = Field(default=None, max_length=200)
+    description: str | None = Field(default=None, max_length=500)
+    options: list[InteractionOption] = Field(default_factory=list, max_length=20)
+    constraints: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("key")
+    @classmethod
+    def valid_key(cls, value: str) -> str:
+        if not _IDENTIFIER.fullmatch(value):
+            raise ValueError("form field key contains unsupported characters")
+        return value
+
+    @model_validator(mode="after")
+    def validate_field_shape(self) -> FormField:
+        selection = self.type in {"single_select", "multi_select"}
+        if selection and not self.options:
+            raise ValueError("selection form fields require options")
+        if not selection and self.options:
+            raise ValueError("only selection form fields may contain options")
+        return self
+
+
 class InteractionPlanStep(StrictContract):
     id: str = Field(min_length=1, max_length=128)
     title: str = Field(min_length=1, max_length=200)
@@ -207,8 +242,12 @@ class Interaction(StrictContract):
                     "then": {"properties": {"options": {"minItems": 1}}},
                 },
                 {
-                    "if": {"properties": {"type": {"enum": ["text_input", "confirmation", "plan_review", "progress", "error"]}}},
+                    "if": {"properties": {"type": {"enum": ["text_input", "text_area", "confirmation", "plan_review", "progress", "error"]}}},
                     "then": {"properties": {"options": {"maxItems": 0}}},
+                },
+                {
+                    "if": {"properties": {"type": {"const": "form"}}},
+                    "then": {"required": ["form"], "properties": {"options": {"maxItems": 0}, "form": {"minItems": 1}}},
                 },
             ],
         },
@@ -222,6 +261,7 @@ class Interaction(StrictContract):
     description: str | None = Field(default=None, max_length=4000)
     status: InteractionStatus
     options: list[InteractionOption] = Field(default_factory=list, max_length=20)
+    form: list[FormField] | None = Field(default=None, max_length=20)
     plan_review: InteractionPlanReview | None = None
     constraints: dict[str, Any] = Field(default_factory=dict)
     expires_at: datetime | None = None
@@ -249,6 +289,14 @@ class Interaction(StrictContract):
             raise ValueError("selection interactions require options")
         if self.type not in {InteractionType.SINGLE_SELECT, InteractionType.MULTI_SELECT} and self.options:
             raise ValueError("only selection interactions may contain options")
+        if self.type == InteractionType.FORM:
+            if not self.form:
+                raise ValueError("form interactions require form fields")
+            field_keys = [field.key for field in self.form]
+            if len(field_keys) != len(set(field_keys)):
+                raise ValueError("form field keys must be unique")
+        elif self.form:
+            raise ValueError("form fields are only valid for form interactions")
         if self.type == InteractionType.PLAN_REVIEW and self.plan_review is None:
             raise ValueError("plan review interactions require a plan snapshot")
         if self.type != InteractionType.PLAN_REVIEW and self.plan_review is not None:

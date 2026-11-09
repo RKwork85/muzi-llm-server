@@ -8,7 +8,7 @@ import httpx
 import pytest
 from pydantic import ValidationError
 
-from app.agents.toolsets import agent_tool_names, ask_tool_names, plan_tool_names
+from app.agents.toolsets import agent_tool_names, ask_tool_names, chat_mode_tool_names, plan_tool_names
 from app.services.chat_service import _download_files
 from app.tools.capabilities import supports_orchestration
 from app.data.context import CURRENT_OSS_CLIENT, CURRENT_TASK_ID
@@ -68,6 +68,24 @@ def test_capability_matrix_keeps_destructive_tools_behind_grants(tmp_path) -> No
         )
     )
     assert {"write_text_file", "write_docx", "delete_file", "run_command"} <= opened
+
+
+def test_ask_mode_masks_skill_tools(tmp_path) -> None:
+    """Ask 模式屏蔽 Skill：不暴露发现/加载/读取技能工具，Agent 与 Plan 保持原有能力。"""
+    registry = build_agent_registry()
+    settings = make_settings(skills_root=str(tmp_path / "skills"))
+    ask = set(chat_mode_tool_names(registry, settings, "ask"))
+    assert "discover_skills" not in ask
+    assert "load_skill" not in ask
+    assert "read_skill_resource" not in ask
+
+    agent = set(chat_mode_tool_names(registry, settings, "agent"))
+    assert {"discover_skills", "load_skill", "read_skill_resource"} <= agent
+
+    plan = set(chat_mode_tool_names(registry, settings, "plan"))
+    assert "discover_skills" in plan
+    assert "load_skill" not in plan
+    assert "read_skill_resource" not in plan
 
 
 def test_explicit_workspace_toolset_does_not_grant_write_or_delete(tmp_path) -> None:
