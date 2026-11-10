@@ -54,6 +54,17 @@ logger = logging.getLogger("muzi_llm")
 ChatBody = ChatCompletionRequest | StreamChatRequest | ToolCallRequest
 
 
+def content_text(content: str | list[dict[str, Any]]) -> str:
+    """从纯文本或多模态内容块中提取文本（供技能发现 / 日志 / JSON 校验等文本场景）。"""
+    if isinstance(content, str):
+        return content
+    parts: list[str] = []
+    for block in content or []:
+        if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+    return "\n".join(parts)
+
+
 @dataclass
 class PreparedChat:
     request_id: str
@@ -191,7 +202,7 @@ class ChatService:
             return
         from app.skills.discovery_models import DiscoveryMode
 
-        task = next((item.content for item in reversed(body.messages) if item.role == "user"), "")
+        task = next((content_text(item.content) for item in reversed(body.messages) if item.role == "user"), "")
         prompt, _result = self.skill_runtime.apply(
             system["content"],
             principal_id=principal_id or "",
@@ -226,7 +237,7 @@ class ChatService:
         response_format = getattr(body, "response_format", None)
         expect_json = bool(response_format and response_format.type == "json_object")
         if expect_json:
-            blob = "\n".join(str(message.get("content") or "") for message in messages)
+            blob = "\n".join(content_text(message.get("content") or "") for message in messages)
             if "json" not in blob.lower():
                 raise InvalidRequestError("JSON 模式要求系统提示词或用户消息包含 json 及格式示例")
         thinking_type = body.thinking.type if body.thinking else self.settings.deepseek_thinking
@@ -343,7 +354,7 @@ class ChatService:
         messages = [dict(item) for item in prepared.provider_request.messages]
         rounds = 0
         ledger_text = "\n".join(
-            str(item.get("content") or "") for item in messages if item.get("role") == "user"
+            content_text(item.get("content") or "") for item in messages if item.get("role") == "user"
         )
         tokens = self._enter_ask_context(
             ledger_text or "ask",

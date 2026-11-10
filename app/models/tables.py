@@ -63,6 +63,9 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="active", server_default=text("'active'")
     )
+    preferences: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=_JSON_OBJECT
+    )
 
     credentials: Mapped[list[UserCredential]] = relationship(
         back_populates="user",

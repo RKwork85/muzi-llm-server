@@ -181,6 +181,42 @@ class LoginRequiredError(AppError):
     default_message = "请先登录"
 
 
+class PermissionDeniedError(AppError):
+    code = "PERMISSION_DENIED"
+    status_code = 403
+    default_message = "没有执行该操作的权限"
+
+
+class RoleNotFoundError(AppError):
+    code = "ROLE_NOT_FOUND"
+    status_code = 404
+    default_message = "未找到指定角色"
+
+
+class PermissionNotFoundError(AppError):
+    code = "PERMISSION_NOT_FOUND"
+    status_code = 404
+    default_message = "未找到指定权限"
+
+
+class UserNotFoundError(AppError):
+    code = "USER_NOT_FOUND"
+    status_code = 404
+    default_message = "未找到指定用户"
+
+
+class QuotaExceededError(AppError):
+    code = "QUOTA_EXCEEDED"
+    status_code = 429
+    default_message = "使用额度已达上限"
+
+
+class SuperAdminProtectedError(AppError):
+    code = "SUPER_ADMIN_PROTECTED"
+    status_code = 409
+    default_message = "不能修改或移除最后一个有效的超级管理员"
+
+
 class ConnectorNotFoundError(AppError):
     code = "CONNECTOR_NOT_FOUND"
     status_code = 404

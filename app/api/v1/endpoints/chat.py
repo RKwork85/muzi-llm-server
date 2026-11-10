@@ -37,7 +37,7 @@ from app.schemas.chat import (
     StreamChatRequest,
     ToolCallRequest,
 )
-from app.services.chat_service import ChatService
+from app.services.chat_service import ChatService, content_text
 from app.tools.workspace_scope import scope_dirname
 
 logger = logging.getLogger("muzi_llm")
@@ -77,8 +77,9 @@ async def _persisted_stream(
         conversation = await store._conversation(conversation_id, owner.id, for_update=True)
     except PlanningNotFound:
         raise PlanningResourceNotFoundError() from None
-    user_text = next((item.get("content", "") for item in reversed(prepared.provider_request.messages) if item.get("role") == "user"), "")
-    session.add(ConversationMessage(session_id=conversation.id, role="user", content=str(user_text)))
+    raw_user = next((item.get("content", "") for item in reversed(prepared.provider_request.messages) if item.get("role") == "user"), "")
+    user_text = content_text(raw_user) or "[附件]"
+    session.add(ConversationMessage(session_id=conversation.id, role="user", content=user_text))
     await store._emit_conversation(conversation.id, PlanningEventType.CHAT_RUN_STARTED, {"run_id": run_id})
     await session.commit()
     assistant_text = ""
@@ -255,6 +256,14 @@ async def stream_completion(
         if owner is None:
             await session.close()
             raise LoginRequiredError()
+        from app.authorization.application.authorization_service import AuthorizationService
+
+        permission = "agent.execute" if body.mode == "agent" else "chat.access"
+        try:
+            await AuthorizationService(session).require_permission(owner.id, permission)
+        except Exception:
+            await session.close()
+            raise
         try:
             await SqlPlanningStore(session)._conversation(body.conversation_id, owner.id)
         except Exception:

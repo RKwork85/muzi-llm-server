@@ -136,6 +136,14 @@ def create_app(
                 from app.core.database.session import get_session_factory
 
                 grant_store = SqlGrantStore(get_session_factory())
+                try:
+                    from app.authorization.seed import seed_authorization
+
+                    async with get_session_factory()() as seed_session:
+                        await seed_authorization(seed_session)
+                        await seed_session.commit()
+                except Exception:
+                    logger.exception("authorization seed failed")
             else:
                 grant_store = MemoryGrantStore()
             app.state.mcp_grants = grant_store

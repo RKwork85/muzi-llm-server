@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import re
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.schemas.common import Usage
+
+# 多模态内容块允许的类型
+_MULTIMODAL_BLOCK_TYPES = {"text", "image_url", "video_url", "file"}
+# 单条消息中文本部分的最大字符数（base64 图片不计入该限制）
+_MAX_TEXT_CHARS = 32000
 
 _PROMPT_NAME = re.compile(r"^[a-z0-9_]+$")
 _VARIABLE_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,31}$")
@@ -95,18 +100,58 @@ class ResponseFormat(BaseModel):
 
 
 class ChatMessageIn(BaseModel):
-    """只接受用户和助手的历史文本。system 由服务端提示词决定，tool 由服务端写入。"""
+    """用户和助手消息。system 由服务端提示词决定，tool 由服务端写入。
+
+    content 支持纯文本或 OpenAI 兼容的多模态内容块数组：
+    - text: {"type": "text", "text": "..."}
+    - 图片: {"type": "image_url", "image_url": {"url": "...", "detail": "auto"}}
+    - 视频/文件: 仅方舟（ark）provider 使用 file_id 形式。
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     role: Literal["user", "assistant"]
-    content: str = Field(min_length=1, max_length=32000)
+    content: str | list[dict[str, Any]]
 
     @field_validator("content")
     @classmethod
-    def _content_not_blank(cls, value: str) -> str:
-        if not value.strip():
+    def _content_valid(cls, value: str | list[dict[str, Any]]) -> str | list[dict[str, Any]]:
+        if isinstance(value, str):
+            if not value.strip():
+                raise ValueError("消息内容不能为空")
+            if len(value) > _MAX_TEXT_CHARS:
+                raise ValueError("消息文本过长")
+            return value
+        if not isinstance(value, list) or not value:
             raise ValueError("消息内容不能为空")
+        if len(value) > 64:
+            raise ValueError("内容块过多")
+        total_text = 0
+        for block in value:
+            if not isinstance(block, dict):
+                raise ValueError("内容块必须是对象")
+            btype = block.get("type")
+            if btype not in _MULTIMODAL_BLOCK_TYPES:
+                raise ValueError(f"不支持的内容块类型：{btype}")
+            if btype == "text":
+                text = block.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError("文本内容块不能为空")
+                total_text += len(text)
+            elif btype == "image_url":
+                src = block.get("image_url")
+                if not isinstance(src, dict) or not (src.get("url") or src.get("file_id")):
+                    raise ValueError("图片内容块缺少 url 或 file_id")
+            elif btype == "video_url":
+                src = block.get("video_url")
+                if not isinstance(src, dict) or not (src.get("url") or src.get("file_id")):
+                    raise ValueError("视频内容块缺少 url 或 file_id")
+            elif btype == "file":
+                src = block.get("file")
+                if not isinstance(src, dict) or not (src.get("file_id") or src.get("url")):
+                    raise ValueError("文件内容块缺少 file_id 或 url")
+        if total_text > _MAX_TEXT_CHARS:
+            raise ValueError("消息文本过长")
         return value
 
 

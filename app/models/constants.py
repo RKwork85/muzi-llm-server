@@ -5,6 +5,19 @@ from __future__ import annotations
 from app.agents.models import TaskStatus, ToolExecutionStatus
 
 USER_STATUSES = ("active", "disabled")
+ROLE_STATUSES = ("active", "disabled")
+GRANT_TYPES = ("allow", "deny")
+RESOURCE_TYPES = (
+    "agent",
+    "skill",
+    "mcp_connector",
+    "mcp_tool",
+    "plugin",
+    "knowledge",
+    "file",
+    "session",
+    "task",
+)
 CREDENTIAL_PROVIDERS = ("email_password", "github")
 SESSION_MODES = ("chat", "agent")
 SESSION_STATUSES = ("active", "archived", "closed")

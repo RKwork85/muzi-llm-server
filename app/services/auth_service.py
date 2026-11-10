@@ -6,7 +6,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -17,7 +17,9 @@ from app.core.exceptions import (
     InvalidRequestError,
 )
 from app.core.security import generate_refresh_token, hash_password, hash_refresh_token, verify_password
+from app.authorization.domain.catalog import MEMBER_ROLE_CODE
 from app.models.mixins import utcnow
+from app.models.rbac import Role, UserRole
 from app.models.tables import RefreshToken, User, UserCredential
 
 _USERNAME = re.compile(r"^[a-z][a-z0-9_]{2,31}$")
@@ -103,11 +105,21 @@ class AuthService:
                     password_hash=hash_password(password),
                 )
             )
+            await self._assign_default_role(user.id)
             issued = await self._issue(user)
             await self.session.flush()
         except IntegrityError:
             raise AccountExistsError("邮箱或用户名已被使用") from None
         return issued
+
+    async def _assign_default_role(self, user_id: object) -> None:
+        """给新注册用户赋予默认 member 角色。角色缺失或表未就绪时静默跳过。"""
+        try:
+            role = await self.session.scalar(select(Role).where(Role.code == MEMBER_ROLE_CODE))
+        except Exception:
+            return
+        if role is not None:
+            self.session.add(UserRole(user_id=user_id, role_id=role.id))
 
     async def login(self, email: str, password: str) -> IssuedLogin:
         try:
@@ -157,6 +169,28 @@ class AuthService:
     async def _username_taken(self, username: str) -> bool:
         found = await self.session.scalar(select(User.id).where(User.username == username))
         return found is not None
+
+    async def reset_password(self, user_id: object, new_password: str) -> None:
+        """管理员重置用户密码：只写入新密码哈希，并吊销该用户全部登录凭证。
+
+        不回显旧密码；旧密码本就不可逆，无法也无法被读取。
+        """
+        new_password = normalize_password(new_password)
+        credential = await self.session.scalar(
+            select(UserCredential).where(
+                UserCredential.user_id == user_id,
+                UserCredential.provider == "email_password",
+            )
+        )
+        if credential is None:
+            raise InvalidRequestError("该用户没有邮箱密码凭证")
+        credential.password_hash = hash_password(new_password)
+        # 重置后旧会话全部失效，需重新登录。
+        await self.session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=utcnow())
+        )
 
     async def _issue(self, user: User) -> IssuedLogin:
         raw, token_hash = generate_refresh_token()

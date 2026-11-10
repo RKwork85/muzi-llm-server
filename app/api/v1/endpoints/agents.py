@@ -74,6 +74,9 @@ async def create_run(
             owner = await AuthService(session).user_for_token(credentials.credentials)
             if owner is None:
                 raise LoginRequiredError()
+            from app.authorization.application.authorization_service import AuthorizationService
+
+            await AuthorizationService(session).require_permission(owner.id, "agent.execute")
             try:
                 conversation = await SqlPlanningStore(session)._conversation(body.conversation_id, owner.id)
             except PlanningNotFound:
