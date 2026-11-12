@@ -168,6 +168,118 @@ def _to_millis(value: Any) -> int | None:
     return None
 
 
+def _image_message(message: dict[str, Any]) -> bool:
+    return bool(
+        message.get("generating_images")
+        or message.get("generated_images")
+        or message.get("gen_image_error")
+        or message.get("gen_image_meta")
+    )
+
+
+def _image_model(model: dict[str, Any] | None) -> bool:
+    if not isinstance(model, dict):
+        return False
+    category = str(model.get("modelCategory") or model.get("model_category") or "")
+    api = str(model.get("modelApi") or model.get("model_api") or "")
+    name = f"{model.get('modelId') or ''} {model.get('modelName') or ''}"
+    return category == "image_gen" or api == "images" or "seedream" in name.lower()
+
+
+def annotate_history_tracks(messages: list[Any], session: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """给消息补上 text/image 轨道，并返回这段对话实际用过的模型行。"""
+    if not isinstance(messages, list):
+        return []
+    image_at: list[int] = []
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        track = message.get("historyTrack")
+        if track in {"text", "image"}:
+            if track == "image":
+                image_at.append(index)
+            continue
+        if message.get("role") == "assistant" and _image_message(message):
+            message["historyTrack"] = "image"
+            image_at.append(index)
+    for index in image_at:
+        for cursor in range(index - 1, -1, -1):
+            prev = messages[cursor]
+            if not isinstance(prev, dict) or prev.get("role") != "user":
+                continue
+            if prev.get("historyTrack") not in {"text", "image"}:
+                prev["historyTrack"] = "image"
+            break
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") == "system":
+            continue
+        if message.get("historyTrack") not in {"text", "image"} and message.get("role") in {"user", "assistant"}:
+            message["historyTrack"] = "text"
+        if message.get("historyTrack") == "image" and not isinstance(message.get("trackModel"), dict):
+            meta = message.get("gen_image_meta")
+            if isinstance(meta, dict) and (meta.get("modelName") or meta.get("modelId")):
+                message["trackModel"] = {
+                    "modelId": meta.get("modelId") or "",
+                    "modelName": meta.get("modelName") or meta.get("modelId") or "",
+                    "providerId": meta.get("providerId") or "ark",
+                    "modelCategory": meta.get("modelCategory") or "image_gen",
+                    "modelApi": meta.get("modelApi") or "images",
+                }
+
+    buckets: dict[str, dict[str, Any]] = {}
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        track = message.get("historyTrack")
+        if track not in {"text", "image"}:
+            continue
+        bucket = buckets.setdefault(track, {"track": track, "turns": 0, "tokens": 0, "last": index, "model": None})
+        bucket["last"] = index
+        if message.get("role") == "user":
+            bucket["turns"] += 1
+        if message.get("role") == "assistant":
+            usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
+            total = int(usage.get("total_tokens") or 0)
+            if total > 0:
+                bucket["tokens"] += total
+            model = message.get("trackModel") if isinstance(message.get("trackModel"), dict) else None
+            if model and (model.get("modelName") or model.get("modelId")):
+                bucket["model"] = model
+    session_model = {
+        "modelId": (session or {}).get("modelId") or "",
+        "modelName": (session or {}).get("modelName") or (session or {}).get("modelId") or "",
+        "providerId": (session or {}).get("providerId") or "",
+        "modelCategory": (session or {}).get("modelCategory") or "",
+        "modelApi": (session or {}).get("modelApi") or "",
+    }
+    rows = [row for row in buckets.values() if row["turns"] > 0]
+    session_track = "image" if _image_model(session_model) else "text"
+    for row in rows:
+        model = row["model"] or {}
+        if not (model.get("modelName") or model.get("modelId")) and session_model["modelName"] and session_track == row["track"]:
+            row["model"] = session_model
+    if len(rows) == 1 and not rows[0]["tokens"]:
+        usage = (session or {}).get("tokenUsage") if isinstance((session or {}).get("tokenUsage"), dict) else {}
+        rows[0]["tokens"] = int(usage.get("total_tokens") or 0)
+    rows.sort(key=lambda row: row["last"], reverse=True)
+    public: list[dict[str, Any]] = []
+    for row in rows:
+        model = row["model"] or {}
+        public.append(
+            {
+                "track": row["track"],
+                "modelId": model.get("modelId") or "",
+                "modelName": model.get("modelName") or model.get("modelId") or "",
+                "providerId": model.get("providerId") or "",
+                "modelCategory": model.get("modelCategory") or ("image_gen" if row["track"] == "image" else ""),
+                "modelApi": model.get("modelApi") or ("images" if row["track"] == "image" else ""),
+                "turns": row["turns"],
+                "tokens": row["tokens"],
+            }
+        )
+    return public
+
+
 def _split_messages(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
     raw = snapshot.get("chatMessages")
     if not isinstance(raw, list):
@@ -195,6 +307,8 @@ def _split_messages(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 "search_error": message.get("search_error"),
                 "trace": message.get("trace") if isinstance(message.get("trace"), list) else [],
                 "planning": planning or None,
+                "history_track": message.get("historyTrack") if message.get("historyTrack") in {"text", "image"} else None,
+                "track_model": message.get("trackModel") if isinstance(message.get("trackModel"), dict) else None,
                 "created_at_ms": _to_millis(message.get("createdAt")),
             }
         )
@@ -232,6 +346,10 @@ def _assemble_message(row: ChatHistoryMessage) -> dict[str, Any]:
         message["trace"] = row.trace
     if isinstance(row.planning, dict) and row.planning:
         message.update(row.planning)
+    if row.history_track in {"text", "image"}:
+        message["historyTrack"] = row.history_track
+    if isinstance(row.track_model, dict) and row.track_model:
+        message["trackModel"] = row.track_model
     if row.created_at_ms is not None:
         message["createdAt"] = row.created_at_ms
     return message
@@ -267,6 +385,8 @@ def _assemble_session(row: ChatHistorySession, messages: list[ChatHistoryMessage
     if row.chat_keywords:
         snapshot["chatKeywords"] = row.chat_keywords
     snapshot.update(row.extra or {})
+    if isinstance(row.model_tracks, list) and row.model_tracks:
+        snapshot["modelTracks"] = row.model_tracks
     return snapshot
 
 
@@ -314,6 +434,9 @@ class HistoryService:
         if not isinstance(snapshot, dict):
             raise InvalidRequestError("snapshot 必须是对象")
 
+        raw_messages = snapshot.get("chatMessages")
+        if isinstance(raw_messages, list):
+            snapshot["modelTracks"] = annotate_history_tracks(raw_messages, snapshot)
         messages = _split_messages(snapshot)
         has_user = any(m["role"] == "user" for m in messages)
         if not has_user:
@@ -349,6 +472,7 @@ class HistoryService:
         row.provider_id = snapshot.get("providerId")
         row.model_category = snapshot.get("modelCategory")
         row.model_api = snapshot.get("modelApi")
+        row.model_tracks = snapshot.get("modelTracks") if isinstance(snapshot.get("modelTracks"), list) else []
         row.pinned = bool(snapshot.get("pinned"))
         row.pinned_at = snapshot.get("pinnedAt")
         row.server_conversation_id = snapshot.get("serverConversationId")
@@ -376,6 +500,8 @@ class HistoryService:
                     search_error=item["search_error"],
                     trace=item["trace"],
                     planning=item["planning"],
+                    history_track=item["history_track"],
+                    track_model=item["track_model"],
                     created_at_ms=item["created_at_ms"],
                 )
             )
@@ -403,6 +529,7 @@ _SESSION_KEYS = {
     "providerId",
     "modelCategory",
     "modelApi",
+    "modelTracks",
     "pinned",
     "pinnedAt",
     "serverConversationId",

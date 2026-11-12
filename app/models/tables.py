@@ -532,6 +532,9 @@ class ChatHistorySession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     provider_id: Mapped[str | None] = mapped_column(String(64))
     model_category: Mapped[str | None] = mapped_column(String(64))
     model_api: Mapped[str | None] = mapped_column(String(64))
+    model_tracks: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
     pinned: Mapped[bool] = mapped_column(nullable=False, default=False, server_default=text("false"))
     pinned_at: Mapped[int | None] = mapped_column(BigInteger)
     server_conversation_id: Mapped[str | None] = mapped_column(String(64))
@@ -593,6 +596,8 @@ class ChatHistoryMessage(UUIDPrimaryKeyMixin, Base):
         JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
     )
     planning: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    history_track: Mapped[str | None] = mapped_column(String(16))
+    track_model: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at_ms: Mapped[int | None] = mapped_column(BigInteger)
 
     session: Mapped[ChatHistorySession] = relationship(back_populates="messages")

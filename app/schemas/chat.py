@@ -194,6 +194,7 @@ class ChatCompletionRequest(ChatRequestBase):
     usage_purpose: Literal["chat", "summary"] = "chat"
     conversation_id: str | None = Field(default=None, max_length=128)
     conversation_title: str | None = Field(default=None, max_length=200)
+    history_chat_id: str | None = Field(default=None, max_length=64)
 
 
 class StreamChatRequest(ChatRequestBase):

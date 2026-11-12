@@ -179,3 +179,157 @@ def test_identifiers_are_masked() -> None:
     technical = result["items"][0]["technical"]
     assert technical["request_ids_masked"]
     assert technical["pricing_version"] == "未提供"
+
+
+def test_conversations_follow_history_and_sum_summary_updates() -> None:
+    records = [
+        _record(id="a", settlement_key="run-a:1", amount=10),
+        _record(id="b", settlement_key="run-b:1", amount=7, created_at=NOW + timedelta(minutes=2)),
+    ]
+    summaries = [
+        {
+            "id": "s1",
+            "conversation_id": CONV,
+            "model": "deepseek-flash",
+            "summary_text": "第一次",
+            "called_at": NOW,
+            "input_tokens": 10,
+            "output_tokens": 2,
+            "total_tokens": 12,
+            "input_breakdown": [
+                {
+                    "direction": "input",
+                    "category": "user",
+                    "token_count": 10,
+                    "attribution_method": "heuristic_estimated",
+                }
+            ],
+            "output_breakdown": [],
+            "cache_breakdown": [],
+            "tool_count": 0,
+            "call_count": 1,
+        },
+        {
+            "id": "s2",
+            "conversation_id": CONV,
+            "model": "deepseek-flash",
+            "summary_text": "第二次",
+            "called_at": NOW + timedelta(minutes=3),
+            "input_tokens": 20,
+            "output_tokens": 4,
+            "total_tokens": 24,
+            "input_breakdown": [
+                {
+                    "direction": "input",
+                    "category": "user",
+                    "token_count": 20,
+                    "attribution_method": "provider_reported",
+                }
+            ],
+            "output_breakdown": [],
+            "cache_breakdown": [],
+            "tool_count": 1,
+            "call_count": 1,
+        },
+    ]
+    sessions = [
+        {
+            "conversation_id": CONV,
+            "title": "你好啊",
+            "model_name": "DeepSeek-V4.1-Flash",
+            "model_category": "chat",
+            "model_api": "chat",
+            "provider_id": "deepseek",
+            "turn_count": 2,
+            "has_images": False,
+            "updated_at": NOW,
+        }
+    ]
+    result = _build(
+        records,
+        [],
+        [],
+        [],
+        [],
+        [],
+        range_key="all",
+        summaries=summaries,
+        sessions=sessions,
+    )
+    assert result["conversation_total"] == 1
+    card = result["conversations"][0]
+    assert card["title"] == "你好啊"
+    assert card["billed_tokens"] == 17
+    assert card["turn_count"] == 2
+    assert card["provider"] == "DeepSeek"
+    assert card["model_kind"] == "文本"
+    assert [item["summary"] for item in card["summaries"]] == ["第一次", "第二次"]
+    assert len(card["turns"]) == 2
+    user = card["summaries"][0]["input_breakdown"][0]
+    assert user["label"] == "当前用户输入"
+    assert user["figure"]["value"] == 10
+    assert user["figure"]["quality"] == "estimated"
+
+
+def test_kind_filter_keeps_only_the_matching_model_row() -> None:
+    records = [
+        _record(id="chat", settlement_key="chat:1", amount=5075, metric="chat", source="chat_completion"),
+        _record(
+            id="image",
+            settlement_key="image:1",
+            amount=4479,
+            metric="image",
+            source="image",
+            created_at=NOW + timedelta(minutes=1),
+            context={"model": "Doubao Seedream 5.0 Flash", "conversation_id": CONV, "conversation_title": "生成一张帅哥图片"},
+        ),
+    ]
+    sessions = [
+        {
+            "conversation_id": CONV,
+            "title": "生成一张帅哥图片",
+            "model_name": "DeepSeek-V4.1-Flash",
+            "model_category": "chat",
+            "model_api": "chat",
+            "provider_id": "deepseek",
+            "turn_count": 2,
+            "has_images": True,
+            "updated_at": NOW,
+            "model_tracks": [
+                {
+                    "track": "text",
+                    "modelName": "DeepSeek-V4.1-Flash",
+                    "providerId": "deepseek",
+                    "modelCategory": "chat",
+                    "modelApi": "chat",
+                    "turns": 1,
+                    "tokens": 5075,
+                },
+                {
+                    "track": "image",
+                    "modelName": "Doubao Seedream 5.0 Flash",
+                    "providerId": "ark",
+                    "modelCategory": "image_gen",
+                    "modelApi": "images",
+                    "turns": 1,
+                    "tokens": 4479,
+                },
+            ],
+        }
+    ]
+    both = _build(records, [], [], [], [], [], range_key="all", sessions=sessions)
+    card = both["conversations"][0]
+    assert [row["track"] for row in card["tracks"]] == ["text", "image"]
+
+    chat_only = _build(records, [], [], [], [], [], range_key="all", kind="chat", sessions=sessions)
+    chat_card = chat_only["conversations"][0]
+    assert [row["model"] for row in chat_card["tracks"]] == ["DeepSeek-V4.1-Flash"]
+    assert chat_card["tracks"][0]["billed_tokens"] == 5075
+    assert all(turn["kind"] == "chat" for turn in chat_card["turns"])
+
+    image_only = _build(records, [], [], [], [], [], range_key="all", kind="image", sessions=sessions)
+    image_card = image_only["conversations"][0]
+    assert [row["model"] for row in image_card["tracks"]] == ["Doubao Seedream 5.0 Flash"]
+    assert image_card["tracks"][0]["billed_tokens"] == 4479
+    assert image_card["summaries"] == []
+    assert all(turn["kind"] == "image" for turn in image_card["turns"])

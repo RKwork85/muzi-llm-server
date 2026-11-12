@@ -209,3 +209,43 @@ class ModelPricingVersion(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     currency: Mapped[str] = mapped_column(String(8), nullable=False, default="USD", server_default=text("'USD'"))
     effective_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     effective_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class SummaryUpdate(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    """一次上下文摘要更新。只追加，不覆盖上一次的正文和用量。"""
+
+    __tablename__ = "summary_updates"
+    __table_args__ = (
+        UniqueConstraint("user_id", "settlement_key", name="uq_summary_updates_settlement"),
+        Index("ix_summary_updates_user_conversation", "user_id", "conversation_id", "called_at"),
+        {"comment": "上下文摘要的每一次更新。Token 来自当次模型调用，不另计一笔额度。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_summary_updates_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    conversation_id: Mapped[str | None] = mapped_column(String(128))
+    settlement_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    request_id: Mapped[str | None] = mapped_column(String(64))
+    provider: Mapped[str] = mapped_column(String(32), nullable=False, default="deepseek")
+    model: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    summary_text: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default=text("''"))
+    called_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    input_tokens: Mapped[int | None] = mapped_column(Integer)
+    output_tokens: Mapped[int | None] = mapped_column(Integer)
+    total_tokens: Mapped[int | None] = mapped_column(Integer)
+    cache_read_tokens: Mapped[int | None] = mapped_column(Integer)
+    cache_write_tokens: Mapped[int | None] = mapped_column(Integer)
+    input_breakdown: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    output_breakdown: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    cache_breakdown: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    tool_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    call_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default=text("1"))

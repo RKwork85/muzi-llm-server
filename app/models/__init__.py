@@ -49,6 +49,7 @@ from app.models.metering import (  # noqa: F401
     ModelPricingVersion,
     QuotaTransaction,
     SkillUsageRecord,
+    SummaryUpdate,
     ToolUsageRecord,
 )
 

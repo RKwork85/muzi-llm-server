@@ -19,10 +19,11 @@ from app.models.metering import (
     LlmUsageRecord,
     QuotaTransaction,
     SkillUsageRecord,
+    SummaryUpdate,
     ToolUsageRecord,
 )
 from app.models.rbac import UsageRecord
-from app.models.tables import ConversationMessage, ConversationSession
+from app.models.tables import ChatHistoryMessage, ChatHistorySession, ConversationMessage, ConversationSession
 
 SHANGHAI = timezone(timedelta(hours=8))
 SUMMARY_WINDOW = timedelta(hours=6)
@@ -58,6 +59,15 @@ ROLE_LABELS = {
     "summary": "上下文摘要",
     "other": "其他模型调用",
 }
+CATEGORY_LABELS = {
+    **dict(INPUT_CATEGORIES),
+    **dict(OUTPUT_CATEGORIES),
+    **EXTRA_LABELS,
+    "cache_read": "缓存读入",
+    "cache_write": "缓存写入",
+    "uncached_input": "未缓存输入",
+}
+PROVIDER_LABELS = {"ark": "方舟", "deepseek": "DeepSeek"}
 
 
 def mask_identifier(value: str | None) -> str | None:
@@ -957,6 +967,364 @@ def _gaps(turns: list[dict[str, Any]], composition: dict[str, Any], truncated: b
     return gaps
 
 
+def _actual(value: int | None) -> dict[str, Any]:
+    if value is None:
+        return _figure(None, "unavailable")
+    return _figure(int(value), "actual")
+
+
+def _part_label(direction: str, category: str) -> str:
+    if direction == "output" and category == "image":
+        return "图片"
+    return CATEGORY_LABELS.get(category, category)
+
+
+def _public_parts(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        count = row.get("token_count")
+        method = str(row.get("attribution_method") or "unavailable")
+        if count is None or int(count) <= 0 or method == "unavailable":
+            continue
+        direction = str(row.get("direction") or "input")
+        category = str(row.get("category") or "")
+        quality = "actual" if method == "provider_reported" else "estimated"
+        items.append(
+            {
+                "category": category,
+                "label": _part_label(direction, category),
+                "direction": direction if direction in {"input", "output", "cache"} else "input",
+                "figure": _figure(int(count), quality),
+                "share": None,
+            }
+        )
+    return items
+
+
+def _public_summary(row: dict[str, Any]) -> dict[str, Any]:
+    text = str(row.get("summary_text") or "").strip()
+    model = str(row.get("model") or "").strip()
+    return {
+        "id": str(row.get("id") or ""),
+        "model": model or None,
+        "called_at": row.get("called_at"),
+        "summary": text or None,
+        "call_count": int(row.get("call_count") or 1),
+        "tool_count": int(row.get("tool_count") or 0),
+        "input_tokens": _actual(row.get("input_tokens")),
+        "output_tokens": _actual(row.get("output_tokens")),
+        "total_tokens": _actual(row.get("total_tokens")),
+        "input_breakdown": _public_parts(row.get("input_breakdown")),
+        "output_breakdown": _public_parts(row.get("output_breakdown")),
+        "cache": _public_parts(row.get("cache_breakdown")),
+    }
+
+
+def _provider_label(provider: str | None) -> str | None:
+    text = str(provider or "").strip()
+    if not text:
+        return None
+    return PROVIDER_LABELS.get(text, text)
+
+
+def _turn_provider(turn: dict[str, Any]) -> str | None:
+    for record in turn.get("records") or []:
+        for row in record.get("llm") or []:
+            if row.get("provider"):
+                return str(row["provider"])
+        if record.get("source") == "image":
+            return "ark"
+    return None
+
+
+def _track_kind(track: str, category: str, api: str) -> str | None:
+    if track == "image" or category in {"vision", "image_gen"} or api == "images":
+        return "视觉"
+    if category == "video_gen" or api == "videos":
+        return "视频"
+    if track == "text" or category or api:
+        return "文本"
+    return None
+
+
+def _turn_tracks(turns: list[dict[str, Any]]) -> set[str]:
+    present = set()
+    for turn in turns:
+        if turn.get("summary_only"):
+            continue
+        present.add("image" if turn.get("kind") == "image" else "text")
+    if present:
+        return present
+    return {"image" if turn.get("kind") == "image" else "text" for turn in turns}
+
+
+def _tracks_in_view(rows: list[dict[str, Any]], turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """筛选后的轮次里没有的轨道不出现在卡片上。全部视图两种都在时两行都保留。"""
+    present = _turn_tracks(turns)
+    if not present or present >= {"text", "image"}:
+        return rows
+    if present == {"image"}:
+        return [row for row in rows if row.get("track") == "image"]
+    return [row for row in rows if row.get("track") != "image"]
+
+
+def _public_tracks(session: dict[str, Any] | None, turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    stored = (session or {}).get("model_tracks")
+    rows: list[dict[str, Any]] = []
+    if isinstance(stored, list):
+        for item in stored:
+            if not isinstance(item, dict):
+                continue
+            turn_count = int(item.get("turns") or 0)
+            if turn_count <= 0:
+                continue
+            rows.append(
+                {
+                    "track": str(item.get("track") or "text"),
+                    "model": str(item.get("modelName") or item.get("model_name") or "") or None,
+                    "model_kind": _track_kind(
+                        str(item.get("track") or ""),
+                        str(item.get("modelCategory") or item.get("model_category") or ""),
+                        str(item.get("modelApi") or item.get("model_api") or ""),
+                    ),
+                    "provider": _provider_label(item.get("providerId") or item.get("provider_id")),
+                    "turn_count": turn_count,
+                    "billed_tokens": int(item.get("tokens") or 0),
+                }
+            )
+    rows = _tracks_in_view(rows, turns)
+    if rows:
+        return rows
+    grouped: dict[str, dict[str, Any]] = {}
+    for turn in turns:
+        track = "image" if turn.get("kind") == "image" else "text"
+        bucket = grouped.setdefault(
+            track,
+            {"track": track, "model": None, "provider": None, "turn_count": 0, "billed_tokens": 0},
+        )
+        if not turn.get("summary_only"):
+            bucket["turn_count"] += 1
+        bucket["billed_tokens"] += int(turn.get("billed") or 0)
+        if turn.get("model"):
+            bucket["model"] = str(turn["model"])
+        provider = _turn_provider(turn)
+        if provider:
+            bucket["provider"] = _provider_label(provider)
+    derived = [item for item in grouped.values() if item["turn_count"] > 0]
+    if len(derived) < 2:
+        return rows
+    for item in derived:
+        item["model_kind"] = "视觉" if item["track"] == "image" else "文本"
+    return derived
+
+
+def _model_kind(session: dict[str, Any] | None, turns: list[dict[str, Any]]) -> str | None:
+    category = str((session or {}).get("model_category") or "")
+    api = str((session or {}).get("model_api") or "")
+    if category in {"vision", "image_gen"} or api == "images":
+        return "视觉"
+    if category == "video_gen" or api == "videos":
+        return "视频"
+    if category in {"chat", "text"} or api == "chat":
+        return "文本"
+    if any(turn.get("kind") == "image" for turn in turns):
+        return "视觉"
+    if (session or {}).get("model_name") or any(turn.get("model") for turn in turns):
+        return "文本"
+    return None
+
+
+def _link_orphan_images(records: list[dict[str, Any]], sessions: list[dict[str, Any]]) -> None:
+    candidates = [
+        item
+        for item in sessions
+        if item.get("has_images") and (item.get("conversation_id") or item.get("history_key")) and item.get("updated_at")
+    ]
+    if not candidates:
+        return
+    for record in records:
+        if record.get("source") != "image":
+            continue
+        context = dict(record.get("context") or {})
+        if _conv_key(context.get("conversation_id")):
+            continue
+        created = _aware(record["created_at"])
+        best = None
+        best_delta = None
+        for item in candidates:
+            delta = abs((created - _aware(item["updated_at"])).total_seconds())
+            if delta > 7200:
+                continue
+            if best_delta is None or delta < best_delta:
+                best = item
+                best_delta = delta
+        if best is None:
+            continue
+        context["conversation_id"] = best.get("conversation_id") or best.get("history_key")
+        if not context.get("conversation_title") and best.get("title"):
+            context["conversation_title"] = best["title"]
+        record["context"] = context
+    anchors = []
+    for record in records:
+        if record.get("source") != "image":
+            continue
+        context = record.get("context") or {}
+        key = _conv_key(context.get("conversation_id"))
+        if key:
+            anchors.append((_aware(record["created_at"]), key, context.get("conversation_title")))
+    if not anchors:
+        return
+    for record in records:
+        if not _is_summary(record):
+            continue
+        context = dict(record.get("context") or {})
+        if _conv_key(context.get("conversation_id")):
+            continue
+        created = _aware(record["created_at"])
+        best = None
+        best_delta = None
+        for moment, key, title in anchors:
+            delta = abs((created - moment).total_seconds())
+            if delta > 1800:
+                continue
+            if best_delta is None or delta < best_delta:
+                best = (key, title)
+                best_delta = delta
+        if best is None:
+            continue
+        context["conversation_id"] = best[0]
+        if best[1] and not context.get("conversation_title"):
+            context["conversation_title"] = best[1]
+        record["context"] = context
+
+
+def _link_summary_rows(summaries: list[dict[str, Any]] | None, records: list[dict[str, Any]]) -> None:
+    anchors = []
+    for record in records:
+        if record.get("source") != "image":
+            continue
+        context = record.get("context") or {}
+        key = _conv_key(context.get("conversation_id"))
+        if key:
+            anchors.append((_aware(record["created_at"]), key))
+    if not anchors:
+        return
+    for row in summaries or []:
+        if _conv_key(row.get("conversation_id")):
+            continue
+        called = row.get("called_at")
+        if called is None:
+            continue
+        moment = _aware(called)
+        best = None
+        best_delta = None
+        for anchor, key in anchors:
+            delta = abs((moment - anchor).total_seconds())
+            if delta > 1800:
+                continue
+            if best_delta is None or delta < best_delta:
+                best = key
+                best_delta = delta
+        if best:
+            row["conversation_id"] = best
+
+
+def _conversation_card(
+    key: str,
+    group: list[dict[str, Any]],
+    session: dict[str, Any] | None,
+    summaries: list[dict[str, Any]],
+) -> dict[str, Any]:
+    ordered = sorted(group, key=lambda item: item["created_at"])
+    title = str((session or {}).get("title") or "").strip()
+    if not title:
+        title = next((str(item.get("conversation_title")) for item in ordered if item.get("conversation_title")), "")
+    if not title:
+        title = next((str(item.get("prompt")) for item in ordered if item.get("prompt")), "")
+    model = str((session or {}).get("model_name") or "").strip()
+    if not model:
+        model = next((str(item.get("model")) for item in reversed(ordered) if item.get("model")), "")
+    provider = _provider_label((session or {}).get("provider_id")) or _provider_label(_turn_provider(ordered[-1]))
+    turn_count = int((session or {}).get("turn_count") or 0)
+    if turn_count <= 0:
+        turn_count = sum(1 for item in ordered if not item.get("summary_only"))
+    summary_rows = sorted(summaries, key=lambda item: _aware(item.get("called_at")))
+    if _turn_tracks(ordered) == {"image"}:
+        summary_rows = []
+    return {
+        "id": key,
+        "title": title or "未命名对话",
+        "created_at": ordered[0]["created_at"],
+        "model": model or None,
+        "model_kind": _model_kind(session, ordered),
+        "provider": provider,
+        "turn_count": turn_count,
+        "billed_tokens": sum(int(item["billed"]) for item in ordered),
+        "tracks": _public_tracks(session, ordered),
+        "summaries": [_public_summary(item) for item in summary_rows],
+        "turns": [_public_turn(item) for item in ordered],
+    }
+
+
+def _public_conversations(
+    turns: list[dict[str, Any]],
+    summaries: list[dict[str, Any]] | None,
+    sessions: list[dict[str, Any]] | None,
+    offset: int,
+    limit: int,
+) -> tuple[list[dict[str, Any]], int]:
+    parent: dict[str, str] = {}
+
+    def find(key: str) -> str:
+        parent.setdefault(key, key)
+        while parent[key] != key:
+            parent[key] = parent[parent[key]]
+            key = parent[key]
+        return key
+
+    def union(left: str, right: str) -> None:
+        parent[find(left)] = find(right)
+
+    session_for = {}
+    for item in sessions or []:
+        aliases = [alias for alias in (item.get("conversation_id"), item.get("history_key")) if alias]
+        if not aliases:
+            continue
+        for alias in aliases[1:]:
+            union(aliases[0], alias)
+        session_for[id(item)] = (aliases, item)
+    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    solos: list[dict[str, Any]] = []
+    for turn in turns:
+        key = turn.get("conversation_id")
+        if key:
+            grouped[find(key)].append(turn)
+        else:
+            solos.append(turn)
+    summary_by_root: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for item in summaries or []:
+        key = _conv_key(item.get("conversation_id"))
+        if key:
+            summary_by_root[find(key)].append(item)
+
+    def matched_session(root: str) -> dict[str, Any] | None:
+        for aliases, item in session_for.values():
+            if any(find(alias) == root for alias in aliases):
+                return item
+        return None
+
+    cards = [
+        _conversation_card(key, group, matched_session(key), summary_by_root.get(key, []))
+        for key, group in grouped.items()
+    ]
+    for turn in solos:
+        cards.append(_conversation_card(f"solo:{_public_turn(turn)['id']}", [turn], None, []))
+    cards.sort(key=lambda item: item["created_at"], reverse=True)
+    return cards[offset : offset + limit], len(cards)
+
+
 def build_usage_analysis(
     records: list[dict[str, Any]],
     llm_records: list[dict[str, Any]],
@@ -976,7 +1344,11 @@ def build_usage_analysis(
     since: datetime | None = None,
     until: datetime | None = None,
     message_limited: bool = False,
+    summaries: list[dict[str, Any]] | None = None,
+    sessions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    _link_orphan_images(records, sessions or [])
+    _link_summary_rows(summaries, records)
     assign_llm(records, llm_records)
     turns = _attach_summaries(_group_records(records))
     _assign_prompts(turns, messages)
@@ -1012,6 +1384,7 @@ def build_usage_analysis(
     trend_round, trend_round_limited = _round_points(filtered)
     filtered.sort(key=lambda item: item["created_at"], reverse=True)
     page = filtered[offset : offset + limit]
+    conversations, conversation_total = _public_conversations(filtered, summaries, sessions, offset, limit)
     return {
         "summary": summary,
         "composition": composition,
@@ -1020,6 +1393,8 @@ def build_usage_analysis(
         "trend_round_limited": trend_round_limited,
         "models": models,
         "items": [_public_turn(turn) for turn in page],
+        "conversations": conversations,
+        "conversation_total": conversation_total,
         "total": len(filtered),
         "limit": limit,
         "offset": offset,
@@ -1156,6 +1531,8 @@ async def load_usage_analysis(
             {"conversation_id": str(session_id), "content": content, "created_at": created_at}
             for session_id, content, created_at in fetched
         ]
+    history = await _load_history_sessions(session, owner)
+    summary_rows = await _load_summary_updates(session, owner, floor)
     return build_usage_analysis(
         records,
         [_map_llm(row, breakdowns.get(str(row.id), [])) for row in llm_rows],
@@ -1205,4 +1582,79 @@ async def load_usage_analysis(
         since=since,
         until=now,
         message_limited=message_limited,
+        summaries=summary_rows,
+        sessions=history,
     )
+
+
+async def _load_history_sessions(session: AsyncSession, owner: uuid.UUID) -> list[dict[str, Any]]:
+    rows = list(await session.scalars(select(ChatHistorySession).where(ChatHistorySession.user_id == owner)))
+    if not rows:
+        return []
+    ids = [row.id for row in rows]
+    counts = await session.execute(
+        select(ChatHistoryMessage.session_id, func.count())
+        .where(ChatHistoryMessage.session_id.in_(ids), ChatHistoryMessage.role == "user")
+        .group_by(ChatHistoryMessage.session_id)
+    )
+    count_map = {session_id: int(count) for session_id, count in counts.all()}
+    image_ids = set(
+        await session.scalars(
+            select(ChatHistoryMessage.session_id).where(
+                ChatHistoryMessage.session_id.in_(ids),
+                func.jsonb_typeof(ChatHistoryMessage.generated_images) == "array",
+                func.jsonb_array_length(ChatHistoryMessage.generated_images) > 0,
+            )
+        )
+    )
+    loaded: list[dict[str, Any]] = []
+    for row in rows:
+        key = _conv_key(row.server_conversation_id)
+        history_key = f"chat:{row.chat_id}" if row.chat_id else None
+        if not key and not history_key:
+            continue
+        loaded.append(
+            {
+                "conversation_id": key,
+                "history_key": history_key,
+                "title": row.chat_title or "",
+                "model_name": row.model_name,
+                "model_category": row.model_category,
+                "model_api": row.model_api,
+                "provider_id": row.provider_id,
+                "model_tracks": row.model_tracks if isinstance(row.model_tracks, list) else [],
+                "turn_count": count_map.get(row.id, 0),
+                "has_images": row.id in image_ids,
+                "updated_at": row.updated_at,
+            }
+        )
+    return loaded
+
+
+async def _load_summary_updates(
+    session: AsyncSession,
+    owner: uuid.UUID,
+    floor: datetime | None,
+) -> list[dict[str, Any]]:
+    stmt = select(SummaryUpdate).where(SummaryUpdate.user_id == owner)
+    if floor is not None:
+        stmt = stmt.where(SummaryUpdate.called_at >= floor)
+    rows = list(await session.scalars(stmt.order_by(SummaryUpdate.called_at.asc())))
+    return [
+        {
+            "id": str(row.id),
+            "conversation_id": row.conversation_id,
+            "model": row.model,
+            "summary_text": row.summary_text,
+            "called_at": row.called_at,
+            "input_tokens": row.input_tokens,
+            "output_tokens": row.output_tokens,
+            "total_tokens": row.total_tokens,
+            "input_breakdown": list(row.input_breakdown or []),
+            "output_breakdown": list(row.output_breakdown or []),
+            "cache_breakdown": list(row.cache_breakdown or []),
+            "tool_count": int(row.tool_count or 0),
+            "call_count": int(row.call_count or 1),
+        }
+        for row in rows
+    ]

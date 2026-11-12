@@ -16,6 +16,7 @@ from app.models.metering import (
     LlmUsageRecord,
     QuotaTransaction,
     SkillUsageRecord,
+    SummaryUpdate,
     ToolUsageRecord,
 )
 from app.models.mixins import utcnow
@@ -201,8 +202,76 @@ async def _insert_call(
                 status=str(meter.get("status") or "completed"),
             )
         )
+    if str(meter.get("usage_source") or "") == "summary":
+        await _insert_summary(session, owner, key, meter, conversation_id, request_id or meter.get("request_id"))
     await session.flush()
     return row
+
+
+def _kept_breakdown(meter: dict[str, Any], direction: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in meter.get("breakdown") or []:
+        if not isinstance(item, dict) or item.get("direction") != direction:
+            continue
+        count = item.get("token_count")
+        method = str(item.get("attribution_method") or "unavailable")
+        if count is None or int(count) <= 0 or method == "unavailable":
+            continue
+        rows.append(
+            {
+                "direction": direction,
+                "category": str(item.get("category") or ""),
+                "token_count": int(count),
+                "attribution_method": method,
+            }
+        )
+    return rows
+
+
+async def _insert_summary(
+    session: AsyncSession,
+    owner: uuid.UUID,
+    key: str,
+    meter: dict[str, Any],
+    conversation_id: str | None,
+    request_id: str | None,
+) -> None:
+    existing = await session.scalar(
+        select(SummaryUpdate.id).where(
+            SummaryUpdate.user_id == owner,
+            SummaryUpdate.settlement_key == key,
+        )
+    )
+    if existing is not None:
+        return
+    text = str(meter.get("summary_text") or "").strip()
+    try:
+        async with session.begin_nested():
+            session.add(
+                SummaryUpdate(
+                    user_id=owner,
+                    conversation_id=conversation_id,
+                    settlement_key=key,
+                    request_id=str(request_id)[:64] if request_id else None,
+                    provider=str(meter.get("provider") or "deepseek"),
+                    model=str(meter.get("model") or ""),
+                    summary_text=text[:2000],
+                    called_at=utcnow(),
+                    input_tokens=meter.get("input_tokens"),
+                    output_tokens=meter.get("output_tokens"),
+                    total_tokens=meter.get("total_tokens"),
+                    cache_read_tokens=meter.get("cache_read_tokens"),
+                    cache_write_tokens=meter.get("cache_write_tokens"),
+                    input_breakdown=_kept_breakdown(meter, "input"),
+                    output_breakdown=_kept_breakdown(meter, "output"),
+                    cache_breakdown=_kept_breakdown(meter, "cache"),
+                    tool_count=int(meter.get("tool_count") or 0),
+                    call_count=1,
+                )
+            )
+            await session.flush()
+    except IntegrityError:
+        return
 
 
 async def _insert_quota_tx(

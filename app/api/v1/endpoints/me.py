@@ -156,6 +156,7 @@ async def list_my_usage_calls(
                 "conversation_id": row.conversation_id,
                 "model": row.model,
                 "runtime_mode": row.runtime_mode,
+                "request_id": row.request_id,
                 "usage_source": row.usage_source,
                 "status": row.status,
                 "input_tokens": row.input_tokens,

@@ -54,6 +54,29 @@ def _usage_amount(payload: dict[str, Any]) -> tuple[int, int, int]:
     return total, prompt, completion
 
 
+def _public_image_usage(payload: dict[str, Any]) -> dict[str, Any]:
+    """返回和入账相同的输入、输出、合计。不补服务商没给的分类。"""
+    total, prompt, completion = _usage_amount(payload)
+    raw = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    public: dict[str, Any] = {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+    }
+    if raw.get("generated_images") is not None:
+        public["generated_images"] = raw.get("generated_images")
+    if completion > 0:
+        public["breakdown"] = [
+            {
+                "direction": "output",
+                "category": "image",
+                "token_count": completion,
+                "attribution_method": "provider_reported",
+            }
+        ]
+    return public
+
+
 @router.post("/images/generations", summary="经服务端生成图片并结算额度")
 async def generate_images(
     request: Request,
@@ -67,6 +90,17 @@ async def generate_images(
         raise InvalidRequestError("图片请求不是合法 JSON") from exc
     if not isinstance(body, dict):
         raise InvalidRequestError("图片请求格式无效")
+    conversation_id = body.pop("conversation_id", None)
+    conversation_title = body.pop("conversation_title", None)
+    if not isinstance(conversation_id, str) or not conversation_id.strip():
+        conversation_id = None
+    if not isinstance(conversation_title, str) or not conversation_title.strip():
+        conversation_title = None
+    history_chat_id = body.pop("history_chat_id", None)
+    if not isinstance(history_chat_id, str) or not history_chat_id.strip():
+        history_chat_id = None
+    if conversation_id is None and history_chat_id:
+        conversation_id = f"chat:{history_chat_id.strip()[:64]}"
     model = body.get("model")
     prompt = body.get("prompt")
     if not isinstance(model, str) or not model.strip() or not isinstance(prompt, str) or not prompt.strip():
@@ -92,6 +126,7 @@ async def generate_images(
         raise UpstreamError(message or "方舟图片生成失败")
     total, prompt_tokens, completion_tokens = _usage_amount(payload if isinstance(payload, dict) else {})
     image_count = len(payload.get("data") or []) if isinstance(payload, dict) else 0
+    extra = {"conversation_title": conversation_title[:200]} if conversation_title else None
     await settle_in_new_session(
         user.id,
         source="image",
@@ -99,11 +134,18 @@ async def generate_images(
         amount=total,
         kind="image",
         model=model,
+        conversation_id=conversation_id,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
         image_count=image_count or None,
+        extra=extra,
     )
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return {}
+    public_usage = _public_image_usage(payload)
+    payload = dict(payload)
+    payload["usage"] = public_usage
+    return payload
 
 
 @router.post("/chat/stream", summary="经服务端转发方舟流式对话并结算额度")

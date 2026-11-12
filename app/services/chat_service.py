@@ -65,6 +65,28 @@ def content_text(content: str | list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def _usage_breakdown(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """只留下有数量的输入、输出分类。空分类和缓存行不进响应。"""
+    kept: list[dict[str, Any]] = []
+    for item in rows or []:
+        if not isinstance(item, dict) or item.get("direction") not in ("input", "output"):
+            continue
+        if item.get("attribution_method") == "unavailable":
+            continue
+        count = item.get("token_count")
+        if count is None or int(count) <= 0:
+            continue
+        kept.append(
+            {
+                "direction": item["direction"],
+                "category": str(item.get("category") or ""),
+                "token_count": int(count),
+                "attribution_method": item.get("attribution_method"),
+            }
+        )
+    return kept or None
+
+
 def _usage_event(request_id: str, usage: UsageStats, meter: dict[str, Any] | None = None) -> str:
     from app.metering.persist import usage_public
 
@@ -93,6 +115,22 @@ class PreparedChat:
     developer_text: str = ""
     skill_text: str = ""
     skill_refs: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _summary_text(content: str) -> str:
+    raw = (content or "").strip()
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            data = json.loads(raw[start : end + 1])
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            text = str(data.get("summary") or "").replace("\n", " ").strip()
+            if text:
+                return text[:500]
+    return raw[:500]
 
 
 class ChatService:
@@ -126,17 +164,23 @@ class ChatService:
         result = await self.provider.create_chat_completion(prepared.provider_request)
         self._ensure_result(result, prepared.expect_json)
         self._log("chat", prepared.request_id, started, result, None)
-        add_meter(
-            self._build_meter(
-                prepared,
-                result.usage,
-                messages=prepared.provider_request.messages,
-                output_text=result.content or "",
-                tool_calls=result.tool_calls,
-                status="completed",
-            )
+        meter = self._build_meter(
+            prepared,
+            result.usage,
+            messages=prepared.provider_request.messages,
+            output_text=result.content or "",
+            tool_calls=result.tool_calls,
+            status="completed",
         )
-        return self._to_response(prepared, result, tool_rounds=None)
+        if body.usage_purpose == "summary":
+            meter["summary_text"] = _summary_text(result.content or "")
+        add_meter(meter)
+        return self._to_response(
+            prepared,
+            result,
+            tool_rounds=None,
+            breakdown=meter.get("breakdown"),
+        )
 
     async def run_tool_loop(self, body: ToolCallRequest) -> ChatCompletionResponse:
         schemas = self.tools.schemas_for(body.tool_names)
@@ -912,6 +956,7 @@ class ChatService:
         prepared: PreparedChat,
         result: CompletionResult,
         tool_rounds: int | None,
+        breakdown: list[dict[str, Any]] | None = None,
     ) -> ChatCompletionResponse:
         reasoning = result.reasoning_content if self._reasoning_visible(prepared.provider_request) else None
         usage = None
@@ -920,6 +965,10 @@ class ChatService:
                 prompt_tokens=result.usage.prompt_tokens,
                 completion_tokens=result.usage.completion_tokens,
                 total_tokens=result.usage.total_tokens,
+                reasoning_tokens=result.usage.reasoning_tokens,
+                cache_read_tokens=result.usage.cache_read_tokens,
+                cache_write_tokens=result.usage.cache_write_tokens,
+                breakdown=_usage_breakdown(breakdown),
             )
         return ChatCompletionResponse(
             request_id=prepared.request_id,

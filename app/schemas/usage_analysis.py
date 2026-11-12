@@ -110,6 +110,44 @@ class TrendPoint(BaseModel):
     output_tokens: int = 0
 
 
+class SummaryRevision(BaseModel):
+    id: str
+    model: str | None = None
+    called_at: datetime
+    summary: str | None = None
+    call_count: int = 1
+    tool_count: int = 0
+    input_tokens: TokenFigure
+    output_tokens: TokenFigure
+    total_tokens: TokenFigure
+    input_breakdown: list[BreakdownItem] = Field(default_factory=list)
+    output_breakdown: list[BreakdownItem] = Field(default_factory=list)
+    cache: list[BreakdownItem] = Field(default_factory=list)
+
+
+class UsageModelTrack(BaseModel):
+    track: str
+    model: str | None = None
+    model_kind: str | None = None
+    provider: str | None = None
+    turn_count: int = 0
+    billed_tokens: int = 0
+
+
+class UsageConversation(BaseModel):
+    id: str
+    title: str
+    created_at: datetime
+    model: str | None = None
+    model_kind: str | None = None
+    provider: str | None = None
+    turn_count: int = 0
+    billed_tokens: int = 0
+    tracks: list[UsageModelTrack] = Field(default_factory=list)
+    summaries: list[SummaryRevision] = Field(default_factory=list)
+    turns: list[UsageTurn] = Field(default_factory=list)
+
+
 class UsageAnalysisResponse(BaseModel):
     summary: UsageSummary
     composition: Composition
@@ -118,6 +156,8 @@ class UsageAnalysisResponse(BaseModel):
     trend_round_limited: bool = False
     models: list[str] = Field(default_factory=list)
     items: list[UsageTurn] = Field(default_factory=list)
+    conversations: list[UsageConversation] = Field(default_factory=list)
+    conversation_total: int = 0
     total: int = 0
     limit: int = 20
     offset: int = 0

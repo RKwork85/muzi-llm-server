@@ -271,7 +271,7 @@ async def create_completion(
             completion_tokens=usage.completion_tokens if usage is not None else 0,
             model=result.model,
             source="summary" if purpose == "summary" else "chat_completion",
-            conversation_id=body.conversation_id,
+            conversation_id=_usage_conversation_id(body),
             conversation_title=body.conversation_title,
             purpose=purpose,
         )
@@ -318,6 +318,15 @@ async def _authorize_model_user(
         return owner
     finally:
         await session.close()
+
+
+def _usage_conversation_id(body: ChatCompletionRequest) -> str | None:
+    if body.conversation_id:
+        return body.conversation_id
+    chat_id = (body.history_chat_id or "").strip()
+    if body.usage_purpose == "summary" and chat_id:
+        return f"chat:{chat_id[:64]}"
+    return None
 
 
 async def _settle_chat_usage(
