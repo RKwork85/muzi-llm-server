@@ -29,6 +29,9 @@ _ALLOWED_FIELDS = frozenset(
         "artifact_type",
         "artifact_size",
         "artifact_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
     }
 )
 _MAX_VALUE = 120

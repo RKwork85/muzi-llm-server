@@ -54,6 +54,7 @@ def setup_logging(settings: Settings) -> None:
         RedactingFilter(
             [
                 settings.deepseek_api_key,
+                settings.ark_api_key,
                 settings.postgres_password,
                 settings.redis_password,
             ]

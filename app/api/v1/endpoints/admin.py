@@ -15,13 +15,15 @@ from app.authorization.application.audit_service import AuditService, QuotaServi
 from app.authorization.application.authorization_service import AuthorizationService
 from app.authorization.application.role_service import RoleService, UserPermissionService
 from app.authorization.dependencies import require_permission
+from app.authorization.domain.catalog import max_role_rank
 from app.core.database.deps import DbSession
-from app.core.exceptions import UserNotFoundError
+from app.core.exceptions import HierarchyDeniedError, UserNotFoundError
 from app.models.rbac import Permission, Role, UserRole
 from app.models.tables import User
 from app.schemas.rbac import (
     AuditLogOut,
     PermissionOut,
+    QuotaAdjust,
     QuotaOut,
     QuotaSet,
     RoleCreate,
@@ -51,6 +53,8 @@ async def _user_admin_out(
         username=user.username,
         display_name=user.display_name,
         status=user.status,
+        avatar=user.avatar,
+        phone=user.phone,
         roles=list(snapshot.roles),
         permissions=sorted(snapshot.permissions),
         data_scope=snapshot.data_scope,
@@ -138,6 +142,8 @@ async def set_user_roles(
         await session.delete(row)
     for role in roles:
         await service.assign_role_to_user(user_id, role.id)
+    # 角色变更后同步额度：super_admin 无限；其余角色若仍是默认值则跟随新角色额度。
+    await QuotaService(session).sync_quota_to_role(user_id)
     await AuditService(session).record(
         actor.id,
         "role_change",
@@ -313,8 +319,12 @@ async def list_audit(
 async def list_quotas(
     user_id: uuid.UUID,
     session: DbSession,
-    _: Annotated[User, Depends(require_permission("quota.read"))],
+    actor: Annotated[User, Depends(require_permission("quota.read"))],
 ) -> list[QuotaOut]:
+    target = await session.get(User, user_id)
+    if target is None:
+        raise UserNotFoundError()
+    await _guard_quota_scope(session, actor, target)
     quotas = await QuotaService(session).list_quotas(user_id)
     return [QuotaOut.model_validate(q) for q in quotas]
 
@@ -326,12 +336,71 @@ async def set_quota(
     session: DbSession,
     actor: Annotated[User, Depends(require_permission("quota.manage"))],
 ) -> QuotaOut:
-    quota = await QuotaService(session).set_quota(user_id, body.quota_key, body.limit_value, body.period)
+    target = await session.get(User, user_id)
+    if target is None:
+        raise UserNotFoundError()
+    await _guard_quota_scope(session, actor, target)
+    service = QuotaService(session)
+    previous = await service.get_quota(user_id, body.quota_key, body.period)
+    source = "unlimited" if body.unlimited else "manual"
+    quota = await service.set_quota(
+        user_id, body.quota_key, body.limit_value, body.period, limit_source=source
+    )
     await AuditService(session).record(
         actor.id,
         "quota_set",
         subject_id=user_id,
-        context={"quota_key": body.quota_key, "period": body.period, "limit": body.limit_value},
+        context={
+            "quota_key": body.quota_key,
+            "period": body.period,
+            "before_limit": previous.limit_value if previous is not None else None,
+            "before_source": previous.limit_source if previous is not None else None,
+            "after_limit": body.limit_value,
+            "after_source": source,
+            "reason": body.reason,
+        },
+    )
+    await session.flush()
+    return QuotaOut.model_validate(quota)
+
+
+@router.post("/users/{user_id}/quotas/adjust", response_model=QuotaOut, summary="按 10 万为单位调整额度")
+async def adjust_quota(
+    user_id: uuid.UUID,
+    body: QuotaAdjust,
+    session: DbSession,
+    actor: Annotated[User, Depends(require_permission("quota.manage"))],
+) -> QuotaOut:
+    target = await session.get(User, user_id)
+    if target is None:
+        raise UserNotFoundError()
+    await _guard_quota_scope(session, actor, target)
+    service = QuotaService(session)
+    previous = await service.get_quota(user_id, body.quota_key, body.period)
+    quota = await service.adjust_quota(
+        user_id,
+        actor.id,
+        action=body.action,
+        units=body.units,
+        reason=body.reason,
+        quota_key=body.quota_key,
+        period=body.period,
+    )
+    await AuditService(session).record(
+        actor.id,
+        "quota_adjust",
+        subject_id=user_id,
+        context={
+            "quota_key": body.quota_key,
+            "period": body.period,
+            "action": body.action,
+            "units": body.units,
+            "unit_size": 100_000,
+            "before_limit": None if previous is None or previous.limit_source == "unlimited" else previous.limit_value,
+            "before_source": previous.limit_source if previous is not None else None,
+            "after_limit": quota.limit_value,
+            "reason": body.reason.strip(),
+        },
     )
     await session.flush()
     return QuotaOut.model_validate(quota)
@@ -340,6 +409,19 @@ async def set_quota(
 # ---------------------------------------------------------------------------
 # 保护性校验
 # ---------------------------------------------------------------------------
+
+async def _guard_quota_scope(session: DbSession, actor: User, target: User) -> None:
+    """分级控制：操作者最高角色等级必须不低于目标用户最高角色等级。
+
+    super_admin（等级 100）可控制所有角色；admin（80）可控制 admin 及以下；
+    逐级向下。等级不足时抛 HierarchyDeniedError。
+    """
+    authz = AuthorizationService(session)
+    actor_roles = await authz.get_user_roles(actor.id)
+    target_roles = await authz.get_user_roles(target.id)
+    if max_role_rank(list(actor_roles)) < max_role_rank(list(target_roles)):
+        raise HierarchyDeniedError()
+
 
 async def _guard_last_super_admin(session: DbSession, user: User) -> None:
     from app.authorization.domain.catalog import SUPER_ADMIN_ROLE_CODE

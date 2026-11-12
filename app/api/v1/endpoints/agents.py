@@ -15,6 +15,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.models import AgentEventType, AgentRequest, EventEnvelope
+from app.authorization.application.audit_service import QuotaService
+from app.authorization.application.quota_bridge import quota_event_observer
 from app.agents.runtime import AgentRuntime
 from app.api.deps import get_agent_runtime
 from app.api.v1.endpoints.mcp import optional_mcp
@@ -63,6 +65,7 @@ async def create_run(
     request_id = get_request_id()
     task_id = None
     event_observer = None
+    owner = None
     if body.conversation_id:
         if credentials is None:
             raise LoginRequiredError()
@@ -110,6 +113,27 @@ async def create_run(
             execution_id,
             lambda: runtime.get(task_id),
         )
+    quota_user_id = None
+    if getattr(request.app.state, "database_ready", False):
+        if owner is None:
+            if credentials is None:
+                raise LoginRequiredError()
+            try:
+                factory = get_session_factory()
+            except RuntimeError:
+                raise LoginRequiredError() from None
+            async with factory() as session:
+                owner = await AuthService(session).user_for_token(credentials.credentials)
+                if owner is None:
+                    raise LoginRequiredError()
+                await QuotaService(session).authorize(owner.id)
+                await session.commit()
+        else:
+            async with factory() as session:
+                await QuotaService(session).authorize(owner.id)
+                await session.commit()
+        quota_user_id = str(owner.id)
+    observer = quota_event_observer(event_observer, quota_user_id, task_id or request_id)
     try:
         view = await runtime.start(
             body,
@@ -118,7 +142,7 @@ async def create_run(
             mcp_user_id=user_id,
             mcp_service=mcp,
             task_id=task_id,
-            event_observer=event_observer,
+            event_observer=observer,
         )
     except Exception:
         if task_id:

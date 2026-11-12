@@ -99,6 +99,11 @@ class QuotaOut(BaseModel):
     period: str
     limit_value: int
     used_value: int
+    limit_source: str = "manual"
+    display_value: int = 0
+    adjust_reason: str = ""
+    adjusted_by: UUID | None = None
+    adjusted_at: datetime | None = None
 
 
 class QuotaSet(BaseModel):
@@ -106,6 +111,18 @@ class QuotaSet(BaseModel):
 
     quota_key: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]{0,63}$")
     limit_value: int = Field(ge=0)
+    period: str = Field(default="total", max_length=32)
+    unlimited: bool = False
+    reason: str = Field(default="", max_length=200)
+
+
+class QuotaAdjust(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    action: str = Field(pattern=r"^(increase|decrease|reset)$")
+    units: int = Field(ge=0, le=1_000_000)
+    reason: str = Field(min_length=1, max_length=200)
+    quota_key: str = Field(default="total_tokens", min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]{0,63}$")
     period: str = Field(default="total", max_length=32)
 
 
@@ -130,3 +147,50 @@ class MeResponse(BaseModel):
     roles: list[str] = Field(default_factory=list)
     permissions: list[str] = Field(default_factory=list)
     data_scope: str = "self"
+
+
+class QuotaSummary(BaseModel):
+    quota_key: str
+    limit_value: int
+    used_value: int
+    remaining: int
+    unlimited: bool = False
+    limit_source: str = "manual"
+
+
+class UsageRecordOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    kind: str
+    amount: int
+    model: str | None = None
+    conversation_id: str | None = None
+    conversation_title: str | None = None
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    image_count: int | None = None
+    purpose: str | None = None
+    created_at: datetime
+
+
+class UsageListResponse(BaseModel):
+    items: list[UsageRecordOut] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 50
+    offset: int = 0
+    total_consumed: int = 0
+    kind_breakdown: dict[str, int] = Field(default_factory=dict)
+
+
+class UsageReportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str = Field(pattern=r"^(chat|image)$")
+    amount: int = Field(ge=0, le=100_000_000)
+    model: str | None = Field(default=None, max_length=128)
+    conversation_id: str | None = Field(default=None, max_length=128)
+    conversation_title: str | None = Field(default=None, max_length=200)
+    prompt_tokens: int = Field(default=0, ge=0)
+    completion_tokens: int = Field(default=0, ge=0)
+    image_count: int | None = Field(default=None, ge=1, le=64)

@@ -12,6 +12,8 @@ from fastapi.responses import StreamingResponse
 from app.core.sse import format_sse
 
 from app.api.deps import get_authenticated_user
+from app.authorization.application.audit_service import QuotaService
+from app.authorization.application.quota_bridge import quota_event_observer
 from app.api.deps import get_agent_runtime
 from app.core.database.deps import DbSession
 from app.core.database.session import get_session_factory
@@ -160,6 +162,7 @@ async def plan_message(
     session: DbSession,
     user: AuthenticatedUser,
 ) -> PlanRuntimeResponse:
+    await QuotaService(session).authorize(user.id)
     try:
         plan, interaction, response = await SqlPlanningStore(session).process_message(
             plan_id,
@@ -192,6 +195,7 @@ async def plan_message_stream(
     若有交互卡片发 `event: interaction`；最后 `event: done`。流开始前的校验错误发 `event: error`。
     """
     store = SqlPlanningStore(session)
+    await QuotaService(session).authorize(user.id)
 
     async def stream_body():
         try:
@@ -382,6 +386,8 @@ async def authorize_execution(
             skill_mode=None,
         )
         mcp_user_id = await mcp.user_id_from_request(request) if mcp is not None else None
+        await QuotaService(session).authorize(user.id)
+        await session.commit()
         try:
             run = await runtime.start(
                 agent_request,
@@ -390,7 +396,7 @@ async def authorize_execution(
                 mcp_user_id=mcp_user_id,
                 mcp_service=mcp,
                 task_id=task_id,
-                event_observer=persistence,
+                event_observer=quota_event_observer(persistence, str(user.id), task_id),
             )
         except Exception:
             task_row = await session.get(AgentTask, db_task_id)

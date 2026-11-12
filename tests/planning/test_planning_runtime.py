@@ -421,3 +421,31 @@ def test_form_submission_value_is_validated() -> None:
     decisions = {decision.key: decision.value for decision in result.decisions if decision.source == "user"}
     assert decisions["travel_basics"] == {"departure": "深圳", "transport": "rail", "budget": 1200, "party": ["friends", "family"]}
 
+
+@pytest.mark.asyncio
+async def test_planning_stream_keeps_the_last_usage() -> None:
+    from app.providers.base import StreamChunk, UsageStats
+    from tests.fakes import FakeProvider
+
+    content = json.dumps(
+        {"protocol_version": "1.0", "action": "respond", "response": "使用安全的默认方案。"}
+    )
+    provider = FakeProvider()
+    provider.push(
+        [
+            StreamChunk(content=content[:12], usage=UsageStats(5, 1, 6)),
+            StreamChunk(content=content[12:], finish_reason="stop", usage=UsageStats(5, 4, 9)),
+        ]
+    )
+    planner = PlanningOrchestrator()
+    plan = planner.create_plan(owner_id="user-a", conversation_id="conv-a", goal="Plan a system")
+    engine = PlanningDecisionEngine(provider, model="test-model")
+    events = [
+        event
+        async for event in engine.propose_stream(goal="Plan a system", user_message="Start", plan=plan)
+    ]
+    assert events[-1][0] == "done"
+    assert engine.total_tokens == 9
+    assert engine.prompt_tokens == 5
+    assert engine.completion_tokens == 4
+

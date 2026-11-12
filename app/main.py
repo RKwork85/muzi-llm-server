@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -151,8 +152,22 @@ def create_app(
             bind_grants(grant_store, production=production)
             app.state.database_ready = ready
             app.state.redis_ready = ready
+            sms_stop = asyncio.Event()
+            sms_task: asyncio.Task[None] | None = None
+            if runtime_settings.sms_receipt_enabled and runtime_settings.sms_mns_queue_name:
+                from app.sms.receipts import run_receipt_loop
+
+                sms_task = asyncio.create_task(run_receipt_loop(runtime_settings, sms_stop))
+            app.state.sms_receipt_task = sms_task
             yield
         finally:
+            sms_task = getattr(app.state, "sms_receipt_task", None)
+            if sms_task is not None:
+                sms_task.cancel()
+                try:
+                    await sms_task
+                except asyncio.CancelledError:
+                    pass
             bind_grants(None)
             await mcp_pool.aclose()
             if mcp_session is not None:

@@ -112,8 +112,15 @@ class AgentLoop:
             except ProviderFailure as exc:
                 status = TaskStatus.LIMIT_REACHED if exc.code == "AGENT_DEADLINE_EXCEEDED" else TaskStatus.FAILED
                 return self._done(status, None, steps, tool_count, exc.code, usage)
-            usage = _add_usage(usage, completion.usage)
-            self._emit("agent.model.completed", {"step": steps, "finish_reason": completion.finish_reason})
+            step_usage = completion.usage
+            usage = _add_usage(usage, step_usage)
+            completed: dict[str, object] = {"step": steps, "finish_reason": completion.finish_reason}
+            if step_usage is not None:
+                completed["prompt_tokens"] = int(step_usage.prompt_tokens)
+                completed["completion_tokens"] = int(step_usage.completion_tokens)
+                completed["total_tokens"] = int(step_usage.total_tokens)
+            self._emit("agent.model.completed", completed)
+            await self._settle_events()
             if completion.finish_reason in _BAD_FINISH:
                 return self._done(TaskStatus.FAILED, None, steps, tool_count, _BAD_FINISH[completion.finish_reason], usage)
             if completion.finish_reason == "unknown":
@@ -223,6 +230,11 @@ class AgentLoop:
     def _emit(self, event_type: str, data: dict[str, object]) -> None:
         if self._events is not None:
             self._events.publish(event_type, data)
+
+    async def _settle_events(self) -> None:
+        drain = getattr(self._events, "drain_observer", None)
+        if drain is not None:
+            await drain()
 
     def _done(
         self,

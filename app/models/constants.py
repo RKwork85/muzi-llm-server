@@ -18,7 +18,9 @@ RESOURCE_TYPES = (
     "session",
     "task",
 )
-CREDENTIAL_PROVIDERS = ("email_password", "github")
+# phone 与迁移 ck_user_credentials_provider 保持一致。
+CREDENTIAL_PROVIDERS = ("email_password", "github", "phone")
+PROFILE_EDIT_FIELDS = ("avatar", "display_name")
 SESSION_MODES = ("chat", "agent")
 SESSION_STATUSES = ("active", "archived", "closed")
 MESSAGE_ROLES = ("user", "assistant", "system", "tool")

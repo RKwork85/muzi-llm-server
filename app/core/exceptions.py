@@ -93,6 +93,19 @@ class ToolRoundLimitError(AppError):
     status_code = 422
     default_message = "已达到工具调用轮数上限"
 
+    def __init__(
+        self,
+        message: str | None = None,
+        *,
+        total_tokens: int = 0,
+        prompt_tokens: int = 0,
+        completion_tokens: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.total_tokens = total_tokens
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
+
 
 class InternalError(AppError):
     code = "INTERNAL_ERROR"
@@ -175,6 +188,24 @@ class AccountExistsError(AppError):
     default_message = "邮箱或用户名已被使用"
 
 
+class FeatureNotReadyError(AppError):
+    code = "FEATURE_NOT_READY"
+    status_code = 501
+    default_message = "功能尚未开放"
+
+
+class SmsRateLimitError(AppError):
+    code = "SMS_RATE_LIMIT"
+    status_code = 429
+    default_message = "验证码发送过于频繁，请稍后再试"
+
+
+class SmsDeliveryError(AppError):
+    code = "SMS_DELIVERY_FAILED"
+    status_code = 502
+    default_message = "短信发送失败，请稍后再试"
+
+
 class LoginRequiredError(AppError):
     code = "LOGIN_REQUIRED"
     status_code = 401
@@ -205,10 +236,28 @@ class UserNotFoundError(AppError):
     default_message = "未找到指定用户"
 
 
+class ArkFileNotFoundError(AppError):
+    code = "ARK_FILE_NOT_FOUND"
+    status_code = 404
+    default_message = "文件不存在"
+
+
 class QuotaExceededError(AppError):
     code = "QUOTA_EXCEEDED"
     status_code = 429
     default_message = "使用额度已达上限"
+
+
+class HierarchyDeniedError(AppError):
+    code = "HIERARCHY_DENIED"
+    status_code = 403
+    default_message = "无权管理同等级或更高等级用户"
+
+
+class AvatarLimitExceededError(AppError):
+    code = "AVATAR_LIMIT_EXCEEDED"
+    status_code = 429
+    default_message = "头像和名字 30 天内最多修改 10 次"
 
 
 class SuperAdminProtectedError(AppError):

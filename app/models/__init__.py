@@ -26,24 +26,40 @@ from app.models.rbac import (
     UsageRecord,
     UserPermission,
     UserRole,
+    QuotaAdjustment,
 )
 from app.models.tables import (
     AgentTask,
+    ArkFile,
+    ChatHistoryMessage,
+    ChatHistorySession,
     ConversationMessage,
     ConversationSession,
     ExecutionEvent,
+    ProfileEdit,
     RefreshToken,
     TaskExecution,
     ToolCallRecord,
     User,
     UserCredential,
 )
+from app.models.metering import (  # noqa: F401
+    LlmUsageBreakdown,
+    LlmUsageRecord,
+    ModelPricingVersion,
+    QuotaTransaction,
+    SkillUsageRecord,
+    ToolUsageRecord,
+)
 
 register_redaction_listeners()
 
 __all__ = [
     "AgentTask",
+    "ArkFile",
     "Base",
+    "ChatHistoryMessage",
+    "ChatHistorySession",
     "PersistentInteraction",
     "PersistentInteractionSubmission",
     "PersistentPlan",
@@ -54,6 +70,7 @@ __all__ = [
     "ConversationMessage",
     "ConversationSession",
     "ExecutionEvent",
+    "ProfileEdit",
     "RefreshToken",
     "TaskExecution",
     "ToolCallRecord",
@@ -73,4 +90,5 @@ __all__ = [
     "UsageRecord",
     "UserPermission",
     "UserRole",
+    "QuotaAdjustment",
 ]

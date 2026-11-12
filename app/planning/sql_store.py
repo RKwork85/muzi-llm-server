@@ -233,11 +233,13 @@ class SqlPlanningStore:
             .order_by(ConversationMessage.created_at.desc()).limit(24)
         ))
         history = [{"role": item.role, "content": str(item.content)[:8000]} for item in reversed(recent_messages)]
-        proposal = await PlanningDecisionEngine(
+        engine = PlanningDecisionEngine(
             provider,
             model=settings.deepseek_model,
             timeout_seconds=settings.deepseek_timeout_seconds,
-        ).propose(goal=current.goal, user_message=message, plan=current, history=history)
+        )
+        proposal = await engine.propose(goal=current.goal, user_message=message, plan=current, history=history)
+        await self._settle_plan(owner, engine, plan_id, current.revision)
         InteractionOrchestrator().enforce(proposal, current)
         updated, interaction = await self.apply_proposal(plan_id, owner, current, proposal)
         conversation = await self._conversation(str(row.conversation_id), owner.id)
@@ -277,18 +279,21 @@ class SqlPlanningStore:
         )
 
         proposal: DecisionProposal | None = None
-        async for event, payload in engine.propose_stream(
-            goal=current.goal, user_message=message, plan=current, history=history
-        ):
-            if event == "delta":
-                yield format_sse("delta", {"content": payload})
-            elif event == "interaction_pending":
-                yield format_sse("interaction_pending", {"action": payload})
-            elif event == "error":
-                yield format_sse("error", {"error": {"code": payload, "message": _PLANNING_ERROR_MESSAGES.get(payload, "规划请求失败")}})
-                return
-            elif event == "done":
-                proposal = payload
+        try:
+            async for event, payload in engine.propose_stream(
+                goal=current.goal, user_message=message, plan=current, history=history
+            ):
+                if event == "delta":
+                    yield format_sse("delta", {"content": payload})
+                elif event == "interaction_pending":
+                    yield format_sse("interaction_pending", {"action": payload})
+                elif event == "error":
+                    yield format_sse("error", {"error": {"code": payload, "message": _PLANNING_ERROR_MESSAGES.get(payload, "规划请求失败")}})
+                    return
+                elif event == "done":
+                    proposal = payload
+        finally:
+            await self._settle_plan(owner, engine, plan_id, current.revision)
         if proposal is None:
             return
 
@@ -303,6 +308,22 @@ class SqlPlanningStore:
         if interaction is not None:
             yield format_sse("interaction", {"interaction": interaction.model_dump(mode="json")})
         yield format_sse("done", {"plan": updated.model_dump(mode="json"), "response": proposal.response or ""})
+
+    async def _settle_plan(self, owner: User, engine, plan_id: str, revision: int) -> None:
+        from app.authorization.application.audit_service import QuotaService
+        from app.core.context import get_request_id
+
+        await QuotaService(self._session).settle(
+            owner.id,
+            source="planning",
+            settlement_key=f"{get_request_id()}:{plan_id}:{revision}",
+            amount=engine.total_tokens,
+            kind="chat",
+            model=engine._model,
+            prompt_tokens=engine.prompt_tokens,
+            completion_tokens=engine.completion_tokens,
+            extra={"plan_id": plan_id, "revision": revision},
+        )
 
     async def apply_proposal(
         self,

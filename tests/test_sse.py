@@ -45,10 +45,48 @@ def test_sse_delta_usage_and_done(client: TestClient, provider: FakeProvider) ->
     assert '"total_tokens":3' in body
     assert "event: done" in body
     assert '"finish_reason":"stop"' in body
-    assert _event_names(body) == ["delta", "usage", "delta", "done"]
+    assert _event_names(body) == ["delta", "delta", "usage", "done"]
     assert "隐藏思维链" not in body
     assert provider.calls[0].messages[0]["role"] == "system"
     assert provider.stream_closed == 1
+
+
+def test_sse_forwards_reasoning_only_when_thinking_is_enabled(client: TestClient, provider: FakeProvider) -> None:
+    provider.push(
+        [
+            StreamChunk(content="好", finish_reason="stop", id="s1", model="deepseek-flash", reasoning_content="先想一下", usage=UsageStats(2, 1, 3)),
+        ]
+    )
+    with client.stream(
+        "POST",
+        "/api/v1/chat/completions/stream",
+        json=chat_payload(thinking={"type": "enabled"}),
+    ) as response:
+        body = response.read().decode("utf-8")
+    assert response.status_code == 200
+    assert "先想一下" in body
+    assert "event: delta" in body
+
+
+def test_stream_keeps_the_last_usage_in_a_round(client: TestClient, provider: FakeProvider) -> None:
+    provider.push(
+        [
+            StreamChunk(content="你", id="s1", model="deepseek-flash", usage=UsageStats(5, 1, 6)),
+            StreamChunk(
+                content="好",
+                id="s1",
+                model="deepseek-flash",
+                finish_reason="stop",
+                usage=UsageStats(5, 2, 7),
+            ),
+        ]
+    )
+    with client.stream("POST", "/api/v1/chat/completions/stream", json=chat_payload()) as response:
+        assert response.status_code == 200
+        body = response.read().decode("utf-8")
+    assert _event_names(body).count("usage") == 1
+    assert '"total_tokens":7' in body
+    assert '"total_tokens":6' not in body
 
 
 def test_plan_stream_injects_plan_mode_prompt(app, provider: FakeProvider) -> None:

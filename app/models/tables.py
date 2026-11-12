@@ -7,8 +7,10 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -26,6 +28,7 @@ from app.models.constants import (
     CREDENTIAL_PROVIDERS,
     EXECUTION_STATUSES,
     MESSAGE_ROLES,
+    PROFILE_EDIT_FIELDS,
     SESSION_MODES,
     SESSION_STATUSES,
     TASK_STATUSES,
@@ -44,6 +47,11 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("email", name="uq_users_email"),
         UniqueConstraint("username", name="uq_users_username"),
+        UniqueConstraint("phone", name="uq_users_phone"),
+        CheckConstraint(
+            "phone IS NULL OR phone ~ '^1[3-9][0-9]{9}$'",
+            name="ck_users_phone",
+        ),
         CheckConstraint(sql_in("status", USER_STATUSES), name="ck_users_status"),
         CheckConstraint(
             "email = lower(email) AND position('@' in email) > 1",
@@ -59,6 +67,7 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     email: Mapped[str] = mapped_column(String(320), nullable=False)
     username: Mapped[str] = mapped_column(String(32), nullable=False)
+    phone: Mapped[str | None] = mapped_column(String(20))
     display_name: Mapped[str | None] = mapped_column(String(120))
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="active", server_default=text("'active'")
@@ -66,8 +75,15 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     preferences: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=_JSON_OBJECT
     )
+    # 裁剪后的头像。以 data URL 形式存储，避免引入外部对象存储依赖。
+    avatar: Mapped[str | None] = mapped_column(Text)
+    avatar_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     credentials: Mapped[list[UserCredential]] = relationship(
+        back_populates="user",
+        passive_deletes=True,
+    )
+    profile_edits: Mapped[list[ProfileEdit]] = relationship(
         back_populates="user",
         passive_deletes=True,
     )
@@ -83,6 +99,26 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         back_populates="user",
         passive_deletes=True,
     )
+
+
+class ProfileEdit(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    """头像与显示名修改记录。用于 30 天内最多修改 10 次的频次限制。"""
+
+    __tablename__ = "profile_edits"
+    __table_args__ = (
+        CheckConstraint(sql_in("field", PROFILE_EDIT_FIELDS), name="ck_profile_edits_field"),
+        Index("ix_profile_edits_user_created", "user_id", "created_at"),
+        {"comment": "头像与显示名修改记录，用于频次限制。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_profile_edits_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    field: Mapped[str] = mapped_column(String(32), nullable=False)
+
+    user: Mapped[User] = relationship(back_populates="profile_edits")
 
 
 class UserCredential(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -470,6 +506,113 @@ class McpAuthorizationAudit(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     connector_id: Mapped[str] = mapped_column(String(32), nullable=False)
     tool_name: Mapped[str] = mapped_column(String(64), nullable=False)
     action: Mapped[str] = mapped_column(String(32), nullable=False)
+
+
+class ChatHistorySession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """用户聊天历史会话（规范化）。一条会话一行，元数据拆列保存。"""
+
+    __tablename__ = "chat_history_sessions"
+    __table_args__ = (
+        UniqueConstraint("user_id", "chat_id", name="uq_chat_history_sessions_user_chat"),
+        Index("ix_chat_history_sessions_user_updated", "user_id", "updated_at"),
+        {"comment": "用户聊天历史会话，按 chat_id 幂等 upsert。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_chat_history_sessions_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    chat_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    chat_title: Mapped[str] = mapped_column(String(200), nullable=False, default="", server_default=text("''"))
+    chat_time: Mapped[str | None] = mapped_column(String(64))
+    mode: Mapped[str | None] = mapped_column(String(32))
+    model_id: Mapped[str | None] = mapped_column(String(128))
+    model_name: Mapped[str | None] = mapped_column(String(128))
+    provider_id: Mapped[str | None] = mapped_column(String(64))
+    model_category: Mapped[str | None] = mapped_column(String(64))
+    model_api: Mapped[str | None] = mapped_column(String(64))
+    pinned: Mapped[bool] = mapped_column(nullable=False, default=False, server_default=text("false"))
+    pinned_at: Mapped[int | None] = mapped_column(BigInteger)
+    server_conversation_id: Mapped[str | None] = mapped_column(String(64))
+    chat_summary: Mapped[str | None] = mapped_column(Text)
+    chat_keywords: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    extra: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=_JSON_OBJECT
+    )
+
+    messages: Mapped[list[ChatHistoryMessage]] = relationship(
+        back_populates="session",
+        passive_deletes=True,
+        order_by="ChatHistoryMessage.seq",
+    )
+
+
+class ChatHistoryMessage(UUIDPrimaryKeyMixin, Base):
+    """用户聊天历史消息（规范化）。文字、图片、文件、工具与规划字段分列保存。"""
+
+    __tablename__ = "chat_history_messages"
+    __table_args__ = (
+        CheckConstraint("seq >= 0", name="ck_chat_history_messages_seq"),
+        Index("ix_chat_history_messages_session_seq", "session_id", "seq"),
+        {"comment": "用户聊天历史消息，追加写入，按 seq 排序。"},
+    )
+
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("chat_history_sessions.id", name="fk_chat_history_messages_session_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    seq: Mapped[int] = mapped_column(Integer, nullable=False)
+    role: Mapped[str] = mapped_column(String(32), nullable=False)
+    content_text: Mapped[str | None] = mapped_column(Text)
+    content: Mapped[Any] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=_JSON_OBJECT
+    )
+    reasoning_content: Mapped[str | None] = mapped_column(Text)
+    thinking_duration_sec: Mapped[float | None] = mapped_column(Float)
+    thinking_started_at: Mapped[int | None] = mapped_column(BigInteger)
+    usage: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    generated_images: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    downloads: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    tool_runs: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    search_results: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    search_query: Mapped[str | None] = mapped_column(Text)
+    search_error: Mapped[str | None] = mapped_column(Text)
+    trace: Mapped[list[Any]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    planning: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
+    created_at_ms: Mapped[int | None] = mapped_column(BigInteger)
+
+    session: Mapped[ChatHistorySession] = relationship(back_populates="messages")
+
+
+class ArkFile(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    __tablename__ = "ark_files"
+    __table_args__ = (
+        UniqueConstraint("file_id", name="uq_ark_files_file_id"),
+        Index("ix_ark_files_user", "user_id"),
+        {"comment": "方舟文件归属。查询只允许上传者。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_ark_files_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    file_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    purpose: Mapped[str] = mapped_column(String(32), nullable=False)
 
 
 def _register_listeners() -> None:

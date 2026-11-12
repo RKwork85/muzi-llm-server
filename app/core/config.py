@@ -60,6 +60,9 @@ class Settings(BaseSettings):
     llm_provider: str = "deepseek"
     deepseek_api_key: str = Field(default="", repr=False)
     deepseek_base_url: str = "https://api.deepseek.com"
+    ark_api_key: str = Field(default="", repr=False)
+    ark_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
+    ark_timeout_seconds: float = Field(default=180, gt=0, le=600)
     deepseek_model: str = "deepseek-flash"
     deepseek_model_allowlist: str = "deepseek-flash,deepseek-v4-pro"
     deepseek_timeout_seconds: float = Field(default=60, gt=0, le=600)
@@ -144,6 +147,20 @@ class Settings(BaseSettings):
     db_startup_retry_seconds: float = Field(default=0.5, ge=0, le=10)
     redis_socket_timeout_seconds: float = Field(default=5, gt=0, le=30)
     redis_max_connections: int = Field(default=20, ge=1, le=100)
+    # 阿里云短信。发送用 dysmsapi；回执用 dybaseapi + MNS，默认不拉取。
+    sms_access_key_id: str = ""
+    sms_access_key_secret: str = Field(default="", repr=False)
+    sms_sign_name: str = ""
+    sms_template_code: str = ""
+    sms_template_param_key: str = "code"
+    sms_endpoint: str = "dysmsapi.aliyuncs.com"
+    sms_code_ttl_seconds: int = Field(default=300, ge=60, le=1800)
+    sms_cooldown_seconds: int = Field(default=60, ge=30, le=300)
+    sms_code_length: int = Field(default=6, ge=4, le=8)
+    sms_receipt_enabled: bool = False
+    sms_mns_endpoint: str = "https://1943695596114318.mns.cn-hangzhou.aliyuncs.com"
+    sms_mns_queue_name: str = ""
+    sms_mns_message_type: str = "SmsReport"
 
     @field_validator("deepseek_base_url")
     @classmethod
@@ -193,6 +210,31 @@ class Settings(BaseSettings):
         if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", cleaned) is None:
             raise ValueError("数据库名称或用户名不合法")
         return cleaned
+
+    @field_validator("sms_access_key_id", "sms_access_key_secret", "sms_sign_name", "sms_template_code")
+    @classmethod
+    def _strip_sms_secret(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("sms_template_param_key")
+    @classmethod
+    def _sms_template_key(cls, value: str) -> str:
+        import re
+
+        cleaned = value.strip()
+        if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,31}", cleaned) is None:
+            raise ValueError("SMS_TEMPLATE_PARAM_KEY 不合法")
+        return cleaned
+
+    @field_validator("sms_endpoint", "sms_mns_endpoint")
+    @classmethod
+    def _strip_sms_endpoint(cls, value: str) -> str:
+        return value.strip().rstrip("/")
+
+    @field_validator("sms_mns_queue_name", "sms_mns_message_type")
+    @classmethod
+    def _strip_sms_queue(cls, value: str) -> str:
+        return value.strip()
 
     @field_validator("log_level")
     @classmethod

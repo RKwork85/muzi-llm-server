@@ -16,6 +16,7 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -230,8 +231,13 @@ class UsageQuota(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         UniqueConstraint("user_id", "quota_key", "period", name="uq_usage_quotas_user_key_period"),
         CheckConstraint("limit_value >= 0 AND used_value >= 0", name="ck_usage_quotas_non_negative"),
+        CheckConstraint("display_value >= 0", name="ck_usage_quotas_display_non_negative"),
+        CheckConstraint(
+            "limit_source IN ('role_default', 'manual', 'unlimited')",
+            name="ck_usage_quotas_limit_source",
+        ),
         Index("ix_usage_quotas_user", "user_id"),
-        {"comment": "用户额度。配额与权限分离，不与角色混用。"},
+        {"comment": "用户额度。limit_source=unlimited 表示不限量；limit_value=0 且非 unlimited 表示禁止使用。"},
     )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
@@ -241,15 +247,71 @@ class UsageQuota(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     quota_key: Mapped[str] = mapped_column(String(64), nullable=False)
     period: Mapped[str] = mapped_column(String(32), nullable=False, default="total", server_default=text("'total'"))
-    limit_value: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    used_value: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default=text("0"))
+    limit_value: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    used_value: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    limit_source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="manual", server_default=text("'manual'")
+    )
+    display_value: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    adjust_reason: Mapped[str] = mapped_column(String(200), nullable=False, default="", server_default=text("''"))
+    adjusted_by: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_usage_quotas_adjusted_by", ondelete="SET NULL"),
+    )
+    adjusted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class QuotaAdjustment(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    """额度调整流水。数值单位固定为 10 万 Token。"""
+
+    __tablename__ = "quota_adjustments"
+    __table_args__ = (
+        CheckConstraint(
+            "action IN ('increase', 'decrease', 'reset')",
+            name="ck_quota_adjustments_action",
+        ),
+        CheckConstraint("units >= 0 AND unit_size > 0 AND after_limit >= 0", name="ck_quota_adjustments_amounts"),
+        Index("ix_quota_adjustments_user_created", "user_id", "created_at"),
+        {"comment": "管理端额度调整。units 是 10 万的倍数个数，after_limit 是调整后的上限。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_quota_adjustments_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    actor_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_quota_adjustments_actor_id", ondelete="SET NULL"),
+    )
+    quota_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    period: Mapped[str] = mapped_column(String(32), nullable=False, default="total", server_default=text("'total'"))
+    action: Mapped[str] = mapped_column(String(16), nullable=False)
+    units: Mapped[int] = mapped_column(Integer, nullable=False)
+    unit_size: Mapped[int] = mapped_column(Integer, nullable=False, default=100_000, server_default=text("100000"))
+    before_limit: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    after_limit: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    before_used: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
+    reason: Mapped[str] = mapped_column(String(200), nullable=False)
 
 
 class UsageRecord(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     __tablename__ = "usage_records"
     __table_args__ = (
         Index("ix_usage_records_user_created", "user_id", "created_at"),
-        {"comment": "使用量记录。用于审计与账单核算。"},
+        Index(
+            "uq_usage_records_settlement",
+            "user_id",
+            "source",
+            "settlement_key",
+            unique=True,
+            postgresql_where=text("settlement_key IS NOT NULL"),
+        ),
+        CheckConstraint(
+            "result IN ('settled', 'exceeded', 'unsettled')",
+            name="ck_usage_records_result",
+        ),
+        {"comment": "使用量记录。同一用户、来源、结算键只记一笔。"},
     )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
@@ -258,7 +320,10 @@ class UsageRecord(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         nullable=False,
     )
     metric: Mapped[str] = mapped_column(String(64), nullable=False)
-    amount: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    amount: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    source: Mapped[str] = mapped_column(String(32), nullable=False, default="legacy", server_default=text("'legacy'"))
+    settlement_key: Mapped[str | None] = mapped_column(String(160))
+    result: Mapped[str] = mapped_column(String(16), nullable=False, default="settled", server_default=text("'settled'"))
     context_json: Mapped[dict[str, Any]] = mapped_column(
         "context",
         JSONB,

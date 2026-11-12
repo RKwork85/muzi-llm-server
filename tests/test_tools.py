@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from app.core.exceptions import InvalidToolArgumentsError, ToolExecutionError, ToolNotAllowedError
-from app.providers.base import ToolCall
+from app.providers.base import ToolCall, UsageStats
 from app.services.tool_service import ToolService
 from app.tools.calculator import calculate
 from app.tools.clock import current_time_handler
@@ -117,6 +117,58 @@ def test_unknown_tool_from_model_is_rejected(client, provider: FakeProvider) -> 
     assert response.json()["error"]["code"] == "TOOL_NOT_ALLOWED"
     assert response.json()["error"]["message"] == "请求的工具不在允许列表中"
     assert "os_system" not in response.text
+
+
+def test_round_limit_keeps_accumulated_usage(client, provider: FakeProvider) -> None:
+    import asyncio
+
+    from app.core.exceptions import ToolRoundLimitError
+    from app.schemas.chat import ToolCallRequest
+
+    provider.push(make_result("", tool_calls=[make_tool_call(call_id="call_1")], usage=UsageStats(10, 5, 15)))
+    provider.push(make_result("", tool_calls=[make_tool_call(call_id="call_2")], usage=UsageStats(8, 4, 12)))
+    service = client.app.state.chat_service
+    body = ToolCallRequest.model_validate(
+        {"messages": [{"role": "user", "content": "一直计算"}], "max_tool_rounds": 1}
+    )
+
+    async def run() -> None:
+        await service.run_tool_loop(body)
+
+    with pytest.raises(ToolRoundLimitError) as caught:
+        asyncio.run(run())
+    assert caught.value.total_tokens == 27
+    assert caught.value.prompt_tokens == 18
+    assert caught.value.completion_tokens == 9
+
+
+def test_tool_failure_keeps_usage_from_completed_rounds(client, provider: FakeProvider) -> None:
+    import asyncio
+
+    from app.core.exceptions import ToolExecutionError
+    from app.schemas.chat import ToolCallRequest
+
+    service = client.app.state.chat_service
+    spec = service.tools.registry.get("calculator")
+    original = spec.handler
+
+    def boom(_args):
+        raise RuntimeError("boom")
+
+    spec.handler = boom
+    provider.push(make_result("", tool_calls=[make_tool_call()], usage=UsageStats(10, 5, 15)))
+    body = ToolCallRequest.model_validate(
+        {"messages": [{"role": "user", "content": "计算"}], "max_tool_rounds": 3}
+    )
+    try:
+        with pytest.raises(ToolExecutionError) as caught:
+            asyncio.run(service.run_tool_loop(body))
+    finally:
+        spec.handler = original
+    assert caught.value.quota_settle is True
+    assert caught.value.quota_total_tokens == 15
+    assert caught.value.quota_prompt_tokens == 10
+    assert caught.value.quota_completion_tokens == 5
 
 
 def test_round_limit_stops_without_extra_execution(client, provider: FakeProvider) -> None:

@@ -29,6 +29,26 @@ def test_events_are_filtered_and_terminal_survives_a_full_queue() -> None:
     assert all(item.sequence >= 1 for item in items)
 
 
+def test_model_usage_counts_survive_sanitizing() -> None:
+    publisher = EventPublisher(request_id="req", task_id="task", max_queue_size=4)
+    publisher.publish(
+        "agent.model.completed",
+        {
+            "step": 1,
+            "finish_reason": "stop",
+            "prompt_tokens": 11,
+            "completion_tokens": 4,
+            "total_tokens": 15,
+            "usage": {"total_tokens": 15, "secret": "hidden"},
+        },
+    )
+    item = publisher.subscribe().get_nowait()
+    assert item.data["total_tokens"] == 15
+    assert item.data["prompt_tokens"] == 11
+    assert "usage" not in item.data
+    assert "secret" not in json.dumps(item.data)
+
+
 def test_slow_subscriber_does_not_block_publish() -> None:
     publisher = EventPublisher(request_id="req", task_id="task", max_queue_size=1)
     queue = publisher.subscribe()

@@ -30,7 +30,7 @@ class OssUploadClient:
         if not files:
             raise OssUploadError("OSS_UPLOAD_FAILED", "没有可上传的文件")
         try:
-            async with httpx.AsyncClient(transport=self._transport, timeout=self.timeout) as client:
+            async with httpx.AsyncClient(transport=self._transport, timeout=self.timeout, trust_env=False) as client:
                 if len(files) == 1:
                     name, content = files[0]
                     response = await client.post(

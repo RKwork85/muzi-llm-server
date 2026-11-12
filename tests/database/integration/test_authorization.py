@@ -217,11 +217,27 @@ async def test_quota_consume_and_audit(ready_database: Settings) -> None:
         factory = get_session_factory()
         async with factory() as session:
             quota_service = QuotaService(session)
-            await quota_service.set_quota(user.id, "daily_tokens", 5)
-            await quota_service.consume(user.id, "daily_tokens", 3)
-            await quota_service.consume(user.id, "daily_tokens", 2)
+            await quota_service.set_quota(user.id, "total_tokens", 5, limit_source="manual")
+            first = await quota_service.settle(
+                user.id, source="test", settlement_key="a", amount=3, kind="chat"
+            )
+            second = await quota_service.settle(
+                user.id, source="test", settlement_key="b", amount=2, kind="chat"
+            )
+            assert first.status == "settled"
+            assert second.status == "settled"
             with pytest.raises(QuotaExceededError):
-                await quota_service.consume(user.id, "daily_tokens", 1)
+                await quota_service.authorize(user.id)
+            third = await quota_service.settle(
+                user.id, source="test", settlement_key="c", amount=1, kind="chat"
+            )
+            assert third.status == "exceeded"
+            assert third.used_value == 6
+            again = await quota_service.settle(
+                user.id, source="test", settlement_key="c", amount=1, kind="chat"
+            )
+            assert again.status == "duplicate"
+            assert again.used_value == 6
             await session.rollback()
         async with factory() as session:
             await AuditService(session).record(

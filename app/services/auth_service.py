@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -10,12 +11,18 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
+from app.core.database.redis import get_redis_or_none
 from app.core.exceptions import (
     AccountDisabledError,
     AccountExistsError,
     AuthFailedError,
+    DatabaseUnavailableError,
+    FeatureNotReadyError,
     InvalidRequestError,
 )
+from app.sms.codes import SmsCodeStore, new_code
+from app.sms.sender import send_verification_code, sms_configured
 from app.core.security import generate_refresh_token, hash_password, hash_refresh_token, verify_password
 from app.authorization.domain.catalog import MEMBER_ROLE_CODE
 from app.models.mixins import utcnow
@@ -23,8 +30,11 @@ from app.models.rbac import Role, UserRole
 from app.models.tables import RefreshToken, User, UserCredential
 
 _USERNAME = re.compile(r"^[a-z][a-z0-9_]{2,31}$")
+_PHONE = re.compile(r"^1[3-9]\d{9}$")
+_SMS_CODE = re.compile(r"^\d{4,8}$")
 _TOKEN_TTL = timedelta(days=30)
 _DUMMY_HASH: str | None = None
+_PHONE_EMAIL_DOMAIN = "phone.local"
 
 
 @dataclass
@@ -65,6 +75,31 @@ def normalize_display_name(value: str | None) -> str | None:
     if len(name) > 120:
         raise InvalidRequestError("显示名过长")
     return name
+
+
+def normalize_phone(value: str) -> str:
+    """归一化中国大陆手机号：去空格与 +86 前缀后校验 11 位。"""
+    phone = value.strip().replace(" ", "").replace("-", "")
+    if phone.startswith("+86"):
+        phone = phone[3:]
+    elif phone.startswith("86") and len(phone) == 13:
+        phone = phone[2:]
+    if _PHONE.fullmatch(phone) is None:
+        raise InvalidRequestError("请输入有效的中国大陆手机号")
+    return phone
+
+
+def normalize_sms_code(value: str) -> str:
+    code = value.strip()
+    if _SMS_CODE.fullmatch(code) is None:
+        raise InvalidRequestError("验证码格式不正确")
+    return code
+
+
+def phone_account_fields(phone: str) -> tuple[str, str, str]:
+    """手机号账户的内部邮箱、用户名和显示名。邮箱仅占位，不对外展示。"""
+    masked = f"{phone[:3]}****{phone[-4:]}"
+    return f"{phone}@{_PHONE_EMAIL_DOMAIN}", f"u{phone}", masked
 
 
 def _dummy_hash() -> str:
@@ -108,6 +143,7 @@ class AuthService:
             await self._assign_default_role(user.id)
             issued = await self._issue(user)
             await self.session.flush()
+            await self._grant_default_quota(user.id)
         except IntegrityError:
             raise AccountExistsError("邮箱或用户名已被使用") from None
         return issued
@@ -120,6 +156,17 @@ class AuthService:
             return
         if role is not None:
             self.session.add(UserRole(user_id=user_id, role_id=role.id))
+
+    async def _grant_default_quota(self, user_id: object) -> None:
+        """为新用户或缺失默认额度的老用户补齐赠送额度（幂等）。"""
+        from app.authorization.application.audit_service import QuotaService
+
+        try:
+            async with self.session.begin_nested():
+                await QuotaService(self.session).ensure_default_quota(user_id)
+        except Exception:
+            # 保存点回滚额度写入，登录事务本身仍可提交。
+            return
 
     async def login(self, email: str, password: str) -> IssuedLogin:
         try:
@@ -143,6 +190,7 @@ class AuthService:
             raise AccountDisabledError()
         issued = await self._issue(user)
         await self.session.flush()
+        await self._grant_default_quota(user.id)
         return issued
 
     async def user_for_token(self, raw_token: str) -> User | None:
@@ -191,6 +239,117 @@ class AuthService:
             .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
             .values(revoked_at=utcnow())
         )
+
+    async def change_password(self, user_id: object, old_password: str, new_password: str) -> None:
+        """用户自助修改密码：校验旧密码后写入新哈希，并吊销该用户全部登录凭证。
+
+        修改成功后所有设备需重新登录。
+        """
+        credential = await self.session.scalar(
+            select(UserCredential).where(
+                UserCredential.user_id == user_id,
+                UserCredential.provider == "email_password",
+            )
+        )
+        if credential is None or not credential.password_hash:
+            raise InvalidRequestError("该账户未使用邮箱密码登录，无法修改密码")
+        if not verify_password(credential.password_hash, old_password):
+            raise AuthFailedError("当前密码不正确")
+        new_password = normalize_password(new_password)
+        credential.password_hash = hash_password(new_password)
+        await self.session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=utcnow())
+        )
+
+    async def revoke_token(self, raw_token: str) -> None:
+        """吊销指定登录凭证（退出登录）。幂等，token 无效时不报错。"""
+        if len(raw_token) < 16:
+            return
+        digest = hash_refresh_token(raw_token)
+        await self.session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.token_hash == digest, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=utcnow())
+        )
+
+    def _sms_store(self) -> SmsCodeStore:
+        settings = get_settings()
+        if not sms_configured(settings):
+            raise FeatureNotReadyError("短信服务尚未配置")
+        redis = get_redis_or_none()
+        if redis is None:
+            raise DatabaseUnavailableError("验证码服务暂不可用")
+        return SmsCodeStore(
+            redis,
+            ttl_seconds=settings.sms_code_ttl_seconds,
+            cooldown_seconds=settings.sms_cooldown_seconds,
+            pepper=settings.sms_access_key_secret,
+        )
+
+    async def send_phone_code(self, phone: str, scene: str = "login") -> dict[str, object]:
+        """生成验证码、写入 Redis，并调用阿里云短信下发。"""
+        phone = normalize_phone(phone)
+        if scene not in {"login", "bind"}:
+            raise InvalidRequestError("不支持的验证码场景")
+        settings = get_settings()
+        store = self._sms_store()
+        await store.reserve(scene, phone)
+        code = new_code(settings.sms_code_length)
+        try:
+            await store.save(scene, phone, code)
+            await asyncio.to_thread(send_verification_code, settings, phone, code)
+        except Exception:
+            await store.rollback(scene, phone)
+            raise
+        return {
+            "ok": True,
+            "cooldown_seconds": settings.sms_cooldown_seconds,
+            "message": "验证码已发送",
+        }
+
+    async def login_with_phone(self, phone: str, code: str) -> IssuedLogin:
+        """校验验证码后登录；手机号尚未注册时自动创建账户。"""
+        phone = normalize_phone(phone)
+        code = normalize_sms_code(code)
+        await self._sms_store().verify("login", phone, code)
+        user = await self.session.scalar(select(User).where(User.phone == phone))
+        if user is None:
+            user = await self._register_phone_user(phone)
+        elif user.status != "active":
+            raise AccountDisabledError()
+        issued = await self._issue(user)
+        await self.session.flush()
+        await self._grant_default_quota(user.id)
+        return issued
+
+    async def _register_phone_user(self, phone: str) -> User:
+        email, username, display_name = phone_account_fields(phone)
+        if await self._email_taken(email) or await self._username_taken(username):
+            raise AccountExistsError("该手机号已被使用")
+        user = User(
+            email=email,
+            username=username,
+            display_name=display_name,
+            phone=phone,
+            status="active",
+        )
+        self.session.add(user)
+        try:
+            await self.session.flush()
+            self.session.add(
+                UserCredential(
+                    user_id=user.id,
+                    provider="phone",
+                    provider_uid=phone,
+                )
+            )
+            await self._assign_default_role(user.id)
+            await self.session.flush()
+        except IntegrityError:
+            raise AccountExistsError("该手机号已被使用") from None
+        return user
 
     async def _issue(self, user: User) -> IssuedLogin:
         raw, token_hash = generate_refresh_token()

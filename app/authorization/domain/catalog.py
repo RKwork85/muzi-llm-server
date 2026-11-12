@@ -179,6 +179,56 @@ ROLE_BY_CODE: dict[str, RoleSpec] = {spec.code: spec for spec in BUILTIN_ROLES}
 
 
 # ---------------------------------------------------------------------------
+# 角色等级（分级控制）
+# ---------------------------------------------------------------------------
+# 数值越大等级越高。拥有 quota.manage 等管理权限的角色，只能对「等级 ≤ 自己」
+# 的目标用户执行操作：super_admin 可控制所有角色，admin 可控制 admin 及以下，
+# 逐级向下。自定义角色未在此表列出，视为最低等级，默认只能控制同等级或更低的目标。
+ROLE_RANK: dict[str, int] = {
+    SUPER_ADMIN_ROLE_CODE: 100,
+    ADMIN_ROLE_CODE: 80,
+    DEVELOPER_ROLE_CODE: 60,
+    MEMBER_ROLE_CODE: 40,
+    GUEST_ROLE_CODE: 20,
+}
+DEFAULT_ROLE_RANK = 0
+
+
+def max_role_rank(role_codes: list[str] | tuple[str, ...] | set[str]) -> int:
+    """取一组角色 code 的最高等级。未知角色按 DEFAULT_ROLE_RANK 处理。"""
+    return max((ROLE_RANK.get(code, DEFAULT_ROLE_RANK) for code in role_codes), default=DEFAULT_ROLE_RANK)
+
+
+# ---------------------------------------------------------------------------
+# 角色默认额度（逐级递增）
+# ---------------------------------------------------------------------------
+# 各角色的默认赠送额度（total_tokens）。limit_value=0 表示不限量（无限额度）。
+# 逐级递增：普通用户 member 100000，向上每级 +200000；超级管理员无限额度。
+ROLE_QUOTA_LIMIT: dict[str, int] = {
+    SUPER_ADMIN_ROLE_CODE: 0,  # 无限
+    ADMIN_ROLE_CODE: 500_000,
+    DEVELOPER_ROLE_CODE: 300_000,
+    MEMBER_ROLE_CODE: 100_000,
+    GUEST_ROLE_CODE: 100_000,
+}
+# 未匹配任何内置角色时的兜底默认额度。
+DEFAULT_QUOTA_LIMIT = 100_000
+
+
+def default_quota_for_roles(role_codes: list[str] | tuple[str, ...] | set[str]) -> int:
+    """返回一组角色对应的默认额度，取等级最高角色对应的额度。
+
+    超级管理员（等级最高）返回 0（无限）。未知角色回退到 DEFAULT_QUOTA_LIMIT。
+    """
+    if not role_codes:
+        return DEFAULT_QUOTA_LIMIT
+    best = max((c for c in role_codes if c in ROLE_QUOTA_LIMIT), key=lambda c: ROLE_RANK.get(c, 0), default=None)
+    if best is None:
+        return DEFAULT_QUOTA_LIMIT
+    return ROLE_QUOTA_LIMIT[best]
+
+
+# ---------------------------------------------------------------------------
 # 数据范围
 # ---------------------------------------------------------------------------
 

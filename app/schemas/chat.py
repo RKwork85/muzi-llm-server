@@ -112,6 +112,7 @@ class ChatMessageIn(BaseModel):
 
     role: Literal["user", "assistant"]
     content: str | list[dict[str, Any]]
+    reasoning_content: str | None = Field(default=None, max_length=200000)
 
     @field_validator("content")
     @classmethod
@@ -190,6 +191,9 @@ class ChatRequestBase(BaseModel):
 class ChatCompletionRequest(ChatRequestBase):
     stream: bool | None = False
     response_format: ResponseFormat | None = None
+    usage_purpose: Literal["chat", "summary"] = "chat"
+    conversation_id: str | None = Field(default=None, max_length=128)
+    conversation_title: str | None = Field(default=None, max_length=200)
 
 
 class StreamChatRequest(ChatRequestBase):

@@ -28,13 +28,33 @@ def read_field(obj: Any, name: str, default: Any = None) -> Any:
     return default
 
 
+def _optional_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    return int(value)
+
+
 def parse_usage(raw: Any) -> UsageStats | None:
     if raw is None:
         return None
+    completion_details = read_field(raw, "completion_tokens_details") or {}
+    prompt_details = read_field(raw, "prompt_tokens_details") or {}
+    reasoning = _optional_int(read_field(completion_details, "reasoning_tokens"))
+    if reasoning is None:
+        reasoning = _optional_int(read_field(raw, "reasoning_tokens"))
+    cache_read = _optional_int(read_field(prompt_details, "cached_tokens"))
+    if cache_read is None:
+        cache_read = _optional_int(read_field(raw, "prompt_cache_hit_tokens"))
+    cache_write = _optional_int(read_field(prompt_details, "cache_write_tokens"))
+    if cache_write is None:
+        cache_write = _optional_int(read_field(raw, "cache_creation_input_tokens"))
     return UsageStats(
         prompt_tokens=int(read_field(raw, "prompt_tokens", 0) or 0),
         completion_tokens=int(read_field(raw, "completion_tokens", 0) or 0),
         total_tokens=int(read_field(raw, "total_tokens", 0) or 0),
+        reasoning_tokens=reasoning,
+        cache_read_tokens=cache_read,
+        cache_write_tokens=cache_write,
     )
 
 

@@ -814,6 +814,16 @@ class PlanningDecisionEngine:
         self._provider = provider
         self._model = model
         self._timeout_seconds = timeout_seconds
+        self.prompt_tokens = 0
+        self.completion_tokens = 0
+        self.total_tokens = 0
+
+    def _note_usage(self, usage) -> None:
+        if usage is None:
+            return
+        self.prompt_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
+        self.completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
+        self.total_tokens += int(getattr(usage, "total_tokens", 0) or 0)
 
     def _proposal_request(
         self, *, goal: str, user_message: str, plan: PlanSnapshot,
@@ -946,6 +956,7 @@ class PlanningDecisionEngine:
                 self._provider.create_chat_completion(request),
                 timeout=self._timeout_seconds,
             )
+            self._note_usage(result.usage)
         except TimeoutError:
             raise PlanningPolicyError("planning model request timed out") from None
         if result.tool_calls:
@@ -991,6 +1002,7 @@ class PlanningDecisionEngine:
                 self._provider.create_chat_completion(retry_request),
                 timeout=self._timeout_seconds,
             )
+            self._note_usage(result.usage)
         except Exception as exc:  # 校正重试是最佳努力，任何异常都退回到原错误。
             logger.warning("planning retry failed request_id=%s type=%s", get_request_id(), type(exc).__name__)
             return None
@@ -1013,8 +1025,11 @@ class PlanningDecisionEngine:
         buffer = ""
         last_len = 0
         action_announced = False
+        last_usage = None
         try:
             async for chunk in self._provider.stream_chat_completion(request):
+                if chunk is not None and chunk.usage is not None:
+                    last_usage = chunk.usage
                 if not chunk or not chunk.content:
                     continue
                 buffer += chunk.content
@@ -1028,9 +1043,11 @@ class PlanningDecisionEngine:
                         action_announced = True
                         yield ("interaction_pending", match.group(1))
         except Exception as exc:
+            self._note_usage(last_usage)
             logger.warning("planning stream failed request_id=%s type=%s", get_request_id(), type(exc).__name__)
             yield ("error", "PLANNING_UPSTREAM_FAILED")
             return
+        self._note_usage(last_usage)
         if not buffer.strip():
             yield ("error", "PLANNING_POLICY_REJECTED")
             return

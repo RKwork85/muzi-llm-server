@@ -26,7 +26,7 @@ from app.core.exceptions import (
     UpstreamTimeoutError,
 )
 from app.core.sse import format_sse
-from app.providers.base import CompletionResult, LLMProvider, ProviderChatRequest, ToolCall
+from app.providers.base import CompletionResult, LLMProvider, ProviderChatRequest, ToolCall, UsageStats
 from app.schemas.chat import (
     AssistantMessageOut,
     ChatCompletionRequest,
@@ -65,6 +65,18 @@ def content_text(content: str | list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+def _usage_event(request_id: str, usage: UsageStats, meter: dict[str, Any] | None = None) -> str:
+    from app.metering.persist import usage_public
+
+    public = usage_public(usage)
+    if meter and meter.get("breakdown"):
+        public["breakdown"] = meter["breakdown"]
+    body: dict[str, Any] = {"request_id": request_id, "usage": public}
+    if meter is not None:
+        body["meter"] = meter
+    return format_sse("usage", body)
+
+
 @dataclass
 class PreparedChat:
     request_id: str
@@ -75,6 +87,12 @@ class PreparedChat:
     allowed_tools: tuple[str, ...] = ()
     mcp_user_id: str | None = None
     principal_id: str | None = None
+    runtime_mode: str = "ask"
+    usage_source: str = "chat"
+    system_text: str = ""
+    developer_text: str = ""
+    skill_text: str = ""
+    skill_refs: list[dict[str, Any]] = field(default_factory=list)
 
 
 class ChatService:
@@ -98,11 +116,26 @@ class ChatService:
     async def complete(self, body: ChatCompletionRequest) -> ChatCompletionResponse:
         if body.stream:
             raise InvalidRequestError("流式输出请调用 /api/v1/chat/completions/stream")
+        from app.metering.context import add_meter, begin_meters
+
+        begin_meters()
         prepared = self.prepare_chat(body)
+        prepared.usage_source = "summary" if body.usage_purpose == "summary" else "chat"
+        prepared.runtime_mode = "chat"
         started = time.perf_counter()
         result = await self.provider.create_chat_completion(prepared.provider_request)
         self._ensure_result(result, prepared.expect_json)
         self._log("chat", prepared.request_id, started, result, None)
+        add_meter(
+            self._build_meter(
+                prepared,
+                result.usage,
+                messages=prepared.provider_request.messages,
+                output_text=result.content or "",
+                tool_calls=result.tool_calls,
+                status="completed",
+            )
+        )
         return self._to_response(prepared, result, tool_rounds=None)
 
     async def run_tool_loop(self, body: ToolCallRequest) -> ChatCompletionResponse:
@@ -116,39 +149,80 @@ class ChatService:
         messages = [dict(item) for item in prepared.provider_request.messages]
         rounds = 0
         started = time.perf_counter()
-        while True:
-            request = ProviderChatRequest(
-                model=prepared.provider_request.model,
-                messages=messages,
-                temperature=prepared.provider_request.temperature,
-                max_tokens=prepared.provider_request.max_tokens,
-                thinking=prepared.provider_request.thinking,
-                reasoning_effort=prepared.provider_request.reasoning_effort,
-                response_format=None,
-                tools=prepared.provider_request.tools,
-                tool_choice=prepared.provider_request.tool_choice,
-            )
-            result = await self.provider.create_chat_completion(request)
-            if not result.tool_calls:
-                self._ensure_result(result, expect_json=False)
-                self._log("tool_loop", prepared.request_id, started, result, rounds)
-                return self._to_response(prepared, result, tool_rounds=rounds)
-            rounds += 1
-            if rounds > max_rounds:
-                logger.info(
-                    "tool round limit request_id=%s max_tool_rounds=%s",
-                    prepared.request_id,
-                    max_rounds,
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        called_model = False
+        from app.metering.context import add_meter, begin_meters
+
+        begin_meters()
+        try:
+            while True:
+                request = ProviderChatRequest(
+                    model=prepared.provider_request.model,
+                    messages=messages,
+                    temperature=prepared.provider_request.temperature,
+                    max_tokens=prepared.provider_request.max_tokens,
+                    thinking=prepared.provider_request.thinking,
+                    reasoning_effort=prepared.provider_request.reasoning_effort,
+                    response_format=None,
+                    tools=prepared.provider_request.tools,
+                    tool_choice=prepared.provider_request.tool_choice,
                 )
-                raise ToolRoundLimitError()
-            logger.info(
-                "tool round request_id=%s round=%s tools=%s",
-                prepared.request_id,
-                rounds,
-                ",".join(call.name for call in result.tool_calls),
-            )
-            messages.append(_assistant_message(result))
-            messages.extend(await self.tools.execute(result.tool_calls))
+                called_model = True
+                result = await self.provider.create_chat_completion(request)
+                if result.usage is not None:
+                    prompt_tokens += result.usage.prompt_tokens
+                    completion_tokens += result.usage.completion_tokens
+                    total_tokens += result.usage.total_tokens
+                add_meter(
+                    self._build_meter(
+                        prepared,
+                        result.usage,
+                        messages=messages,
+                        output_text=result.content or "",
+                        tool_calls=result.tool_calls,
+                        status="completed" if not result.tool_calls else "partial",
+                    )
+                )
+                if not result.tool_calls:
+                    self._ensure_result(result, expect_json=False)
+                    result.usage = UsageStats(
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                    )
+                    self._log("tool_loop", prepared.request_id, started, result, rounds)
+                    return self._to_response(prepared, result, tool_rounds=rounds)
+                rounds += 1
+                if rounds > max_rounds:
+                    logger.info(
+                        "tool round limit request_id=%s max_tool_rounds=%s",
+                        prepared.request_id,
+                        max_rounds,
+                    )
+                    raise ToolRoundLimitError(
+                        total_tokens=total_tokens,
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                    )
+                logger.info(
+                    "tool round request_id=%s round=%s tools=%s",
+                    prepared.request_id,
+                    rounds,
+                    ",".join(call.name for call in result.tool_calls),
+                )
+                messages.append(_assistant_message(result))
+                messages.extend(await self.tools.execute(result.tool_calls))
+        except ToolRoundLimitError:
+            raise
+        except Exception as exc:
+            if called_model:
+                exc.quota_settle = True  # type: ignore[attr-defined]
+                exc.quota_total_tokens = total_tokens  # type: ignore[attr-defined]
+                exc.quota_prompt_tokens = prompt_tokens  # type: ignore[attr-defined]
+                exc.quota_completion_tokens = completion_tokens  # type: ignore[attr-defined]
+            raise
 
     def prepare_stream(
         self,
@@ -186,6 +260,20 @@ class ChatService:
         if extra:
             system["content"] = f"{system['content']}\n\n{extra}"
         self._apply_registered_skills(body, system, prepared.request_id, mcp_user_id)
+        prepared.runtime_mode = mode
+        full = system["content"] if isinstance(system.get("content"), str) else ""
+        tail = full[len(prepared.system_text) :] if full.startswith(prepared.system_text) else ""
+        note = skill_notes(list(body.skill_names), execute=mode == "agent")
+        if note and note in tail:
+            prepared.skill_text = note
+            prepared.developer_text = tail.replace(note, "", 1).strip()
+        else:
+            prepared.developer_text = tail.strip()
+        if prepared.skill_text:
+            prepared.skill_refs = [
+                {"skill_id": name, "skill_name": name, "skill_version": None}
+                for name in list(body.skill_names) + list(body.explicit_skill_ids)
+            ]
         return prepared
 
     def _apply_registered_skills(
@@ -233,7 +321,10 @@ class ChatService:
         for item in body.messages:
             if item.role not in {"user", "assistant"}:
                 raise InvalidRequestError()
-            messages.append({"role": item.role, "content": item.content})
+            message: dict[str, Any] = {"role": item.role, "content": item.content}
+            if item.role == "assistant" and item.reasoning_content:
+                message["reasoning_content"] = item.reasoning_content
+            messages.append(message)
         response_format = getattr(body, "response_format", None)
         expect_json = bool(response_format and response_format.type == "json_object")
         if expect_json:
@@ -256,6 +347,7 @@ class ChatService:
             request_id=get_request_id(),
             provider_request=provider_request,
             expect_json=expect_json,
+            system_text=system_prompt,
         )
 
     async def iter_sse(
@@ -283,6 +375,7 @@ class ChatService:
         last_model = prepared.provider_request.model
         last_finish = "stop"
         parts: list[str] = []
+        last_usage: UsageStats | None = None
         try:
             iterator = stream.__aiter__()
             while True:
@@ -296,6 +389,14 @@ class ChatService:
                     raise UpstreamTimeoutError() from None
                 if await is_disconnected():
                     logger.info("stream client disconnected request_id=%s", prepared.request_id)
+                    if last_usage is not None:
+                        yield self._usage_frame(
+                            prepared,
+                            last_usage,
+                            messages=request.messages,
+                            output_text="".join(parts),
+                            status="cancelled",
+                        )
                     return
                 if chunk.id:
                     last_id = chunk.id
@@ -304,28 +405,26 @@ class ChatService:
                 if chunk.finish_reason:
                     last_finish = chunk.finish_reason
                 if chunk.usage is not None:
-                    yield format_sse(
-                        "usage",
-                        {
-                            "request_id": prepared.request_id,
-                            "usage": {
-                                "prompt_tokens": chunk.usage.prompt_tokens,
-                                "completion_tokens": chunk.usage.completion_tokens,
-                                "total_tokens": chunk.usage.total_tokens,
-                            },
-                        },
-                    )
+                    last_usage = chunk.usage
                 delta: dict[str, str] = {}
                 if chunk.content:
                     parts.append(chunk.content)
                     delta["content"] = chunk.content
-                if self.settings.expose_reasoning and chunk.reasoning_content:
+                if self._reasoning_visible(request) and chunk.reasoning_content:
                     delta["reasoning_content"] = chunk.reasoning_content
                 if delta:
                     yield format_sse("delta", {"request_id": prepared.request_id, **delta})
             if prepared.expect_json:
                 _validate_json_text("".join(parts), last_finish)
             self._log_stream(prepared.request_id, started, last_model)
+            if last_usage is not None:
+                yield self._usage_frame(
+                    prepared,
+                    last_usage,
+                    messages=request.messages,
+                    output_text="".join(parts),
+                    status="completed",
+                )
             yield format_sse(
                 "done",
                 {
@@ -336,9 +435,25 @@ class ChatService:
                 },
             )
         except AppError as exc:
+            if last_usage is not None:
+                yield self._usage_frame(
+                    prepared,
+                    last_usage,
+                    messages=request.messages,
+                    output_text="".join(parts),
+                    status="failed",
+                )
             yield _sse_error(prepared.request_id, exc)
         except Exception:
             logger.error("stream failed request_id=%s", prepared.request_id)
+            if last_usage is not None:
+                yield self._usage_frame(
+                    prepared,
+                    last_usage,
+                    messages=request.messages,
+                    output_text="".join(parts),
+                    status="failed",
+                )
             yield _sse_error(prepared.request_id, InternalError())
         finally:
             aclose = getattr(stream, "aclose", None)
@@ -402,6 +517,7 @@ class ChatService:
                 announced: set[int] = set()
                 previews = _WritePreview()
                 pending_answer: list[str] = []
+                round_usage: UsageStats | None = None
                 stream = self.provider.stream_chat_completion(request)
                 iterator = stream.__aiter__()
                 try:
@@ -417,6 +533,15 @@ class ChatService:
                             raise UpstreamTimeoutError() from None
                         if await is_disconnected():
                             logger.info("stream client disconnected request_id=%s", prepared.request_id)
+                            if round_usage is not None:
+                                yield self._usage_frame(
+                                    prepared,
+                                    round_usage,
+                                    messages=messages,
+                                    output_text="".join(parts),
+                                    tool_calls=_calls_from_slots(slots) if saw_tools else [],
+                                    status="cancelled",
+                                )
                             return
                         if chunk.id:
                             last_id = chunk.id
@@ -473,18 +598,16 @@ class ChatService:
                                         {"request_id": prepared.request_id, "content": piece},
                                     )
                         if chunk.usage is not None:
-                            yield format_sse(
-                                "usage",
-                                {
-                                    "request_id": prepared.request_id,
-                                    "usage": {
-                                        "prompt_tokens": chunk.usage.prompt_tokens,
-                                        "completion_tokens": chunk.usage.completion_tokens,
-                                        "total_tokens": chunk.usage.total_tokens,
-                                    },
-                                },
-                            )
+                            round_usage = chunk.usage
                         if saw_tools:
+                            if self._reasoning_visible(request) and chunk.reasoning_content:
+                                yield format_sse(
+                                    "delta",
+                                    {
+                                        "request_id": prepared.request_id,
+                                        "reasoning_content": chunk.reasoning_content,
+                                    },
+                                )
                             if chunk.content and not consumed_content:
                                 parts.append(chunk.content)
                                 yield format_sse(
@@ -501,21 +624,48 @@ class ChatService:
                             pending_answer.append(chunk.content)
                             parts.append(chunk.content)
                             delta["content"] = chunk.content
-                        if self.settings.expose_reasoning and chunk.reasoning_content:
+                        if self._reasoning_visible(request) and chunk.reasoning_content:
                             delta["reasoning_content"] = chunk.reasoning_content
                         if delta:
                             yield format_sse("delta", {"request_id": prepared.request_id, **delta})
                 except AppError as exc:
+                    if round_usage is not None:
+                        yield self._usage_frame(
+                            prepared,
+                            round_usage,
+                            messages=messages,
+                            output_text="".join(parts),
+                            tool_calls=_calls_from_slots(slots) if saw_tools else [],
+                            status="failed",
+                        )
                     yield _sse_error(prepared.request_id, exc)
                     return
                 except Exception:
                     logger.error("stream failed request_id=%s", prepared.request_id)
+                    if round_usage is not None:
+                        yield self._usage_frame(
+                            prepared,
+                            round_usage,
+                            messages=messages,
+                            output_text="".join(parts),
+                            tool_calls=_calls_from_slots(slots) if saw_tools else [],
+                            status="failed",
+                        )
                     yield _sse_error(prepared.request_id, InternalError())
                     return
                 finally:
                     aclose = getattr(stream, "aclose", None)
                     if aclose is not None:
                         await aclose()
+                if round_usage is not None:
+                    yield self._usage_frame(
+                        prepared,
+                        round_usage,
+                        messages=messages,
+                        output_text="".join(parts),
+                        tool_calls=_calls_from_slots(slots) if saw_tools else [],
+                        status="completed",
+                    )
                 if not saw_tools:
                     if prepared.expect_json:
                         _validate_json_text("".join(parts), last_finish)
@@ -574,9 +724,23 @@ class ChatService:
                 if runner is None:
                     yield _sse_error(prepared.request_id, InternalError())
                     return
+                tool_started = time.perf_counter()
                 tool_messages = await runner.execute(calls, allowed=frozenset(allowed))
+                tool_elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
                 messages.extend(tool_messages)
                 for slot_index, call, tool_message in zip(call_indexes, calls, tool_messages, strict=True):
+                    yield format_sse(
+                        "resource",
+                        {
+                            "request_id": prepared.request_id,
+                            "kind": "tool",
+                            "tool_name": call.name,
+                            "tool_call_id": call.id,
+                            "status": "completed",
+                            "duration_ms": tool_elapsed_ms,
+                            "retry_count": 0,
+                        },
+                    )
                     detail, preview = _tool_public(call.name, call.arguments, tool_message["content"])
                     cards, total = _tool_cards(call.name, call.arguments, tool_message["content"])
                     payload: dict[str, Any] = {
@@ -689,13 +853,67 @@ class ChatService:
         if not (result.content and result.content.strip()):
             raise InvalidModelResponseError()
 
+    def _reasoning_visible(self, request: ProviderChatRequest) -> bool:
+        thinking = request.thinking or {}
+        return thinking.get("type") == "enabled" or bool(self.settings.expose_reasoning)
+
+    def _build_meter(
+        self,
+        prepared: PreparedChat,
+        usage: UsageStats | None,
+        *,
+        messages: list[dict[str, Any]],
+        output_text: str,
+        tool_calls: list[Any] | None,
+        status: str,
+    ) -> dict[str, Any]:
+        from app.metering.attribute import build_meter
+
+        return build_meter(
+            provider_name=self.settings.llm_provider,
+            model=prepared.provider_request.model,
+            runtime_mode=prepared.runtime_mode,
+            usage_source=prepared.usage_source,
+            status=status,
+            usage=usage,
+            messages=messages,
+            tools=prepared.provider_request.tools,
+            system_text=prepared.system_text,
+            developer_text=prepared.developer_text,
+            skill_text=prepared.skill_text,
+            skill_refs=prepared.skill_refs,
+            output_text=output_text,
+            tool_calls=tool_calls or [],
+            structured=prepared.expect_json,
+        )
+
+    def _usage_frame(
+        self,
+        prepared: PreparedChat,
+        usage: UsageStats,
+        *,
+        messages: list[dict[str, Any]],
+        output_text: str = "",
+        tool_calls: list[Any] | None = None,
+        status: str = "completed",
+    ) -> str:
+        meter = self._build_meter(
+            prepared,
+            usage,
+            messages=messages,
+            output_text=output_text,
+            tool_calls=tool_calls,
+            status=status,
+        )
+        return _usage_event(prepared.request_id, usage, meter)
+
     def _to_response(
         self,
         prepared: PreparedChat,
         result: CompletionResult,
         tool_rounds: int | None,
     ) -> ChatCompletionResponse:
-        reasoning = result.reasoning_content if self.settings.expose_reasoning else None
+        reasoning = result.reasoning_content if self._reasoning_visible(prepared.provider_request) else None
         usage = None
         if result.usage is not None:
             usage = Usage(
