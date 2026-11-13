@@ -93,6 +93,8 @@ def _usage_event(request_id: str, usage: UsageStats, meter: dict[str, Any] | Non
     public = usage_public(usage)
     if meter and meter.get("breakdown"):
         public["breakdown"] = meter["breakdown"]
+    if meter and meter.get("tool_usage"):
+        public["tool_usage"] = meter["tool_usage"]
     body: dict[str, Any] = {"request_id": request_id, "usage": public}
     if meter is not None:
         body["meter"] = meter
@@ -820,17 +822,11 @@ class ChatService:
                     }
                     spec = runner.registry.get(call.name)
                     if spec is not None and spec.pricing is not None:
-                        from app.metering.tool_pricing import quote_tool_money, quote_tool_tokens
+                        from app.metering.tool_pricing import quote_tool_tokens
 
                         success = _tool_succeeded(str(tool_message["content"]))
                         resource_payload["status"] = "completed" if success else "failed"
-                        if spec.pricing.model == "external":
-                            resource_payload["external_requests"] = 1 if success else 0
-                            money = quote_tool_money(spec.pricing, success=success)
-                            if money is not None:
-                                resource_payload["external_cost"] = str(money)
-                                resource_payload["currency"] = spec.pricing.currency
-                        tokens = quote_tool_tokens(spec.pricing, success=success)
+                        tokens = quote_tool_tokens(spec.pricing, tool_name=call.name, success=success)
                         if tokens > 0:
                             resource_payload["external_tokens"] = tokens
                     yield format_sse("resource", resource_payload)

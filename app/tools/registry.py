@@ -64,14 +64,18 @@ MUTABLE_ACCESS = frozenset({"write_workspace", "delete_workspace", "sandbox_exec
 
 @dataclass
 class ToolPricing:
-    """工具的外部计费模型。free 不扣额度；external 按成功请求换算成 token 扣额度。"""
+    """工具计费模型。系统内部只认 token 额度，人民币换算交给充值/定价系统。
 
-    model: str = "free"  # free | fixed_tokens | external
-    fixed_tokens: int = 0  # fixed_tokens 模式：每次调用换算的 token 数
-    external_price: str = "0"  # external 模式：单价，Decimal 字符串
-    external_unit: int = 1  # 计费单位（如 1000 次请求）
-    currency: str = "CNY"  # 计费币种
-    requests_per_call: int = 1  # 每次工具调用产生的外部请求次数（默认 1）
+    - free：不扣额度，结果以 tool_result 计入下一轮模型输入。
+    - fixed_tokens：每次成功调用扣固定 token（失败返回 0）。
+      默认值在定义处给，运行期可用环境变量 TOOL_PRICE_<NAME>_TOKENS 覆盖。
+
+    unit 决定结算乘数：call=按调用次数；image=按图片张数（张数 × tokens）。
+    """
+
+    model: str = "free"  # free | fixed_tokens
+    tokens: int = 0  # 每次成功调用（或每单位）扣的 token 数
+    unit: str = "call"  # call | image
 
 
 @dataclass
@@ -341,7 +345,7 @@ def build_agent_registry(search_calls: int = 5, fetch_calls: int = 5) -> ToolReg
             toolset="delivery",
             max_calls_per_run=5,
             timeout_s=25,
-            pricing=ToolPricing(model="fixed_tokens", fixed_tokens=2000),
+            pricing=ToolPricing(model="fixed_tokens", tokens=2000),
         )
     )
     registry.register(

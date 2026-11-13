@@ -141,6 +141,68 @@ def test_provider_reasoning_is_marked_actual() -> None:
     assert any(row["category"] == "tool_call" for row in meter["breakdown"])
 
 
+def test_tool_usage_is_grouped_by_tool_name() -> None:
+    """工具调用按工具名聚合，token 一律记 0（不再字符估算，定价由 resource 事件下发）。"""
+    from app.metering.attribute import tool_usage_rows
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "write_docx", "arguments": '{"title":"x"}'}},
+                {"id": "c2", "type": "function", "function": {"name": "deliver_file", "arguments": '{"path":"a"}'}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "content": "doc created ok"},
+        {"role": "tool", "tool_call_id": "c2", "content": "sent"},
+    ]
+    calls = [
+        ToolCall(id="c1", name="write_docx", arguments='{"title":"x"}'),
+        ToolCall(id="c2", name="deliver_file", arguments='{"path":"a"}'),
+    ]
+    rows = tool_usage_rows(messages, calls)
+    by_name = {row["tool_name"]: row for row in rows}
+    assert set(by_name) == {"write_docx", "deliver_file"}
+    assert by_name["write_docx"]["calls"] == 1
+    assert by_name["deliver_file"]["calls"] == 1
+    assert by_name["write_docx"]["tokens"] == 0
+    assert by_name["deliver_file"]["tokens"] == 0
+
+
+def test_tool_usage_in_meter_survives_build() -> None:
+    """build_meter 返回 tool_usage 字段，供前端工具行展示；token 一律记 0。"""
+    meter = build_meter(
+        provider_name="deepseek",
+        model="deepseek-flash",
+        runtime_mode="ask",
+        usage_source="chat",
+        status="completed",
+        usage=UsageStats(prompt_tokens=10, completion_tokens=4, total_tokens=14),
+        messages=[
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "write_docx", "arguments": '{"title":"x"}'}},
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c1", "content": "ok"},
+        ],
+        tools=None,
+        system_text="",
+        developer_text="",
+        skill_text="",
+        skill_refs=None,
+        output_text="",
+        tool_calls=[ToolCall(id="c1", name="write_docx", arguments='{"title":"x"}')],
+        structured=False,
+    )
+    assert meter["tool_usage"] == [
+        {"tool_name": "write_docx", "calls": 1, "tokens": 0}
+    ]
+
+
 def test_parse_usage_keeps_missing_details_empty() -> None:
     usage = parse_usage(
         {

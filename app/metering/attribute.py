@@ -118,6 +118,59 @@ def _provider(direction: str, category: str, token_count: int, metadata: dict[st
     return _row(direction, category, token_count, "provider_reported", "1", metadata)
 
 
+def _call_id_to_name(messages: list[dict[str, Any]]) -> dict[str, str]:
+    """从 assistant 消息的 tool_calls 构建 tool_call_id → tool_name 映射。"""
+    mapping: dict[str, str] = {}
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for tc in message.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            call_id = tc.get("id")
+            fn = tc.get("function")
+            name = fn.get("name") if isinstance(fn, dict) else None
+            if call_id and name:
+                mapping[str(call_id)] = str(name)
+    return mapping
+
+
+def tool_usage_rows(
+    messages: list[dict[str, Any]],
+    tool_calls: list[Any],
+) -> list[dict[str, Any]]:
+    """按工具名聚合一轮对话的工具调用次数，token 一律记 0。
+
+    工具行的 token 不再用字符估算：上下文字符 token 已在 breakdown 的
+    tool_call / tool_result 分类里体现，这里不重复估算。免费工具记 0，
+    固定/外部定价由 resource 事件单独下发 external_tokens，前端据此展示「固定计费」。
+    """
+    by_name: dict[str, dict[str, int]] = {}
+
+    def bump(name: str, calls: int = 0) -> None:
+        row = by_name.setdefault(name, {"calls": 0, "tokens": 0})
+        row["calls"] += calls
+
+    for call in tool_calls:
+        name = getattr(call, "name", None)
+        if not name:
+            continue
+        bump(str(name), 1)
+
+    call_id_to_name = _call_id_to_name(messages)
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        call_id = str(message.get("tool_call_id") or "")
+        name = call_id_to_name.get(call_id) or "tool"
+        bump(name)
+
+    return [
+        {"tool_name": name, "calls": row["calls"], "tokens": row["tokens"]}
+        for name, row in by_name.items()
+    ]
+
+
 def message_segments(messages: list[dict[str, Any]], *, skip_system: bool) -> list[tuple[str, str, list[dict[str, Any]]]]:
     """每条消息只进入一个文本分类。工具结果优先于历史，避免同一段文字计两次。"""
     last_user = -1
@@ -286,6 +339,7 @@ def build_meter(
         "cache_write_tokens": cache_write,
         "total_tokens": total,
         "breakdown": breakdown,
+        "tool_usage": tool_usage_rows(messages, tool_calls),
         "skills": skills,
     }
 
@@ -376,9 +430,14 @@ def annotate_image_usage(
         runtime_mode="image",
         usage_source="image",
     )
+    prompt_tokens = int(public.get("prompt_tokens") or 0)
     reasoning_tokens = 0
     breakdown: list[dict[str, Any]] = []
     for row in meter.get("breakdown") or []:
+        # 图片模型（如 Seedream）通常只计输出、不计输入（prompt_tokens=0）。
+        # 此时输入方向的启发式估算没有意义，反而会造成「输入 0 却列了用户输入 21」的矛盾，直接丢弃。
+        if row.get("direction") == "input" and prompt_tokens == 0:
+            continue
         if row.get("direction") == "output" and row.get("category") in {"answer", "structured_output", "other_output"}:
             continue
         if row.get("direction") == "output" and row.get("category") == "reasoning":

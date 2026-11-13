@@ -111,6 +111,12 @@ def test_summary_attaches_to_latest_turn_without_using_text() -> None:
     assert turn["link"] == "conversation_latest_turn"
     assert turn["input_tokens"]["value"] == 95
     assert turn["output_tokens"]["value"] == 25
+    # 统计卡片：摘要不混入「对话」，累计 = 对话 + 图片 + 摘要。
+    stats = result["summary"]
+    assert stats["chat"] == 100
+    assert stats["image"] == 0
+    assert stats["summary_tokens"] == 20
+    assert stats["total"] == stats["chat"] + stats["image"] + stats["summary_tokens"] == 120
 
 
 def test_late_summary_stays_separate() -> None:
@@ -269,6 +275,48 @@ def test_conversations_follow_history_and_sum_summary_updates() -> None:
     assert user["label"] == "当前用户输入"
     assert user["figure"]["value"] == 10
     assert user["figure"]["quality"] == "estimated"
+
+
+def test_tool_external_is_split_from_chat_and_total() -> None:
+    records = [
+        _record(id="chat", settlement_key="run:1", amount=100, context={"prompt_tokens": 80, "completion_tokens": 20}),
+        _record(
+            id="tool",
+            source="tool",
+            settlement_key="run:1:tool:call1",
+            amount=2000,
+            created_at=NOW + timedelta(seconds=2),
+            context={"task_id": "run:1", "tool_name": "deliver_file", "external": True},
+        ),
+    ]
+    result = _build(records, [], [], [], [], [], range_key="all")
+    stats = result["summary"]
+    assert stats["chat"] == 2100
+    assert stats["summary_tokens"] == 0
+    assert stats["total"] == 2100
+    assert result["composition"]["tool_external"] == 2000
+    assert result["composition"]["billed_total"] == 2100
+
+
+def test_image_billed_is_split_from_provider_and_total() -> None:
+    records = [
+        _record(id="chat", settlement_key="run:1", amount=100, context={"prompt_tokens": 80, "completion_tokens": 20}),
+        _record(
+            id="image",
+            source="image",
+            metric="image",
+            settlement_key="image:1",
+            amount=150000,
+            created_at=NOW + timedelta(seconds=2),
+            context={"model": "Doubao Seedream 5.0 Flash", "image_count": 1},
+        ),
+    ]
+    result = _build(records, [], [], [], [], [], range_key="all")
+    assert result["summary"]["image"] == 150000
+    assert result["summary"]["total"] == 150100
+    assert result["composition"]["image_billed"] == 150000
+    assert result["composition"]["tool_external"] == 0
+    assert result["composition"]["billed_total"] == 150100
 
 
 def test_kind_filter_keeps_only_the_matching_model_row() -> None:

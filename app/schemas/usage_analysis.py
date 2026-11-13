@@ -117,6 +117,8 @@ class Composition(BaseModel):
     output: TokenFigure
     total: TokenFigure
     billed_total: int = 0
+    tool_external: int = 0
+    image_billed: int = 0
     summary: SummaryComposition | None = None
     note: str | None = None
 

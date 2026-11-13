@@ -583,7 +583,7 @@ def register_data_tools(registry) -> None:
                 toolset="data",
                 max_calls_per_run=8,
                 timeout_s=20,
-                pricing=ToolPricing(model="fixed_tokens", fixed_tokens=2000),  # ← 新增
+                pricing=ToolPricing(model="fixed_tokens", tokens=2000),
             )
         )
     for name, model, handler in (

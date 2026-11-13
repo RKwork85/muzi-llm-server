@@ -24,6 +24,13 @@ router = APIRouter(prefix="/ark", tags=["ark"])
 _FILE_ID = r"^[A-Za-z0-9_-]{1,128}$"
 _MAX_FILE_BYTES = 32 * 1024 * 1024
 
+# 图片生成固定计费：每成功生成一张图扣固定 token（系统只认 token，人民币换算在充值/定价系统）。
+# 暂定只有 Seedream 5.0 Flash 计费（0.12 元/张 → 150000 token/张），其他模型号暂未加入（计 0）。
+# 环境变量 TOOL_PRICE_IMAGE_GENERATION_TOKENS 可覆盖单张 token。
+IMAGE_TOOL_NAME = "image_generation"
+IMAGE_DEFAULT_TOKENS = 150000
+IMAGE_PRICED_MODELS = ("doubao-seedream-5-0-flash",)
+
 
 def _settings(request: Request):
     settings = getattr(request.app.state, "settings", None)
@@ -54,44 +61,64 @@ def _usage_amount(payload: dict[str, Any]) -> tuple[int, int, int]:
     return total, prompt, completion
 
 
+def _successful_image_count(payload: dict[str, Any]) -> int:
+    """成功生成的图片张数（跳过组图里带 error 的部分失败项）。"""
+    data = payload.get("data") or []
+    if not isinstance(data, list):
+        return 0
+    return sum(1 for item in data if isinstance(item, dict) and not item.get("error"))
+
+
+def _image_is_priced(model: str | None) -> bool:
+    """暂定只有列入 IMAGE_PRICED_MODELS 的图片模型计费，其余暂未加入。"""
+    m = (model or "").strip().lower()
+    return any(m.startswith(prefix) for prefix in IMAGE_PRICED_MODELS)
+
+
+def _image_fixed_tokens(model: str | None, image_count: int) -> int:
+    """图片生成固定计费额度：成功张数 × 每张固定 token（未定价模型为 0）。"""
+    if image_count <= 0 or not _image_is_priced(model):
+        return 0
+    from app.metering.tool_pricing import quote_tool_tokens
+    from app.tools.registry import ToolPricing
+
+    pricing = ToolPricing(model="fixed_tokens", tokens=IMAGE_DEFAULT_TOKENS, unit="image")
+    return quote_tool_tokens(pricing, tool_name=IMAGE_TOOL_NAME, success=True, units=image_count)
+
+
 def _public_image_usage(
     payload: dict[str, Any],
     *,
     prompt: str = "",
     images: Any = None,
 ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """输入、输出、合计与入账相同，分类方式与文本对话一致。"""
-    raw = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
-    try:
-        from app.metering.attribute import annotate_image_usage
+    """图片生成按固定 token 计费：每成功生成一张图扣固定 token，系统只认 token。
 
-        public, meter = annotate_image_usage(
-            provider_name="ark",
-            model=str(payload.get("model") or ""),
-            prompt=prompt if isinstance(prompt, str) else "",
-            images=images,
-            usage_raw=raw,
-        )
-    except Exception:
-        total, prompt_tokens, completion = _usage_amount(payload)
-        public = {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion,
-            "total_tokens": total,
-        }
-        if completion > 0:
-            public["breakdown"] = [
-                {
-                    "direction": "output",
-                    "category": "image",
-                    "token_count": completion,
-                    "attribution_method": "provider_reported",
-                }
-            ]
-        meter = None
+    图片不是文本模型 token，无 input/output breakdown；用 tool_usage 表达
+    「图片生成」的工具固定计费，前端据此显示「图片生成 N 张 × 固定 token」。
+    """
+    image_count = _successful_image_count(payload) if isinstance(payload, dict) else 0
+    image_tokens = _image_fixed_tokens(str(payload.get("model") or ""), image_count) if isinstance(payload, dict) else 0
+    public: dict[str, Any] = {
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "total_tokens": 0,
+        "tool_usage": [
+            {
+                "tool_name": IMAGE_TOOL_NAME,
+                "calls": image_count,
+                "tokens": 0,
+                "priced_tokens": image_tokens,
+                "unit": "image",
+            }
+        ]
+        if image_count > 0
+        else [],
+    }
+    raw = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
     if raw.get("generated_images") is not None:
         public["generated_images"] = raw.get("generated_images")
-    return public, meter
+    return public, None
 
 
 @router.post("/images/generations", summary="经服务端生成图片并结算额度")
@@ -141,34 +168,27 @@ async def generate_images(
             if isinstance(error, dict):
                 message = str(error.get("message") or "")
         raise UpstreamError(message or "方舟图片生成失败")
-    total, prompt_tokens, completion_tokens = _usage_amount(payload if isinstance(payload, dict) else {})
-    image_count = len(payload.get("data") or []) if isinstance(payload, dict) else 0
+    image_count = _successful_image_count(payload) if isinstance(payload, dict) else 0
     extra = {"conversation_title": conversation_title[:200]} if conversation_title else None
-    public_usage: dict[str, Any] = {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": total,
-    }
-    meter = None
-    if isinstance(payload, dict):
-        public_usage, meter = _public_image_usage(
-            payload,
-            prompt=prompt if isinstance(prompt, str) else "",
-            images=body.get("image"),
-        )
+    public_usage, _meter = _public_image_usage(
+        payload if isinstance(payload, dict) else {},
+        prompt=prompt if isinstance(prompt, str) else "",
+        images=body.get("image"),
+    )
+    # 图片生成固定计费：额度 = 成功张数 × 每张固定 token（与 public_usage.tool_usage 同源）。
+    image_tokens = _image_fixed_tokens(str(payload.get("model") or ""), image_count) if isinstance(payload, dict) else 0
     await settle_in_new_session(
         user.id,
         source="image",
         settlement_key=get_request_id(),
-        amount=total,
+        amount=image_tokens,
         kind="image",
         model=model,
         conversation_id=conversation_id,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
+        prompt_tokens=0,
+        completion_tokens=0,
         image_count=image_count or None,
         extra=extra,
-        meters=[meter] if meter else None,
         trace_id=get_request_id(),
     )
     if not isinstance(payload, dict):

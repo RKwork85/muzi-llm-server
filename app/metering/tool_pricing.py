@@ -1,77 +1,80 @@
-"""工具成本换算：外部货币成本 → token 额度。
+"""工具固定计费：系统内部只认 token 额度。
 
 工具本身不直接扣额度，工具结果以 tool_result 形式计入下一轮模型输入。
-但外部工具（web_search / web_fetch）有真实货币成本，需要按「成功请求次数」换算成
-token 额度扣减，同时把货币成本单独记账用于财务对账。
+但某些工具（如文件交付、图片生成）有独立成本，需要按「成功调用」扣固定 token。
 
-换算公式：
-    tokens = price / unit * requests_per_call / TOKEN_PRICE
-    其中 TOKEN_PRICE 是「1 token 的人民币成本」，由配置 TOKEN_PRICE_CNY 注入。
+计费口径：
+- free：0。
+- fixed_tokens：每次成功调用扣固定 token（失败返回 0）。
+  按张计费（unit="image"）时，扣 = 每张 token × 成功张数。
 
-计费口径是「成功请求」：失败的外部调用不计费。
+人民币 → token 的换算在充值/定价系统完成，这里不做任何货币运算。
+固定 token 默认值在 ToolPricing 定义处给出，运行期可用环境变量
+TOOL_PRICE_<NAME>_TOKENS 覆盖（NAME 转大写、非字母数字转下划线）。
 """
 
 from __future__ import annotations
 
-from decimal import Decimal, ROUND_UP
+import os
+import re
+from functools import lru_cache
 from typing import Any
 
-_TOKEN_PRICE_DEFAULT = Decimal("0.000001")  # 1 token = 0.000001 元（占位，需按实际定价调整）
+
+def _env_key(tool_name: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9]+", "_", (tool_name or "").upper()).strip("_")
+    if not name:
+        return ""
+    return f"TOOL_PRICE_{name}_TOKENS"
 
 
-def get_token_price(currency: str = "CNY") -> Decimal:
-    """返回「1 token 的人民币成本」。非 CNY 币种暂按同一汇率换算。
-
-    汇率从配置读取，不硬编码，因为厂商定价会变。
-    """
-    price: Decimal
+@lru_cache(maxsize=1)
+def _load_env_file() -> None:
+    """把 .env 里的 TOOL_PRICE_* 加载进 os.environ（进程环境变量优先）。"""
     try:
-        from app.core.config import get_settings
+        from app.core.config import ROOT
+        from dotenv import load_dotenv
 
-        raw = get_settings().token_price_cny
-        price = Decimal(str(raw))
+        load_dotenv(ROOT / ".env", override=False)
     except Exception:
-        price = _TOKEN_PRICE_DEFAULT
-    if price <= 0:
-        return _TOKEN_PRICE_DEFAULT
-    return price
+        pass
 
 
-def quote_tool_money(pricing: Any | None, *, success: bool = True) -> Decimal | None:
-    """返回本次工具调用的真实货币成本（财务对账用，不参与额度）。
+def resolve_tokens(tool_name: str, default: int) -> int:
+    """返回工具的固定 token 值：环境变量 TOOL_PRICE_<NAME>_TOKENS 优先，否则用默认值。"""
+    _load_env_file()
+    key = _env_key(tool_name)
+    if key:
+        raw = os.environ.get(key)
+        if raw is not None and raw.strip():
+            try:
+                return max(0, int(raw))
+            except ValueError:
+                pass
+    return max(0, int(default or 0))
 
-    非 external 模型或失败调用返回 None。
-    """
-    if pricing is None or getattr(pricing, "model", "free") != "external" or not success:
-        return None
-    price = Decimal(str(getattr(pricing, "external_price", "0") or "0"))
-    unit = max(1, int(getattr(pricing, "external_unit", 1) or 1))
-    per_call = Decimal(str(getattr(pricing, "requests_per_call", 1) or 1))
-    return price / unit * per_call
 
-
-def quote_tool_tokens(pricing: Any | None, *, success: bool = True) -> int:
+def quote_tool_tokens(
+    pricing: Any | None,
+    *,
+    tool_name: str = "",
+    success: bool = True,
+    units: int = 1,
+) -> int:
     """把一次工具调用换算成 token 额度。
 
-    - free：0（结果走 tool_result 计入输入，不另扣）。
-    - fixed_tokens：每次调用固定扣固定值，仅成功时计费（失败返回 0）。
-    - external：外部价格换算成 token（成功请求才计费，向上取整）。
+    - free：0。
+    - fixed_tokens：成功时按「每单位 token × 单位数」扣（unit=call 时单位数恒为 1，
+      unit=image 时单位数 = 图片张数），失败返回 0。
     """
     if pricing is None:
         return 0
     model = getattr(pricing, "model", "free")
-    if model == "free":
+    if model != "fixed_tokens":
         return 0
-    if model == "fixed_tokens":
-        if not success:
-            return 0
-        return max(0, int(getattr(pricing, "fixed_tokens", 0) or 0))
-    if model == "external":
-        money = quote_tool_money(pricing, success=success)
-        if money is None or money <= 0:
-            return 0
-        token_price = get_token_price(str(getattr(pricing, "currency", "CNY") or "CNY"))
-        if token_price <= 0:
-            return 0
-        return int((money / token_price).to_integral_value(rounding=ROUND_UP))
-    return 0
+    if not success:
+        return 0
+    tokens = resolve_tokens(tool_name, getattr(pricing, "tokens", 0) or 0)
+    unit = getattr(pricing, "unit", "call") or "call"
+    multiplier = max(0, int(units or 0)) if unit == "image" else 1
+    return tokens * multiplier

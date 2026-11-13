@@ -225,17 +225,10 @@ class AgentLoop:
                 event_data["duration_ms"] = duration_ms
                 spec = self._registry.get(call.name)
                 if spec is not None and spec.pricing is not None:
-                    from app.metering.tool_pricing import quote_tool_money, quote_tool_tokens
+                    from app.metering.tool_pricing import quote_tool_tokens
 
                     success = error_code is None
-                    event_data["external_requests"] = (
-                        1 if spec.pricing.model == "external" and success else 0
-                    )
-                    money = quote_tool_money(spec.pricing, success=success)
-                    if money is not None:
-                        event_data["external_cost"] = str(money)
-                        event_data["currency"] = spec.pricing.currency
-                    tokens = quote_tool_tokens(spec.pricing, success=success)
+                    tokens = quote_tool_tokens(spec.pricing, tool_name=call.name, success=success)
                     if tokens > 0:
                         event_data["external_tokens"] = tokens
             if fresh and error_code is None:

@@ -1397,17 +1397,26 @@ def build_usage_analysis(
     filtered = pre_mode
     if mode:
         filtered = [turn for turn in filtered if turn.get("mode") == mode]
-    billed_total = sum(int(turn["billed"]) for turn in filtered)
-    summary_billed = sum(
-        _int(record.get("amount"))
-        for turn in filtered
-        for record in turn["records"]
-        if _is_summary(record)
-    )
+    chat_billed = 0
+    tool_billed = 0
+    image_billed = 0
+    summary_billed = 0
+    for turn in filtered:
+        for record in turn["records"]:
+            amount = _int(record.get("amount"))
+            if _is_summary(record):
+                summary_billed += amount
+            elif record.get("source") == "tool":
+                tool_billed += amount
+            elif record.get("source") == "image" or _kind(record) == "image":
+                image_billed += amount
+            else:
+                chat_billed += amount
+    billed_total = chat_billed + tool_billed + image_billed + summary_billed
     summary = {
         "total": billed_total,
-        "chat": sum(int(turn["billed"]) for turn in filtered if turn["kind"] == "chat"),
-        "image": sum(int(turn["billed"]) for turn in filtered if turn["kind"] == "image"),
+        "chat": chat_billed + tool_billed,
+        "image": image_billed,
         "summary_tokens": summary_billed,
         "count": len(filtered),
         "by_mode": [
@@ -1419,10 +1428,12 @@ def build_usage_analysis(
     primary_rows, summary_rows = _composition_split(filtered)
     composition = _exclusive_composition(primary_rows)
     composition["billed_total"] = billed_total
+    composition["tool_external"] = tool_billed
+    composition["image_billed"] = image_billed
     composition["summary"] = _exclusive_composition(summary_rows)
     summary_total_value = (composition["summary"].get("total") or {}).get("value")
     provider_total = (composition["total"]["value"] or 0) + (summary_total_value or 0)
-    if provider_total != billed_total:
+    if provider_total + tool_billed + image_billed != billed_total:
         extra = f"额度扣减 {billed_total}，服务商输入加输出 {provider_total}。"
         composition["note"] = f"{composition['note']} {extra}".strip() if composition.get("note") else extra
     trend_round, trend_round_limited = _round_points(filtered)
