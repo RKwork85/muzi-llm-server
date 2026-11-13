@@ -458,7 +458,7 @@ def _catalog(
             rows.append(
                 {
                     "category": category,
-                    "label": EXTRA_LABELS.get(category, category),
+                    "label": _part_label(direction, category),
                     "direction": direction,
                     "figure": figure,
                     "share": _share(figure, provider_total),

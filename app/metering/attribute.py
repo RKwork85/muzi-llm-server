@@ -335,3 +335,59 @@ def annotate_provider_usage(
     public = usage_public(stats)
     public["breakdown"] = meter["breakdown"]
     return public, meter
+
+
+def _image_user_content(prompt: str, images: Any) -> str | list[dict[str, Any]]:
+    refs: list[str] = []
+    if isinstance(images, str) and images:
+        refs = [images]
+    elif isinstance(images, list):
+        refs = [item for item in images if isinstance(item, str) and item]
+    if not refs:
+        return prompt
+    blocks: list[dict[str, Any]] = []
+    if prompt:
+        blocks.append({"type": "text", "text": prompt})
+    for url in refs:
+        blocks.append({"type": "image_url", "image_url": {"url": url}})
+    return blocks
+
+
+def annotate_image_usage(
+    *,
+    provider_name: str,
+    model: str,
+    prompt: str,
+    images: Any,
+    usage_raw: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """图片生成沿用文本的分类规则。
+
+    提示词按用户输入估算，差额记入未归因输入。
+    服务商给出的输出总量记为图片，不再改写成未归因输出。
+    输入、输出和合计仍用服务商数字，估算不计入额度。
+    """
+    public, meter = annotate_provider_usage(
+        provider_name=provider_name,
+        model=model,
+        messages=[{"role": "user", "content": _image_user_content(prompt, images)}],
+        usage_raw=usage_raw,
+        output_text="",
+        runtime_mode="image",
+        usage_source="image",
+    )
+    reasoning_tokens = 0
+    breakdown: list[dict[str, Any]] = []
+    for row in meter.get("breakdown") or []:
+        if row.get("direction") == "output" and row.get("category") in {"answer", "structured_output", "other_output"}:
+            continue
+        if row.get("direction") == "output" and row.get("category") == "reasoning":
+            reasoning_tokens = int(row.get("token_count") or 0)
+        breakdown.append(row)
+    completion = int(public.get("completion_tokens") or 0)
+    image_tokens = max(0, completion - reasoning_tokens)
+    if image_tokens:
+        breakdown.append(_provider("output", "image", image_tokens))
+    meter["breakdown"] = breakdown
+    public["breakdown"] = breakdown
+    return public, meter

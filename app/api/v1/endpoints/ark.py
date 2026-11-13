@@ -54,27 +54,44 @@ def _usage_amount(payload: dict[str, Any]) -> tuple[int, int, int]:
     return total, prompt, completion
 
 
-def _public_image_usage(payload: dict[str, Any]) -> dict[str, Any]:
-    """返回和入账相同的输入、输出、合计。不补服务商没给的分类。"""
-    total, prompt, completion = _usage_amount(payload)
+def _public_image_usage(
+    payload: dict[str, Any],
+    *,
+    prompt: str = "",
+    images: Any = None,
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """输入、输出、合计与入账相同，分类方式与文本对话一致。"""
     raw = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
-    public: dict[str, Any] = {
-        "prompt_tokens": prompt,
-        "completion_tokens": completion,
-        "total_tokens": total,
-    }
+    try:
+        from app.metering.attribute import annotate_image_usage
+
+        public, meter = annotate_image_usage(
+            provider_name="ark",
+            model=str(payload.get("model") or ""),
+            prompt=prompt if isinstance(prompt, str) else "",
+            images=images,
+            usage_raw=raw,
+        )
+    except Exception:
+        total, prompt_tokens, completion = _usage_amount(payload)
+        public = {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion,
+            "total_tokens": total,
+        }
+        if completion > 0:
+            public["breakdown"] = [
+                {
+                    "direction": "output",
+                    "category": "image",
+                    "token_count": completion,
+                    "attribution_method": "provider_reported",
+                }
+            ]
+        meter = None
     if raw.get("generated_images") is not None:
         public["generated_images"] = raw.get("generated_images")
-    if completion > 0:
-        public["breakdown"] = [
-            {
-                "direction": "output",
-                "category": "image",
-                "token_count": completion,
-                "attribution_method": "provider_reported",
-            }
-        ]
-    return public
+    return public, meter
 
 
 @router.post("/images/generations", summary="经服务端生成图片并结算额度")
@@ -127,6 +144,18 @@ async def generate_images(
     total, prompt_tokens, completion_tokens = _usage_amount(payload if isinstance(payload, dict) else {})
     image_count = len(payload.get("data") or []) if isinstance(payload, dict) else 0
     extra = {"conversation_title": conversation_title[:200]} if conversation_title else None
+    public_usage: dict[str, Any] = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total,
+    }
+    meter = None
+    if isinstance(payload, dict):
+        public_usage, meter = _public_image_usage(
+            payload,
+            prompt=prompt if isinstance(prompt, str) else "",
+            images=body.get("image"),
+        )
     await settle_in_new_session(
         user.id,
         source="image",
@@ -139,10 +168,10 @@ async def generate_images(
         completion_tokens=completion_tokens,
         image_count=image_count or None,
         extra=extra,
+        meters=[meter] if meter else None,
     )
     if not isinstance(payload, dict):
         return {}
-    public_usage = _public_image_usage(payload)
     payload = dict(payload)
     payload["usage"] = public_usage
     return payload
