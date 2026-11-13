@@ -55,6 +55,11 @@ class ToolService:
             item = self._validate(call)
             if allowed is not None and item[1].name not in allowed:
                 raise ToolNotAllowedError()
+            from app.authorization.application.execution_guard import authorize_registered_tool
+
+            decision = await authorize_registered_tool(item[1])
+            if not decision.allowed:
+                raise ToolNotAllowedError()
             validated.append(item)
         async def run_one(call: ToolCall, spec: ToolSpec, args: Any) -> dict[str, str]:
             return {

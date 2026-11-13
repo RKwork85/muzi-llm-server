@@ -470,6 +470,7 @@ class QuotaService:
         image_count: int | None = None,
         extra: dict[str, Any] | None = None,
         quota_key: str = DEFAULT_QUOTA_KEY,
+        trace_id: str | None = None,
     ) -> Settlement:
         """按结算键记一笔。重复键不再相加。缺用量记为未结算。"""
         existing = await self.session.scalar(
@@ -530,6 +531,7 @@ class QuotaService:
             context.update(extra)
         record = UsageRecord(
             user_id=user_id,
+            trace_id=trace_id,
             metric=kind,
             amount=billable,
             source=source,

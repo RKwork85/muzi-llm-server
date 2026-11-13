@@ -817,6 +817,11 @@ class PlanningDecisionEngine:
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.total_tokens = 0
+        self.reasoning_tokens = 0
+        self.cache_read_tokens = 0
+        self.cache_write_tokens = 0
+        self.last_messages: list[dict[str, Any]] = []
+        self.last_output_text = ""
 
     def _note_usage(self, usage) -> None:
         if usage is None:
@@ -824,6 +829,9 @@ class PlanningDecisionEngine:
         self.prompt_tokens += int(getattr(usage, "prompt_tokens", 0) or 0)
         self.completion_tokens += int(getattr(usage, "completion_tokens", 0) or 0)
         self.total_tokens += int(getattr(usage, "total_tokens", 0) or 0)
+        self.reasoning_tokens += int(getattr(usage, "reasoning_tokens", 0) or 0)
+        self.cache_read_tokens += int(getattr(usage, "cache_read_tokens", 0) or 0)
+        self.cache_write_tokens += int(getattr(usage, "cache_write_tokens", 0) or 0)
 
     def _proposal_request(
         self, *, goal: str, user_message: str, plan: PlanSnapshot,
@@ -951,6 +959,7 @@ class PlanningDecisionEngine:
         history: list[dict[str, str]] | None = None,
     ) -> DecisionProposal:
         request = self._proposal_request(goal=goal, user_message=user_message, plan=plan, history=history)
+        self.last_messages = list(request.messages)
         try:
             result: CompletionResult = await asyncio.wait_for(
                 self._provider.create_chat_completion(request),
@@ -963,6 +972,7 @@ class PlanningDecisionEngine:
             raise PlanningPolicyError("planning proposal cannot request tool execution")
         if not result.content:
             raise PlanningPolicyError("planning model returned an empty proposal")
+        self.last_output_text = result.content
         try:
             return self._parse_proposal(result.content)
         except PlanningPolicyError as parse_error:
@@ -1022,6 +1032,7 @@ class PlanningDecisionEngine:
         yield 的元组：("delta", str) | ("done", DecisionProposal) | ("error", str)。
         """
         request = self._proposal_request(goal=goal, user_message=user_message, plan=plan, history=history)
+        self.last_messages = list(request.messages)
         buffer = ""
         last_len = 0
         action_announced = False
@@ -1060,6 +1071,7 @@ class PlanningDecisionEngine:
                 yield ("error", "PLANNING_POLICY_REJECTED")
                 return
             proposal = corrected
+        self.last_output_text = buffer
         yield ("done", proposal)
 
 

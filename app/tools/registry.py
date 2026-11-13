@@ -63,6 +63,18 @@ MUTABLE_ACCESS = frozenset({"write_workspace", "delete_workspace", "sandbox_exec
 
 
 @dataclass
+class ToolPricing:
+    """工具的外部计费模型。free 不扣额度；external 按成功请求换算成 token 扣额度。"""
+
+    model: str = "free"  # free | fixed_tokens | external
+    fixed_tokens: int = 0  # fixed_tokens 模式：每次调用换算的 token 数
+    external_price: str = "0"  # external 模式：单价，Decimal 字符串
+    external_unit: int = 1  # 计费单位（如 1000 次请求）
+    currency: str = "CNY"  # 计费币种
+    requests_per_call: int = 1  # 每次工具调用产生的外部请求次数（默认 1）
+
+
+@dataclass
 class ToolSpec:
     name: str
     description: str = ""
@@ -77,6 +89,7 @@ class ToolSpec:
     idempotent: bool = True
     toolset: str = "basic"
     parameters: dict[str, Any] | None = None
+    pricing: ToolPricing | None = None
 
     def openai_schema(self) -> dict[str, Any]:
         if self.parameters is not None:
@@ -328,6 +341,7 @@ def build_agent_registry(search_calls: int = 5, fetch_calls: int = 5) -> ToolReg
             toolset="delivery",
             max_calls_per_run=5,
             timeout_s=25,
+            pricing=ToolPricing(model="fixed_tokens", fixed_tokens=2000),
         )
     )
     registry.register(

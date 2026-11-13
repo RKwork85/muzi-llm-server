@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 
 from app.core.config import Settings
 
-logger = logging.getLogger("muzi_llm.sms")
+logger = logging.getLogger("muzi_llm")
 _REFRESH_EARLY = timedelta(minutes=2)
 
 

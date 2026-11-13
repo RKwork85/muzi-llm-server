@@ -14,6 +14,13 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
+from tests.support_agent_access import allow_legacy_agent_api
+
+
+@pytest.fixture(autouse=True)
+def _legacy_agent_api(monkeypatch) -> None:
+    allow_legacy_agent_api(monkeypatch)
+
 from app.agents.toolsets import agent_tool_names
 from app.core.exceptions import LoginRequiredError, ToolExecutionError, ToolNotAllowedError
 from app.main import create_app

@@ -1,6 +1,10 @@
 """权限目录与内置角色定义。
 
-权限 code 采用 `resource.action` 命名，稳定且不依赖前端路由。
+权限 code 分两类：
+- 功能权限：`resource.action`，与运行时无关（如 chat.access、user.read）。
+- 工具执行权限：`mode.resource.action`，按工作模式（ask/plan/agent）区分，
+  例如 `ask.workspace.write` 表示「普通对话里写入工作区」。
+
 角色只是权限集合；业务代码通过 AuthorizationService.has_permission 判断，
 不直接写 if role == 'admin'。
 
@@ -25,6 +29,13 @@ DEVELOPER_ROLE_CODE = "developer"
 MEMBER_ROLE_CODE = "member"
 GUEST_ROLE_CODE = "guest"
 
+# ---------------------------------------------------------------------------
+# 工作模式
+# ---------------------------------------------------------------------------
+
+# 工具执行权限按这三个模式拆分。功能权限 mode 为空字符串。
+TOOL_MODES: tuple[str, ...] = ("ask", "plan", "agent")
+
 
 @dataclass(frozen=True)
 class PermissionSpec:
@@ -33,6 +44,7 @@ class PermissionSpec:
     resource: str
     action: str
     description: str = ""
+    mode: str = ""  # 工具执行权限的模式前缀；功能权限为空
 
 
 @dataclass(frozen=True)
@@ -46,6 +58,31 @@ class RoleSpec:
 # ---------------------------------------------------------------------------
 # 权限目录
 # ---------------------------------------------------------------------------
+
+# 工具执行权限的 (resource, action, 名称)。按 TOOL_MODES 展开为 mode.resource.action。
+_TOOL_ACTIONS: tuple[tuple[str, str, str], ...] = (
+    ("workspace", "read", "读取工作区"),
+    ("workspace", "write", "写入工作区"),
+    ("workspace", "delete", "删除工作区文件"),
+    ("command", "execute", "执行命令"),
+)
+
+
+def _tool_permission_specs() -> list[PermissionSpec]:
+    specs: list[PermissionSpec] = []
+    for mode in TOOL_MODES:
+        for resource, action, label in _TOOL_ACTIONS:
+            specs.append(
+                PermissionSpec(
+                    code=f"{mode}.{resource}.{action}",
+                    name=label,
+                    resource=resource,
+                    action=action,
+                    mode=mode,
+                )
+            )
+    return specs
+
 
 PERMISSION_CATALOG: tuple[PermissionSpec, ...] = (
     # 功能权限
@@ -83,9 +120,21 @@ PERMISSION_CATALOG: tuple[PermissionSpec, ...] = (
     # 额度
     PermissionSpec("quota.read", "查看额度", "quota", "read", "查看使用额度"),
     PermissionSpec("quota.manage", "管理额度", "quota", "manage", "调整用户额度"),
+    # 工具执行权限（按模式展开）
+    *_tool_permission_specs(),
 )
 
 PERMISSION_BY_CODE: dict[str, PermissionSpec] = {spec.code: spec for spec in PERMISSION_CATALOG}
+
+# 旧的、无模式前缀的工具执行权限码（数据迁移时清理用）。
+LEGACY_TOOL_PERMISSION_CODES = frozenset(
+    {
+        "workspace.read",
+        "workspace.write",
+        "workspace.delete",
+        "command.execute",
+    }
+)
 
 
 def _p(*codes: str) -> frozenset[str]:
@@ -114,6 +163,29 @@ _BASE_MEMBER = _p(
     "task.cancel",
 )
 
+# ---------------------------------------------------------------------------
+# 工具执行权限的默认角色许可（按模式）
+#
+# 普通对话（ask）是常规能力：member 即可读写工作区（生成文档/写文件），
+# 但删除与执行代码仍是高风险，只给 developer 及以上。
+# plan 保持只读：任何内置角色都不授予写/删/执行。
+# agent 模式更敏感：写/删/执行只给 developer 及以上，member 仅可读。
+# ---------------------------------------------------------------------------
+_TOOL_GRANT_MEMBER = _p(
+    "ask.workspace.read",
+    "ask.workspace.write",
+    "plan.workspace.read",
+    "agent.workspace.read",
+)
+
+_TOOL_GRANT_DEVELOPER = _TOOL_GRANT_MEMBER | _p(
+    "ask.workspace.delete",
+    "ask.command.execute",
+    "agent.workspace.write",
+    "agent.workspace.delete",
+    "agent.command.execute",
+)
+
 BUILTIN_ROLES: tuple[RoleSpec, ...] = (
     RoleSpec(
         code=SUPER_ADMIN_ROLE_CODE,
@@ -126,6 +198,7 @@ BUILTIN_ROLES: tuple[RoleSpec, ...] = (
         name="平台管理员",
         description="运营管理员，管理用户、资源、审核和运营配置。",
         permissions=_BASE_MEMBER
+        | _TOOL_GRANT_DEVELOPER
         | _p(
             "agent.delete",
             "agent.share",
@@ -137,6 +210,7 @@ BUILTIN_ROLES: tuple[RoleSpec, ...] = (
             "user.read",
             "user.create",
             "user.update",
+            "user.delete",
             "user.manage",
             "role.read",
             "role.manage",
@@ -152,6 +226,7 @@ BUILTIN_ROLES: tuple[RoleSpec, ...] = (
         name="开发者",
         description="高级用户，使用高级 Agent、Tool、Skill 和开发能力。",
         permissions=_BASE_MEMBER
+        | _TOOL_GRANT_DEVELOPER
         | _p(
             "agent.delete",
             "agent.share",
@@ -165,7 +240,7 @@ BUILTIN_ROLES: tuple[RoleSpec, ...] = (
         code=MEMBER_ROLE_CODE,
         name="普通用户",
         description="标准用户，使用普通对话、个人 Agent 和授权资源。",
-        permissions=_BASE_MEMBER,
+        permissions=_BASE_MEMBER | _TOOL_GRANT_MEMBER,
     ),
     RoleSpec(
         code=GUEST_ROLE_CODE,
@@ -197,6 +272,65 @@ DEFAULT_ROLE_RANK = 0
 def max_role_rank(role_codes: list[str] | tuple[str, ...] | set[str]) -> int:
     """取一组角色 code 的最高等级。未知角色按 DEFAULT_ROLE_RANK 处理。"""
     return max((ROLE_RANK.get(code, DEFAULT_ROLE_RANK) for code in role_codes), default=DEFAULT_ROLE_RANK)
+
+
+def role_grant_rank(role_code: str) -> int:
+    """角色可被授予的权限等级上限。
+
+    用于后台「角色权限」面板的可配置范围：只有等级足够高的角色，才能被配置
+    对应等级的权限。自定义角色未在 ROLE_RANK 列出，按普通用户（member）等级处理，
+    避免管理员无法为自定义角色配置基础权限。
+    """
+    return ROLE_RANK.get(role_code, ROLE_RANK[MEMBER_ROLE_CODE])
+
+
+# ---------------------------------------------------------------------------
+# 权限可授予的最小角色等级（可配置范围门槛）
+# ---------------------------------------------------------------------------
+# 数值来自 ROLE_RANK。低等级角色在后台看不到、也无法被授予超过其等级的权限，
+# 防止普通用户（member）被错误地勾上「删除用户 / 创建用户」等管理权限。
+# 未显式列出的权限默认门槛为 member 等级（40）。
+PERMISSION_MIN_RANK: dict[str, int] = {
+    # 仅管理员（80）可配置的管理类权限
+    "admin.access": 80,
+    "user.read": 80,
+    "user.create": 80,
+    "user.update": 80,
+    "user.delete": 80,
+    "user.manage": 80,
+    "role.read": 80,
+    "role.manage": 80,
+    "permission.read": 80,
+    "permission.manage": 80,
+    "audit.read": 80,
+    "quota.read": 80,
+    "quota.manage": 80,
+    # plan 模式默认只读；写/删/执行仅管理员可开放给自定义角色
+    "plan.workspace.write": 80,
+    "plan.workspace.delete": 80,
+    "plan.command.execute": 80,
+    # 开发者（60）及以上
+    "agent.delete": 60,
+    "agent.share": 60,
+    "skill.install": 60,
+    "mcp.connect": 60,
+    "mcp.execute": 60,
+    "plugin.access": 60,
+    "ask.workspace.delete": 60,
+    "ask.command.execute": 60,
+    "agent.workspace.write": 60,
+    "agent.workspace.delete": 60,
+    "agent.command.execute": 60,
+    # 访客（20）即可配置的基础对话
+    "chat.access": 20,
+}
+
+DEFAULT_PERMISSION_MIN_RANK = ROLE_RANK[MEMBER_ROLE_CODE]
+
+
+def permission_min_rank(code: str) -> int:
+    """返回权限可授予的最小角色等级。未列出的默认按 member 等级处理。"""
+    return PERMISSION_MIN_RANK.get(code, DEFAULT_PERMISSION_MIN_RANK)
 
 
 # ---------------------------------------------------------------------------

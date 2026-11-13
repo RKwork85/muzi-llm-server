@@ -11,7 +11,7 @@ import logging
 from app.core.config import Settings
 from app.core.exceptions import FeatureNotReadyError, SmsDeliveryError, SmsRateLimitError
 
-logger = logging.getLogger("muzi_llm.sms")
+logger = logging.getLogger("muzi_llm")
 
 
 def sms_configured(settings: Settings) -> bool:

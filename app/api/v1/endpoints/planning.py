@@ -12,6 +12,7 @@ from fastapi.responses import StreamingResponse
 from app.core.sse import format_sse
 
 from app.api.deps import get_authenticated_user
+from app.authorization.application.execution_guard import CURRENT_EXECUTION, load_execution_context
 from app.authorization.application.audit_service import QuotaService
 from app.authorization.application.quota_bridge import quota_event_observer
 from app.api.deps import get_agent_runtime
@@ -388,15 +389,25 @@ async def authorize_execution(
         mcp_user_id = await mcp.user_id_from_request(request) if mcp is not None else None
         await QuotaService(session).authorize(user.id)
         await session.commit()
+        workspace_scope = scope_dirname(request.headers.get("x-workspace-key"))
+        tool_context = await load_execution_context(
+            str(user.id),
+            runtime_mode="agent",
+            run_id=task_id,
+            conversation_id=str(plan.conversation_id) if getattr(plan, "conversation_id", None) else None,
+            workspace_scope=workspace_scope,
+        )
+        token = CURRENT_EXECUTION.set(tool_context)
         try:
             run = await runtime.start(
                 agent_request,
                 run_request_id,
-                workspace_scope=scope_dirname(request.headers.get("x-workspace-key")),
+                workspace_scope=workspace_scope,
                 mcp_user_id=mcp_user_id,
                 mcp_service=mcp,
                 task_id=task_id,
                 event_observer=quota_event_observer(persistence, str(user.id), task_id),
+                owner_id=str(user.id),
             )
         except Exception:
             task_row = await session.get(AgentTask, db_task_id)
@@ -418,6 +429,8 @@ async def authorize_execution(
             )
             await session.commit()
             raise
+        finally:
+            CURRENT_EXECUTION.reset(token)
         return PlanRuntimeResponse(plan=plan, approved_revision=body.approved_revision, run=run)
     except (PlanningNotFound, PlanningConflict, PlanningPolicyError) as exc:
         _translate(exc)

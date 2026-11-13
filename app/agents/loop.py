@@ -114,11 +114,20 @@ class AgentLoop:
                 return self._done(status, None, steps, tool_count, exc.code, usage)
             step_usage = completion.usage
             usage = _add_usage(usage, step_usage)
-            completed: dict[str, object] = {"step": steps, "finish_reason": completion.finish_reason}
+            completed: dict[str, object] = {
+                "step": steps,
+                "finish_reason": completion.finish_reason,
+                "model": self._model,
+            }
+            if completion.content:
+                completed["output_text"] = completion.content
             if step_usage is not None:
                 completed["prompt_tokens"] = int(step_usage.prompt_tokens)
                 completed["completion_tokens"] = int(step_usage.completion_tokens)
                 completed["total_tokens"] = int(step_usage.total_tokens)
+                completed["reasoning_tokens"] = step_usage.reasoning_tokens
+                completed["cache_read_tokens"] = step_usage.cache_read_tokens
+                completed["cache_write_tokens"] = step_usage.cache_write_tokens
             self._emit("agent.model.completed", completed)
             await self._settle_events()
             if completion.finish_reason in _BAD_FINISH:
@@ -161,6 +170,7 @@ class AgentLoop:
         self._context.append_assistant(completion)
         for call in calls:
             fresh: list[dict[str, object]] = []
+            duration_ms: int | None = None
             if self._clock.remaining() <= 0:
                 result_content, status_name, error_code = _deadline_tool_content(call.name, self._clock)
             elif self._over_call_limit(call.name):
@@ -188,6 +198,7 @@ class AgentLoop:
                 result_content = executed.content
                 status_name = executed.status.value
                 error_code = executed.error_code
+                duration_ms = executed.duration_ms
                 if error_code is None:
                     result_content, fresh, limit_code = absorb_tool_output(
                         result_content,
@@ -205,10 +216,28 @@ class AgentLoop:
             event_name = "agent.tool.completed" if error_code is None else "agent.tool.failed"
             event_data: dict[str, object] = {
                 "tool_name": call.name,
+                "tool_call_id": call.id,
                 "status": status_name,
                 "error_code": error_code or "",
                 "step": steps,
             }
+            if duration_ms is not None:
+                event_data["duration_ms"] = duration_ms
+                spec = self._registry.get(call.name)
+                if spec is not None and spec.pricing is not None:
+                    from app.metering.tool_pricing import quote_tool_money, quote_tool_tokens
+
+                    success = error_code is None
+                    event_data["external_requests"] = (
+                        1 if spec.pricing.model == "external" and success else 0
+                    )
+                    money = quote_tool_money(spec.pricing, success=success)
+                    if money is not None:
+                        event_data["external_cost"] = str(money)
+                        event_data["currency"] = spec.pricing.currency
+                    tokens = quote_tool_tokens(spec.pricing, success=success)
+                    if tokens > 0:
+                        event_data["external_tokens"] = tokens
             if fresh and error_code is None:
                 event_data["artifact_id"] = fresh[0]["id"]
                 event_data["artifact_type"] = fresh[0]["type"]
@@ -298,7 +327,16 @@ def _add_usage(current: UsageSnapshot | None, incoming: UsageSnapshot | None) ->
         prompt_tokens=current.prompt_tokens + incoming.prompt_tokens,
         completion_tokens=current.completion_tokens + incoming.completion_tokens,
         total_tokens=current.total_tokens + incoming.total_tokens,
+        reasoning_tokens=_add_opt(current.reasoning_tokens, incoming.reasoning_tokens),
+        cache_read_tokens=_add_opt(current.cache_read_tokens, incoming.cache_read_tokens),
+        cache_write_tokens=_add_opt(current.cache_write_tokens, incoming.cache_write_tokens),
     )
+
+
+def _add_opt(left: int | None, right: int | None) -> int | None:
+    if left is None and right is None:
+        return None
+    return (left or 0) + (right or 0)
 
 
 def _result(

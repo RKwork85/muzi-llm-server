@@ -97,6 +97,17 @@ class ToolExecutor:
                 "TOOL_NOT_ALLOWED",
             )
 
+        from app.authorization.application.execution_guard import authorize_registered_tool
+
+        decision = await authorize_registered_tool(spec)
+        if not decision.allowed:
+            code = decision.error_code or "PERMISSION_DENIED"
+            return finish(
+                ToolExecutionStatus.REJECTED,
+                _error_content(public_name, code, "工具未获授权", clock),
+                code,
+            )
+
         try:
             payload = _parse_object(arguments)
             args = spec.args_model.model_validate(payload)

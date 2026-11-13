@@ -67,7 +67,20 @@ def test_capability_matrix_keeps_destructive_tools_behind_grants(tmp_path) -> No
             ["write_file", "delete_file", "run_command"],
         )
     )
-    assert {"write_text_file", "write_docx", "delete_file", "run_command"} <= opened
+    assert "write_text_file" not in opened
+    assert "write_docx" not in opened
+    assert "delete_file" not in opened
+    assert "run_command" not in opened
+    permitted = set(
+        agent_tool_names(
+            registry,
+            settings,
+            None,
+            ["write_file", "delete_file", "run_command"],
+            permissions={"agent.workspace.write", "agent.workspace.delete", "agent.command.execute"},
+        )
+    )
+    assert {"write_text_file", "write_docx", "delete_file", "run_command"} <= permitted
 
 
 def test_ask_mode_masks_skill_tools(tmp_path) -> None:

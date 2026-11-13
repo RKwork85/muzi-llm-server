@@ -1,6 +1,7 @@
 """导入全部模型，供 Alembic 和脱敏监听注册。"""
 
 from app.core.database.redaction import register_redaction_listeners
+from app.models.ask_run import AskRun
 from app.models.base import Base
 from app.models.planning import (
     PersistentInteraction,
@@ -57,6 +58,7 @@ register_redaction_listeners()
 
 __all__ = [
     "AgentTask",
+    "AskRun",
     "ArkFile",
     "Base",
     "ChatHistoryMessage",

@@ -159,6 +159,11 @@ def _bucket_key(record: dict[str, Any]) -> tuple[str, str]:
     if _is_summary(record):
         return ("summary", str(record["id"]))
     key = str(record.get("settlement_key") or record["id"])
+    # 工具外部成本记录 {trace}:tool:{call_id} 归到所属 run，而不是独立成一轮。
+    if ":tool:" in key:
+        run, _, _ = key.partition(":tool:")
+        if run:
+            return ("run", run)
     if ":" in key:
         head, tail = key.rsplit(":", 1)
         if head and (tail == "rest" or tail.isdigit()):
@@ -522,14 +527,17 @@ def _exclusive_composition(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def _composition_rows(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+def _composition_split(turns: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """把轮次用量拆成「非摘要」与「摘要」两组，供构成环形图分别展示。"""
+    primary: list[dict[str, Any]] = []
+    summary: list[dict[str, Any]] = []
     for turn in turns:
         for record in turn["records"]:
+            target = summary if _is_summary(record) else primary
             linked = record.get("llm") or []
             if linked:
                 for call in linked:
-                    rows.append(
+                    target.append(
                         {
                             "input": call.get("input_tokens"),
                             "output": call.get("output_tokens"),
@@ -538,14 +546,14 @@ def _composition_rows(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     )
                 continue
             context = record.get("context") or {}
-            rows.append(
+            target.append(
                 {
                     "input": _int_or_none(context.get("prompt_tokens")) if "prompt_tokens" in context else None,
                     "output": _int_or_none(context.get("completion_tokens")) if "completion_tokens" in context else None,
                     "cache": None,
                 }
             )
-    return rows
+    return primary, summary
 
 
 def _finish_turn(turn: dict[str, Any], tools: list[dict[str, Any]], skills: list[dict[str, Any]], transactions: list[dict[str, Any]]) -> None:
@@ -595,8 +603,14 @@ def _finish_turn(turn: dict[str, Any], tools: list[dict[str, Any]], skills: list
         keys.add(turn["bucket"][1])
     turn["tools"] = [tool for tool in tools if tool.get("task_id") and tool["task_id"] in keys]
     provider_ids = {call["id"] for call in calls if call.get("origin") == "provider"}
-    turn["skills"] = [skill for skill in skills if skill.get("llm_usage_id") and str(skill["llm_usage_id"]) in provider_ids]
+    turn["skills"] = [
+        skill
+        for skill in skills
+        if (skill.get("llm_usage_id") and str(skill["llm_usage_id"]) in provider_ids)
+        or (skill.get("task_id") and skill["task_id"] in keys)
+    ]
     turn["tool_count"] = len(turn["tools"])
+    turn["skill_count"] = len(turn["skills"])
     turn["transactions"] = [
         item
         for item in transactions
@@ -736,6 +750,11 @@ def _timeline(turn: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
     for tool in sorted(turn["tools"], key=lambda item: _aware(item["created_at"])):
+        external_cost = tool.get("external_cost")
+        if external_cost is not None:
+            detail = f"外部成本 {external_cost} {tool.get('currency') or 'CNY'}。"
+        else:
+            detail = "工具执行本身不另计 LLM Token。"
         nodes.append(
             {
                 "id": f"tool:{tool['id']}",
@@ -747,7 +766,7 @@ def _timeline(turn: dict[str, Any]) -> list[dict[str, Any]]:
                 "tokens": None,
                 "status": tool.get("status") or "completed",
                 "event_id_masked": mask_identifier(str(tool["id"])),
-                "detail": "工具执行本身不另计 LLM Token。",
+                "detail": detail,
                 "_order": 2,
             }
         )
@@ -888,6 +907,7 @@ def _public_turn(turn: dict[str, Any]) -> dict[str, Any]:
         "call_count": turn["call_count"],
         "summary_count": turn["summary_count"],
         "tool_count": turn["tool_count"],
+        "skill_count": turn.get("skill_count", 0),
         "image_count": turn.get("image_count"),
         "result": turn["result"],
         "link": turn.get("link"),
@@ -1356,29 +1376,53 @@ def build_usage_analysis(
         _finish_turn(turn, tools, skills, transactions)
     kind_turns = [turn for turn in turns if not kind or turn["kind"] == kind]
     models = sorted({turn["model"] for turn in kind_turns if turn.get("model")})
-    filtered = kind_turns
+    pre_mode = kind_turns
     if model:
-        filtered = [turn for turn in filtered if turn.get("model") == model]
-    if mode:
-        filtered = [turn for turn in filtered if turn.get("mode") == mode]
+        pre_mode = [turn for turn in pre_mode if turn.get("model") == model]
     needle = (query or "").strip().casefold()
     if needle:
-        filtered = [
+        pre_mode = [
             turn
-            for turn in filtered
+            for turn in pre_mode
             if needle in " ".join([turn.get("prompt") or "", turn.get("conversation_title") or ""]).casefold()
         ]
+    # 三模式分布基于「模式筛选之前」的集合，用户在任一模式下都能看到全局分布。
+    mode_billed: dict[str, int] = {}
+    mode_counts: dict[str, int] = {}
+    for turn in pre_mode:
+        turn_mode = turn.get("mode")
+        if turn_mode in {"ask", "plan", "agent"}:
+            mode_billed[turn_mode] = mode_billed.get(turn_mode, 0) + int(turn["billed"])
+            mode_counts[turn_mode] = mode_counts.get(turn_mode, 0) + 1
+    filtered = pre_mode
+    if mode:
+        filtered = [turn for turn in filtered if turn.get("mode") == mode]
     billed_total = sum(int(turn["billed"]) for turn in filtered)
+    summary_billed = sum(
+        _int(record.get("amount"))
+        for turn in filtered
+        for record in turn["records"]
+        if _is_summary(record)
+    )
     summary = {
         "total": billed_total,
         "chat": sum(int(turn["billed"]) for turn in filtered if turn["kind"] == "chat"),
         "image": sum(int(turn["billed"]) for turn in filtered if turn["kind"] == "image"),
+        "summary_tokens": summary_billed,
         "count": len(filtered),
+        "by_mode": [
+            {"mode": key, "billed": mode_billed[key], "count": mode_counts[key]}
+            for key in ("ask", "plan", "agent")
+            if key in mode_billed
+        ],
     }
-    composition = _exclusive_composition(_composition_rows(filtered))
+    primary_rows, summary_rows = _composition_split(filtered)
+    composition = _exclusive_composition(primary_rows)
     composition["billed_total"] = billed_total
-    provider_total = composition["total"]["value"]
-    if provider_total is not None and provider_total != billed_total:
+    composition["summary"] = _exclusive_composition(summary_rows)
+    summary_total_value = (composition["summary"].get("total") or {}).get("value")
+    provider_total = (composition["total"]["value"] or 0) + (summary_total_value or 0)
+    if provider_total != billed_total:
         extra = f"额度扣减 {billed_total}，服务商输入加输出 {provider_total}。"
         composition["note"] = f"{composition['note']} {extra}".strip() if composition.get("note") else extra
     trend_round, trend_round_limited = _round_points(filtered)
@@ -1545,6 +1589,9 @@ async def load_usage_analysis(
                 "duration_ms": row.duration_ms,
                 "created_at": row.created_at,
                 "llm_usage_id": str(row.llm_usage_id) if row.llm_usage_id else None,
+                "external_requests": row.external_requests,
+                "external_cost": str(row.external_cost) if row.external_cost is not None else None,
+                "currency": row.currency,
             }
             for row in tool_rows
         ],
@@ -1552,8 +1599,10 @@ async def load_usage_analysis(
             {
                 "id": str(row.id),
                 "llm_usage_id": str(row.llm_usage_id) if row.llm_usage_id else None,
+                "skill_id": row.skill_id,
                 "skill_name": row.skill_name,
                 "skill_execution_id": row.skill_execution_id,
+                "task_id": row.task_id,
                 "status": row.status,
                 "duration_ms": row.duration_ms,
                 "instruction_tokens": row.instruction_tokens,

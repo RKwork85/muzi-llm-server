@@ -6,19 +6,26 @@ import asyncio
 import threading
 import time
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import create_app
 from tests.conftest import make_settings
 from tests.fakes import FakeProvider, chat_payload, make_result, make_tool_call
+from tests.support_agent_access import AGENT_HEADERS, allow_legacy_agent_api
 
 _TERMINAL = {"completed", "failed", "cancelled", "limit_reached"}
+
+
+@pytest.fixture(autouse=True)
+def _legacy_agent_api(monkeypatch) -> None:
+    allow_legacy_agent_api(monkeypatch)
 
 
 def _wait(client: TestClient, task_id: str) -> dict[str, object]:
     last: dict[str, object] = {}
     for _ in range(80):
-        response = client.get(f"/api/v1/agents/runs/{task_id}")
+        response = client.get(f"/api/v1/agents/runs/{task_id}", headers=AGENT_HEADERS)
         assert response.status_code == 200
         last = response.json()
         if last["status"] in _TERMINAL:
@@ -45,6 +52,7 @@ def test_tool_round_trip_and_phase1_chat_remain_separate(client: TestClient, pro
     provider.push(make_result("结果是 437"))
     created = client.post(
         "/api/v1/agents/runs",
+        headers=AGENT_HEADERS,
         json={"message": "计算 23 * 19", "prompt_name": "calculator"},
     )
     assert created.status_code == 200
@@ -63,17 +71,20 @@ def test_tool_round_trip_and_phase1_chat_remain_separate(client: TestClient, pro
 def test_client_cannot_submit_tools_or_raise_limits(client: TestClient, provider: FakeProvider) -> None:
     rejected = client.post(
         "/api/v1/agents/runs",
+        headers=AGENT_HEADERS,
         json={"message": "计算", "prompt_name": "calculator", "tools": [{"name": "shell"}], "handler": "os.system"},
     )
     assert rejected.status_code == 422
     widened = client.post(
         "/api/v1/agents/runs",
+        headers=AGENT_HEADERS,
         json={"message": "计算", "prompt_name": "calculator", "policy": {"max_steps": 100}},
     )
     assert widened.status_code == 422
     assert widened.json()["error"]["code"] == "AGENT_POLICY_INVALID"
     missing = client.post(
         "/api/v1/agents/runs",
+        headers=AGENT_HEADERS,
         json={"message": "计算", "prompt_name": "calculator", "allowed_tools": ["shell"]},
     )
     assert missing.status_code == 403
@@ -85,10 +96,11 @@ def test_sse_delivers_terminal_without_reasoning(client: TestClient, provider: F
     provider.push(make_result("流式终态", reasoning="secret-thought"))
     created = client.post(
         "/api/v1/agents/runs",
+        headers=AGENT_HEADERS,
         json={"message": "只回答", "prompt_name": "default"},
     )
     task_id = created.json()["task_id"]
-    with client.stream("GET", f"/api/v1/agents/runs/{task_id}/events") as response:
+    with client.stream("GET", f"/api/v1/agents/runs/{task_id}/events", headers=AGENT_HEADERS) as response:
         assert response.status_code == 200
         assert response.headers["content-type"].startswith("text/event-stream")
         payload = response.read().decode("utf-8")
@@ -120,6 +132,7 @@ def _assert_deadline_and_cancel(client: TestClient, provider: FakeProvider, rele
     provider.create_chat_completion = slow  # type: ignore[method-assign]
     created = client.post(
         "/api/v1/agents/runs",
+        headers=AGENT_HEADERS,
         json={
             "message": "慢请求",
             "prompt_name": "calculator",
@@ -142,16 +155,17 @@ def _assert_deadline_and_cancel(client: TestClient, provider: FakeProvider, rele
     provider.create_chat_completion = blocked  # type: ignore[method-assign]
     running = client.post(
         "/api/v1/agents/runs",
+        headers=AGENT_HEADERS,
         json={"message": "请取消", "prompt_name": "calculator"},
     )
     task_id = running.json()["task_id"]
     assert entered.wait(timeout=2)
-    still_running = client.get(f"/api/v1/agents/runs/{task_id}").json()
+    still_running = client.get(f"/api/v1/agents/runs/{task_id}", headers=AGENT_HEADERS).json()
     assert still_running["status"] in {"created", "running"}
-    cancelled = client.post(f"/api/v1/agents/runs/{task_id}/cancel")
+    cancelled = client.post(f"/api/v1/agents/runs/{task_id}/cancel", headers=AGENT_HEADERS)
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "cancelled"
-    repeated = client.post(f"/api/v1/agents/runs/{task_id}/cancel")
+    repeated = client.post(f"/api/v1/agents/runs/{task_id}/cancel", headers=AGENT_HEADERS)
     assert repeated.json()["status"] == "cancelled"
     release.set()
     missing = client.get("/api/v1/agents/runs/not a task")
@@ -208,6 +222,7 @@ def test_default_agent_response_matches_m3_fields(client: TestClient, provider: 
     provider.push(make_result("原样回答"))
     created = client.post(
         "/api/v1/agents/runs",
+        headers=AGENT_HEADERS,
         json={"message": "只回答", "prompt_name": "default"},
     )
     assert created.status_code == 200
@@ -221,18 +236,21 @@ def test_default_agent_response_matches_m3_fields(client: TestClient, provider: 
 def test_unknown_and_offline_toolsets_use_new_error_codes(client: TestClient) -> None:
     unknown = client.post(
         "/api/v1/agents/runs",
+        headers=AGENT_HEADERS,
         json={"message": "搜索", "prompt_name": "default", "toolsets": ["nope"]},
     )
     assert unknown.status_code == 422
     assert unknown.json()["error"]["code"] == "TOOLSET_UNKNOWN"
     disabled = client.post(
         "/api/v1/agents/runs",
+        headers=AGENT_HEADERS,
         json={"message": "搜索", "prompt_name": "default", "toolsets": ["mcp"]},
     )
     assert disabled.status_code == 403
     assert disabled.json()["error"]["code"] == "TOOLSET_UNAVAILABLE"
     offline = client.post(
         "/api/v1/agents/runs",
+        headers=AGENT_HEADERS,
         json={"message": "搜索", "prompt_name": "default", "toolsets": ["research"]},
     )
     assert offline.status_code == 403

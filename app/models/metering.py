@@ -47,6 +47,9 @@ class LlmUsageRecord(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         ForeignKey("users.id", name="fk_llm_usage_user_id", ondelete="CASCADE"),
         nullable=False,
     )
+    trace_id: Mapped[str | None] = mapped_column(String(64))
+    span_id: Mapped[str | None] = mapped_column(String(64))
+    parent_span_id: Mapped[str | None] = mapped_column(String(64))
     conversation_id: Mapped[str | None] = mapped_column(String(128))
     message_id: Mapped[str | None] = mapped_column(String(128))
     task_id: Mapped[str | None] = mapped_column(String(128))
@@ -115,6 +118,9 @@ class ToolUsageRecord(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         ForeignKey("users.id", name="fk_tool_usage_user_id", ondelete="CASCADE"),
         nullable=False,
     )
+    trace_id: Mapped[str | None] = mapped_column(String(64))
+    span_id: Mapped[str | None] = mapped_column(String(64))
+    parent_span_id: Mapped[str | None] = mapped_column(String(64))
     llm_usage_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("llm_usage_records.id", name="fk_tool_usage_llm_id", ondelete="SET NULL"),
@@ -146,6 +152,9 @@ class SkillUsageRecord(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         ForeignKey("users.id", name="fk_skill_usage_user_id", ondelete="CASCADE"),
         nullable=False,
     )
+    trace_id: Mapped[str | None] = mapped_column(String(64))
+    span_id: Mapped[str | None] = mapped_column(String(64))
+    parent_span_id: Mapped[str | None] = mapped_column(String(64))
     llm_usage_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("llm_usage_records.id", name="fk_skill_usage_llm_id", ondelete="SET NULL"),
@@ -180,6 +189,7 @@ class QuotaTransaction(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         ForeignKey("users.id", name="fk_quota_tx_user_id", ondelete="CASCADE"),
         nullable=False,
     )
+    trace_id: Mapped[str | None] = mapped_column(String(64))
     llm_usage_id: Mapped[uuid.UUID | None] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("llm_usage_records.id", name="fk_quota_tx_llm_id", ondelete="SET NULL"),

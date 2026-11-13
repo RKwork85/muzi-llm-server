@@ -86,6 +86,10 @@ class Settings(BaseSettings):
     tools_sandbox_commands: str = ""
     tools_sandbox_timeout_seconds: float = Field(default=10, gt=0, le=20)
     tools_network_concurrency: int = Field(default=4, ge=1, le=8)
+    # 外部工具（web_search / web_fetch）货币成本换算成 token 的汇率基准：
+    # 1 token = TOKEN_PRICE_CNY 元。示例值 0.000001 表示 100 万 token = 1 元，
+    # 需按 DeepSeek 实际输入/输出加权价调整。
+    token_price_cny: str = Field(default="0.000001")
     agent_max_artifacts: int = Field(default=5, ge=1, le=8)
     agent_max_artifact_chars: int = Field(default=20000, ge=256, le=20000)
     web_tools_max_retries: int = Field(default=0, ge=0, le=1)

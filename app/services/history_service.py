@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
@@ -32,6 +33,7 @@ _IMAGE_CONTENT_TYPES = {
 }
 
 # 消息里额外落进 planning JSONB 的字段（其余字段走显式列）。
+_RUN_ID = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 _PLANNING_KEYS = (
     "generating_images",
     "gen_image_error",
@@ -289,6 +291,12 @@ def _split_messages(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(message, dict):
             continue
         planning = {key: message[key] for key in _PLANNING_KEYS if key in message}
+        run_id = message.get("chatRunId")
+        if isinstance(run_id, str) and _RUN_ID.fullmatch(run_id):
+            planning["chatRunId"] = run_id
+        server_run_id = message.get("serverRunId")
+        if isinstance(server_run_id, str) and _RUN_ID.fullmatch(server_run_id):
+            planning["serverRunId"] = server_run_id
         out.append(
             {
                 "seq": index,

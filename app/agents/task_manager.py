@@ -16,6 +16,7 @@ from app.core.exceptions import AgentTaskLimitError, AgentTaskNotFoundError
 class TaskRecord:
     task_id: str
     request_id: str
+    owner_id: str | None = None
     status: TaskStatus = TaskStatus.CREATED
     answer: str | None = None
     steps: int = 0
@@ -60,14 +61,14 @@ class TaskManager:
         for task_id in expired:
             del self._tasks[task_id]
 
-    def create(self, request_id: str, *, task_id: str | None = None) -> TaskRecord:
+    def create(self, request_id: str, *, task_id: str | None = None, owner_id: str | None = None) -> TaskRecord:
         self.cleanup()
         if self.active_count() >= self._max_active:
             raise AgentTaskLimitError()
         task_id = task_id or secrets.token_urlsafe(16)
         if task_id in self._tasks:
             raise AgentTaskLimitError()
-        record = TaskRecord(task_id=task_id, request_id=request_id)
+        record = TaskRecord(task_id=task_id, request_id=request_id, owner_id=owner_id)
         self._tasks[task_id] = record
         return record
 

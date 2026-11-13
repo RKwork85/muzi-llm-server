@@ -8,7 +8,7 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import func, select
 
 from app.authorization.application.audit_service import AuditService, QuotaService
@@ -17,7 +17,7 @@ from app.authorization.application.role_service import RoleService, UserPermissi
 from app.authorization.dependencies import require_permission
 from app.authorization.domain.catalog import max_role_rank
 from app.core.database.deps import DbSession
-from app.core.exceptions import HierarchyDeniedError, UserNotFoundError
+from app.core.exceptions import CannotDeleteSelfError, HierarchyDeniedError, UserNotFoundError
 from app.models.rbac import Permission, Role, UserRole
 from app.models.tables import User
 from app.schemas.rbac import (
@@ -37,6 +37,7 @@ from app.schemas.rbac import (
     UserStatusUpdate,
 )
 from app.services.auth_service import AuthService
+from app.services.user_cleanup_service import UserCleanupService
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -154,13 +155,18 @@ async def set_user_roles(
     return await _user_admin_out(session, user, AuthorizationService(session))
 
 
-@router.post("/users/{user_id}/reset-password", status_code=204, summary="重置用户密码")
+@router.post(
+    "/users/{user_id}/reset-password",
+    status_code=204,
+    response_class=Response,
+    summary="重置用户密码",
+)
 async def reset_user_password(
     user_id: uuid.UUID,
     body: UserPasswordReset,
     session: DbSession,
     actor: Annotated[User, Depends(require_permission("user.manage"))],
-) -> None:
+) -> Response:
     user = await session.get(User, user_id)
     if user is None:
         raise UserNotFoundError()
@@ -172,6 +178,7 @@ async def reset_user_password(
         outcome="success",
     )
     await session.flush()
+    return Response(status_code=204)
 
 
 @router.put("/users/{user_id}/permissions", response_model=UserAdminOut, summary="用户直接授权或拒绝")
@@ -195,6 +202,80 @@ async def set_user_permissions(
     )
     await session.flush()
     return await _user_admin_out(session, user, AuthorizationService(session))
+
+
+# ---------------------------------------------------------------------------
+# 删除用户相关数据
+# ---------------------------------------------------------------------------
+
+@router.delete("/users/{user_id}", status_code=204, response_class=Response, summary="删除用户及其全部数据")
+async def delete_user(
+    user_id: uuid.UUID,
+    session: DbSession,
+    actor: Annotated[User, Depends(require_permission("user.delete"))],
+) -> Response:
+    if actor.id == user_id:
+        raise CannotDeleteSelfError()
+    target = await session.get(User, user_id)
+    if target is None:
+        raise UserNotFoundError()
+    await _guard_last_super_admin(session, target)
+    await _guard_hierarchy(session, actor, target)
+    # 删除前先记录审计：subject_id 仍有效；删除用户后该外键会被置空，详情保存在 context。
+    await AuditService(session).record(
+        actor.id,
+        "user_delete",
+        subject_id=user_id,
+        outcome="success",
+        context={"email": target.email, "username": target.username},
+    )
+    await UserCleanupService(session).delete_user(user_id)
+    await session.flush()
+    return Response(status_code=204)
+
+
+@router.delete("/users/{user_id}/conversations", status_code=204, response_class=Response, summary="删除用户对话数据")
+async def delete_user_conversations(
+    user_id: uuid.UUID,
+    session: DbSession,
+    actor: Annotated[User, Depends(require_permission("user.delete"))],
+) -> Response:
+    target = await session.get(User, user_id)
+    if target is None:
+        raise UserNotFoundError()
+    await _guard_hierarchy(session, actor, target)
+    stats = await UserCleanupService(session).delete_conversations(user_id)
+    await AuditService(session).record(
+        actor.id,
+        "user_conversations_delete",
+        subject_id=user_id,
+        outcome="success",
+        context={"email": target.email, **stats},
+    )
+    await session.flush()
+    return Response(status_code=204)
+
+
+@router.delete("/users/{user_id}/quotas", status_code=204, response_class=Response, summary="删除用户额度信息")
+async def delete_user_quota(
+    user_id: uuid.UUID,
+    session: DbSession,
+    actor: Annotated[User, Depends(require_permission("quota.manage"))],
+) -> Response:
+    target = await session.get(User, user_id)
+    if target is None:
+        raise UserNotFoundError()
+    await _guard_hierarchy(session, actor, target)
+    stats = await UserCleanupService(session).delete_quota(user_id)
+    await AuditService(session).record(
+        actor.id,
+        "user_quota_delete",
+        subject_id=user_id,
+        outcome="success",
+        context={"email": target.email, **stats},
+    )
+    await session.flush()
+    return Response(status_code=204)
 
 
 # ---------------------------------------------------------------------------
@@ -240,16 +321,17 @@ async def update_role(
     return RoleOut.model_validate(role)
 
 
-@router.delete("/roles/{role_id}", status_code=204, summary="删除角色")
+@router.delete("/roles/{role_id}", status_code=204, response_class=Response, summary="删除角色")
 async def delete_role(
     role_id: uuid.UUID,
     session: DbSession,
     actor: Annotated[User, Depends(require_permission("role.manage"))],
-) -> None:
+) -> Response:
     role = await RoleService(session).get_role(role_id)
     await RoleService(session).delete_role(role_id)
     await AuditService(session).record(actor.id, "role_delete", context={"code": role.code})
     await session.flush()
+    return Response(status_code=204)
 
 
 @router.get("/roles/{role_id}/permissions", response_model=list[str], summary="查看角色权限")
@@ -410,7 +492,7 @@ async def adjust_quota(
 # 保护性校验
 # ---------------------------------------------------------------------------
 
-async def _guard_quota_scope(session: DbSession, actor: User, target: User) -> None:
+async def _guard_hierarchy(session: DbSession, actor: User, target: User) -> None:
     """分级控制：操作者最高角色等级必须不低于目标用户最高角色等级。
 
     super_admin（等级 100）可控制所有角色；admin（80）可控制 admin 及以下；
@@ -421,6 +503,11 @@ async def _guard_quota_scope(session: DbSession, actor: User, target: User) -> N
     target_roles = await authz.get_user_roles(target.id)
     if max_role_rank(list(actor_roles)) < max_role_rank(list(target_roles)):
         raise HierarchyDeniedError()
+
+
+async def _guard_quota_scope(session: DbSession, actor: User, target: User) -> None:
+    """分级控制（额度场景），复用通用分级校验。"""
+    await _guard_hierarchy(session, actor, target)
 
 
 async def _guard_last_super_admin(session: DbSession, user: User) -> None:

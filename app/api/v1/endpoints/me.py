@@ -23,7 +23,9 @@ from app.schemas.rbac import MeResponse, QuotaSummary, UsageListResponse, UsageR
 from app.services.avatar_service import AvatarService
 from app.authorization.application.audit_service import QuotaService
 from app.authorization.application.usage_turns import load_usage_analysis
-from app.core.exceptions import InvalidRequestError
+from app.authorization.application.chat_run_detail import load_chat_run_detail
+from app.core.exceptions import ChatRunNotFoundError, InvalidRequestError
+from app.schemas.chat_run import ChatRunDetailResponse
 from app.schemas.usage_analysis import UsageAnalysisResponse
 
 router = APIRouter(prefix="/me", tags=["me"])
@@ -240,6 +242,18 @@ async def update_preferences(
     user.preferences = preferences
     await session.flush()
     return _preferences_out(user)
+
+
+@router.get("/chat-runs/{run_id}", response_model=ChatRunDetailResponse, summary="读取我的一轮对话运行详情")
+async def get_my_chat_run(
+    run_id: str,
+    user: Annotated[User, Depends(get_authenticated_user)],
+    session: DbSession,
+) -> ChatRunDetailResponse:
+    detail = await load_chat_run_detail(session, user.id, run_id)
+    if detail is None:
+        raise ChatRunNotFoundError()
+    return detail
 
 
 @router.get("/avatar/status", response_model=AvatarStatusOut, summary="读取头像与剩余修改次数")

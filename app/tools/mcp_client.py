@@ -273,6 +273,10 @@ def _sync_tools(
             _required: list[str] = required,
             _properties: list[str] = properties,
         ) -> str:
+            from app.authorization.application.execution_guard import mcp_runtime_allowed
+
+            if not mcp_runtime_allowed():
+                raise PermissionError("mcp user denied")
             if _session.tools_changed:
                 await _session.refresh_tools()
             user = CURRENT_MCP_USER.get()

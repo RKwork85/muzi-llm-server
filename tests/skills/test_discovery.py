@@ -146,6 +146,20 @@ def test_disabled_skill_is_not_selected_and_load_rechecks(tmp_path: Path) -> Non
 
 
 def test_legacy_prompts_stay_in_place() -> None:
-    assert skill_notes(["research", "polish", "minutes", "weekly"], execute=True).startswith("已启用技能")
-    assert "深度研究" in skill_notes(["research"], execute=False)
+    """四条旧提示仍由 skill_notes 提供。v1.8 只把标题扩成插件/技能，正文和执行边界不变。"""
+    from app.prompts.skills import SKILL_INSTRUCTIONS
+
+    assert SKILL_INSTRUCTIONS["research"].startswith("深度研究：")
+    assert SKILL_INSTRUCTIONS["polish"].startswith("文案润色：")
+    assert SKILL_INSTRUCTIONS["minutes"].startswith("会议纪要：")
+    assert SKILL_INSTRUCTIONS["weekly"].startswith("周报生成：")
+    executing = skill_notes(["research", "polish", "minutes", "weekly"], execute=True)
+    assert executing.startswith("已启用插件/技能。按这些做法完成任务：")
+    assert "深度研究：" in executing
+    assert "文案润色：" in executing
+    assert "会议纪要：" in executing
+    assert "周报生成：" in executing
+    planning = skill_notes(["research"], execute=False)
+    assert planning.startswith("这些插件/技能只作为计划参考，不要执行其中的动作：")
+    assert "深度研究" in planning
     assert skill_notes(["unknown"], execute=True) == ""

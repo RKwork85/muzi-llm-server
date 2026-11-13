@@ -210,6 +210,23 @@ async def test_system_role_and_super_admin_protected(ready_database: Settings) -
         await session.rollback()
 
 
+async def test_set_role_permissions_rejects_over_rank(ready_database: Settings) -> None:
+    """低等级角色不能被授予超过其等级的管理权限。"""
+    del ready_database
+    factory = get_session_factory()
+    async with factory() as session:
+        service = RoleService(session)
+        member_id = await _role_id("member")
+        # member(40) 可配置基础权限
+        await service.set_role_permissions(member_id, {"chat.access", "ask.workspace.write"})
+        # member 不能被授予 user.create / role.manage 等管理权限
+        with pytest.raises(Exception):
+            await service.set_role_permissions(
+                member_id, {"chat.access", "user.create", "role.manage"}
+            )
+        await session.rollback()
+
+
 async def test_quota_consume_and_audit(ready_database: Settings) -> None:
     del ready_database
     user = await _create_user()

@@ -7,7 +7,12 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.authorization.domain.catalog import PERMISSION_BY_CODE, SUPER_ADMIN_ROLE_CODE
+from app.authorization.domain.catalog import (
+    PERMISSION_BY_CODE,
+    SUPER_ADMIN_ROLE_CODE,
+    permission_min_rank,
+    role_grant_rank,
+)
 from app.core.exceptions import RoleNotFoundError, SuperAdminProtectedError
 from app.models.rbac import (
     Permission,
@@ -87,6 +92,12 @@ class RoleService:
             from app.core.exceptions import InvalidRequestError
 
             raise InvalidRequestError(f"未知权限: {', '.join(sorted(unknown))}")
+        rank = role_grant_rank(role.code)
+        too_high = sorted(c for c in codes if permission_min_rank(c) > rank)
+        if too_high:
+            from app.core.exceptions import InvalidRequestError
+
+            raise InvalidRequestError(f"权限超出角色等级: {', '.join(too_high)}")
         perms = list(
             await self.session.scalars(select(Permission).where(Permission.code.in_(codes)))
         )
@@ -95,7 +106,8 @@ class RoleService:
         )
         for row in existing:
             await self.session.delete(row)
-        perm_by_id = {p.id: p for p in perms}
+        # 先落库删除，再插入，避免同 key 的 INSERT 先于 DELETE 触发唯一约束冲突。
+        await self.session.flush()
         for perm in perms:
             self.session.add(RolePermission(role_id=role_id, permission_id=perm.id))
         await self.session.flush()

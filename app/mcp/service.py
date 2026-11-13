@@ -646,6 +646,10 @@ class McpService:
             _required: list[str] = required,
             _properties: list[str] = properties,
         ) -> str:
+            from app.authorization.application.execution_guard import mcp_runtime_allowed
+
+            if not mcp_runtime_allowed():
+                raise PermissionError("mcp user denied")
             data = args.model_dump()
             if any(key not in data for key in _required):
                 raise ValueError("missing mcp argument")

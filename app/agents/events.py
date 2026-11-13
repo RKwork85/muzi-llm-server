@@ -32,6 +32,19 @@ _ALLOWED_FIELDS = frozenset(
         "prompt_tokens",
         "completion_tokens",
         "total_tokens",
+        "reasoning_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "model",
+        "provider",
+        "output_text",
+        "tool_call_id",
+        "duration_ms",
+        "external_requests",
+        "external_cost",
+        "external_tokens",
+        "currency",
+        "retry_count",
     }
 )
 _MAX_VALUE = 120

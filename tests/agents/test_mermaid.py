@@ -23,6 +23,12 @@ from app.tools.local_tools import DateDiffArgs, FormatJsonArgs, TextStatsArgs, d
 from app.tools.registry import build_agent_registry, build_default_registry
 from tests.conftest import make_settings
 from tests.fakes import FakeProvider, make_result, make_tool_call
+from tests.support_agent_access import AGENT_HEADERS, allow_legacy_agent_api
+
+
+@pytest.fixture(autouse=True)
+def _legacy_agent_api(monkeypatch) -> None:
+    allow_legacy_agent_api(monkeypatch)
 
 
 def _flow(**overrides: object) -> FlowchartArgs:
@@ -193,13 +199,14 @@ def test_diagram_artifact_round_trip(provider: FakeProvider) -> None:
     with TestClient(app) as client:
         created = client.post(
             "/api/v1/agents/runs",
+            headers=AGENT_HEADERS,
             json={"message": "画登录流程", "prompt_name": "default", "toolsets": ["diagram"]},
         )
         assert created.status_code == 200
         task_id = created.json()["task_id"]
         finished = None
         for _ in range(40):
-            response = client.get(f"/api/v1/agents/runs/{task_id}")
+            response = client.get(f"/api/v1/agents/runs/{task_id}", headers=AGENT_HEADERS)
             body = response.json()
             if body["status"] in {"completed", "failed", "cancelled", "limit_reached"}:
                 finished = body
@@ -210,7 +217,7 @@ def test_diagram_artifact_round_trip(provider: FakeProvider) -> None:
         assert finished["artifacts"][0]["type"] == "mermaid"
         assert finished["artifacts"][0]["content"].startswith("flowchart TB\n")
         assert "n1[" in finished["artifacts"][0]["content"]
-        with client.stream("GET", f"/api/v1/agents/runs/{task_id}/events") as stream:
+        with client.stream("GET", f"/api/v1/agents/runs/{task_id}/events", headers=AGENT_HEADERS) as stream:
             raw = stream.read().decode("utf-8")
     assert "artifact_type" in raw
     assert "flowchart TB" not in raw
@@ -229,12 +236,13 @@ def test_default_request_cannot_call_diagram(provider: FakeProvider) -> None:
     with TestClient(app) as client:
         created = client.post(
             "/api/v1/agents/runs",
+            headers=AGENT_HEADERS,
             json={"message": "画图", "prompt_name": "default"},
         )
         task_id = created.json()["task_id"]
         finished = None
         for _ in range(40):
-            body = client.get(f"/api/v1/agents/runs/{task_id}").json()
+            body = client.get(f"/api/v1/agents/runs/{task_id}", headers=AGENT_HEADERS).json()
             if body["status"] in {"completed", "failed", "cancelled", "limit_reached"}:
                 finished = body
                 break

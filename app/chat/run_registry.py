@@ -36,5 +36,12 @@ class ChatRunRegistry:
             run.task.cancel()
             return True
 
+    async def is_active(self, run_id: str, owner_id: str) -> bool:
+        async with self._lock:
+            run = self._runs.get(run_id)
+            if run is None or run.owner_id != owner_id:
+                return False
+            return not run.task.done()
+
 
 chat_run_registry = ChatRunRegistry()

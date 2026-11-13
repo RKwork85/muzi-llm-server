@@ -266,6 +266,12 @@ class SuperAdminProtectedError(AppError):
     default_message = "不能修改或移除最后一个有效的超级管理员"
 
 
+class CannotDeleteSelfError(AppError):
+    code = "CANNOT_DELETE_SELF"
+    status_code = 409
+    default_message = "不能删除当前登录的账号"
+
+
 class ConnectorNotFoundError(AppError):
     code = "CONNECTOR_NOT_FOUND"
     status_code = 404
@@ -288,6 +294,24 @@ class AgentTaskNotFoundError(AppError):
     code = "AGENT_TASK_NOT_FOUND"
     status_code = 404
     default_message = "未找到指定任务"
+
+
+class ChatRunNotFoundError(AppError):
+    code = "CHAT_RUN_NOT_FOUND"
+    status_code = 404
+    default_message = "未找到指定运行"
+
+
+class AskRunConflictError(AppError):
+    code = "ASK_RUN_CONFLICT"
+    status_code = 409
+    default_message = "该客户端运行标识已用于另一轮对话"
+
+
+class AskRunInProgressError(AppError):
+    code = "ASK_RUN_IN_PROGRESS"
+    status_code = 409
+    default_message = "同一请求仍在运行，未开始第二轮"
 
 
 class AgentTaskLimitError(AppError):

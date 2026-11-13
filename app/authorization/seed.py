@@ -9,16 +9,17 @@ import logging
 import os
 import uuid
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.authorization.domain.catalog import (
     BUILTIN_ROLES,
+    LEGACY_TOOL_PERMISSION_CODES,
     MEMBER_ROLE_CODE,
     PERMISSION_CATALOG,
     SUPER_ADMIN_ROLE_CODE,
 )
-from app.models.rbac import Permission, Role, RolePermission, UserRole
+from app.models.rbac import Permission, Role, RolePermission, UserPermission, UserRole
 
 logger = logging.getLogger("muzi_llm")
 
@@ -42,6 +43,29 @@ async def seed_permissions(session: AsyncSession) -> None:
             )
         )
     await session.flush()
+    await _drop_legacy_tool_permissions(session)
+
+
+async def _drop_legacy_tool_permissions(session: AsyncSession) -> None:
+    """删除无模式前缀的旧工具执行权限码（已拆分为 mode.resource.action）。"""
+    legacy_ids = list(
+        await session.scalars(
+            select(Permission.id).where(Permission.code.in_(LEGACY_TOOL_PERMISSION_CODES))
+        )
+    )
+    if not legacy_ids:
+        return
+    await session.execute(
+        delete(RolePermission).where(RolePermission.permission_id.in_(legacy_ids))
+    )
+    await session.execute(
+        delete(UserPermission).where(UserPermission.permission_id.in_(legacy_ids))
+    )
+    await session.execute(
+        delete(Permission).where(Permission.id.in_(legacy_ids))
+    )
+    await session.flush()
+    logger.info("dropped legacy tool permissions: %s", sorted(LEGACY_TOOL_PERMISSION_CODES))
 
 
 async def seed_roles(session: AsyncSession) -> None:

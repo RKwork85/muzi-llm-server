@@ -239,7 +239,7 @@ class SqlPlanningStore:
             timeout_seconds=settings.deepseek_timeout_seconds,
         )
         proposal = await engine.propose(goal=current.goal, user_message=message, plan=current, history=history)
-        await self._settle_plan(owner, engine, plan_id, current.revision)
+        await self._settle_plan(owner, engine, plan_id, current.revision, str(row.conversation_id))
         InteractionOrchestrator().enforce(proposal, current)
         updated, interaction = await self.apply_proposal(plan_id, owner, current, proposal)
         conversation = await self._conversation(str(row.conversation_id), owner.id)
@@ -293,7 +293,7 @@ class SqlPlanningStore:
                 elif event == "done":
                     proposal = payload
         finally:
-            await self._settle_plan(owner, engine, plan_id, current.revision)
+            await self._settle_plan(owner, engine, plan_id, current.revision, str(row.conversation_id))
         if proposal is None:
             return
 
@@ -309,20 +309,97 @@ class SqlPlanningStore:
             yield format_sse("interaction", {"interaction": interaction.model_dump(mode="json")})
         yield format_sse("done", {"plan": updated.model_dump(mode="json"), "response": proposal.response or ""})
 
-    async def _settle_plan(self, owner: User, engine, plan_id: str, revision: int) -> None:
+    async def _settle_plan(
+        self,
+        owner: User,
+        engine,
+        plan_id: str,
+        revision: int,
+        conversation_id: str | None = None,
+    ) -> None:
         from app.authorization.application.audit_service import QuotaService
         from app.core.context import get_request_id
 
+        request_id = get_request_id()
+        settlement_key = f"{request_id}:{plan_id}:{revision}"
+        amount = engine.total_tokens
         await QuotaService(self._session).settle(
             owner.id,
             source="planning",
-            settlement_key=f"{get_request_id()}:{plan_id}:{revision}",
-            amount=engine.total_tokens,
+            settlement_key=settlement_key,
+            amount=amount,
             kind="chat",
             model=engine._model,
             prompt_tokens=engine.prompt_tokens,
             completion_tokens=engine.completion_tokens,
             extra={"plan_id": plan_id, "revision": revision},
+            trace_id=plan_id,
+        )
+        await self._persist_plan_meter(
+            owner,
+            engine,
+            plan_id,
+            revision,
+            settlement_key,
+            request_id,
+            amount,
+            conversation_id,
+        )
+
+    async def _persist_plan_meter(
+        self,
+        owner: User,
+        engine,
+        plan_id: str,
+        revision: int,
+        settlement_key: str,
+        request_id: str,
+        amount: int,
+        conversation_id: str | None,
+    ) -> None:
+        from app.core.config import get_settings
+        from app.metering.attribute import build_meter
+        from app.metering.persist import persist_meters
+        from app.metering.trace import new_span_id
+        from app.providers.base import UsageStats
+
+        usage = UsageStats(
+            prompt_tokens=engine.prompt_tokens,
+            completion_tokens=engine.completion_tokens,
+            total_tokens=engine.total_tokens,
+            reasoning_tokens=engine.reasoning_tokens or None,
+            cache_read_tokens=engine.cache_read_tokens or None,
+            cache_write_tokens=engine.cache_write_tokens or None,
+        )
+        meter = build_meter(
+            provider_name=get_settings().llm_provider,
+            model=engine._model,
+            runtime_mode="plan",
+            usage_source="planning",
+            status="completed",
+            usage=usage,
+            messages=engine.last_messages,
+            tools=None,
+            system_text="",
+            developer_text="",
+            skill_text="",
+            skill_refs=None,
+            output_text=engine.last_output_text,
+            tool_calls=[],
+            structured=True,
+        )
+        meter["trace_id"] = plan_id
+        meter["span_id"] = new_span_id()
+        meter["parent_span_id"] = None
+        await persist_meters(
+            self._session,
+            owner.id,
+            settlement_key,
+            [meter],
+            conversation_id=conversation_id,
+            quota_amount=max(0, amount),
+            request_id=request_id,
+            trace_id=plan_id,
         )
 
     async def apply_proposal(

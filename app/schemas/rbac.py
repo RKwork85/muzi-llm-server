@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from app.schemas.auth import UserOut
 
@@ -20,6 +20,20 @@ class PermissionOut(BaseModel):
     action: str
     description: str | None = None
     is_system: bool = False
+    mode: str = ""  # 工具执行权限的工作模式（ask/plan/agent）；功能权限为空
+    min_rank: int = 0  # 可授予该权限的最小角色等级
+
+    @model_validator(mode="after")
+    def _derive(self) -> "PermissionOut":
+        if not self.mode:
+            prefix = self.code.split(".")[0]
+            if prefix in {"ask", "plan", "agent"}:
+                self.mode = prefix
+        if not self.min_rank:
+            from app.authorization.domain.catalog import permission_min_rank
+
+            self.min_rank = permission_min_rank(self.code)
+        return self
 
 
 class RoleOut(BaseModel):
@@ -31,6 +45,15 @@ class RoleOut(BaseModel):
     description: str | None = None
     is_system: bool = False
     status: str
+    rank: int = 0  # 角色等级，用于权限可配置范围
+
+    @model_validator(mode="after")
+    def _derive_rank(self) -> "RoleOut":
+        if not self.rank:
+            from app.authorization.domain.catalog import role_grant_rank
+
+            self.rank = role_grant_rank(self.code)
+        return self
 
 
 class RoleCreate(BaseModel):

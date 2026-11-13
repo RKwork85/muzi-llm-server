@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from pathlib import Path
 
 from app.agents.policy import PolicyError, basic_tool_names
+from app.authorization.application.execution_guard import mode_permission_code
 from app.core.config import ROOT, Settings
 from app.data.store import store_is_ready
 from app.tools.capabilities import AGENT_GRANT_BY_TOOL, ASK_TOOLS, PLAN_TOOLS, SKILL_TOOL_NAMES
@@ -69,9 +71,11 @@ def agent_tool_names(
     toolsets: list[str] | None,
     grants: list[str] | None,
     user_id: str | None = None,
+    permissions: Collection[str] | None = None,
 ) -> tuple[str, ...]:
-    """Agent 默认可使用共享只读能力。写入、删除和命令必须带用户授权。"""
+    """grants 只表达请求意图。危险工具还要服务端权限，不能单凭请求放行。"""
     grant_set = set(grants or [])
+    permission_set = None if permissions is None else set(permissions)
     if toolsets is None:
         names = [
             spec.name
@@ -91,6 +95,9 @@ def agent_tool_names(
             continue
         spec = registry.get(tool)
         if spec is None or spec.risk_level != "low":
+            continue
+        required = mode_permission_code("agent", spec.access)
+        if required is None or permission_set is None or required not in permission_set:
             continue
         if selected is not None and spec.toolset not in selected:
             continue

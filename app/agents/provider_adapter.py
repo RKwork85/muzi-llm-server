@@ -105,6 +105,9 @@ def normalize_completion(result: CompletionResult) -> NormalizedCompletion:
             prompt_tokens=max(0, int(result.usage.prompt_tokens)),
             completion_tokens=max(0, int(result.usage.completion_tokens)),
             total_tokens=max(0, int(result.usage.total_tokens)),
+            reasoning_tokens=_opt_int(result.usage.reasoning_tokens),
+            cache_read_tokens=_opt_int(result.usage.cache_read_tokens),
+            cache_write_tokens=_opt_int(result.usage.cache_write_tokens),
         )
     content = result.content if isinstance(result.content, str) else None
     reasoning = result.reasoning_content if isinstance(result.reasoning_content, str) else None
@@ -120,6 +123,12 @@ def normalize_completion(result: CompletionResult) -> NormalizedCompletion:
 def _normalize_call(call: ToolCall) -> NormalizedToolCall:
     arguments = call.arguments if isinstance(call.arguments, str) else ""
     return NormalizedToolCall(str(call.id or ""), str(call.name or ""), arguments)
+
+
+def _opt_int(value: int | None) -> int | None:
+    if value is None:
+        return None
+    return max(0, int(value))
 
 
 def _failure_from_exception(exc: Exception) -> ProviderFailure:

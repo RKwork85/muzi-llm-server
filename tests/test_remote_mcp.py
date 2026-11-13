@@ -10,6 +10,13 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+
+from tests.support_agent_access import allow_legacy_agent_api
+
+
+@pytest.fixture(autouse=True)
+def _legacy_agent_api(monkeypatch) -> None:
+    allow_legacy_agent_api(monkeypatch)
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response, StreamingResponse

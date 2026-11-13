@@ -15,13 +15,16 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.models import AgentEventType, AgentRequest, EventEnvelope
+from app.agents.task_manager import TaskRecord
+from app.api.agent_access import authenticate_request_user, require_agent_operator
+from app.authorization.application.execution_guard import CURRENT_EXECUTION, load_execution_context
 from app.authorization.application.audit_service import QuotaService
 from app.authorization.application.quota_bridge import quota_event_observer
 from app.agents.runtime import AgentRuntime
 from app.api.deps import get_agent_runtime
 from app.api.v1.endpoints.mcp import optional_mcp
 from app.mcp.service import McpService
-from app.core.exceptions import AgentTaskNotFoundError
+from app.core.exceptions import AgentTaskNotFoundError, DatabaseUnavailableError
 from app.core.context import get_request_id
 from app.core.sse import format_sse
 from app.schemas.agents import AgentTaskResponse
@@ -57,6 +60,7 @@ async def create_run(
     mcp: McpService | None = Depends(optional_mcp),
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_optional_bearer)] = None,
 ) -> AgentTaskResponse:
+    owner = await require_agent_operator(credentials)
     user_id = await mcp.user_id_from_request(request) if mcp is not None else None
     if mcp is not None and user_id is not None:
         from app.mcp.grants import sync_stdio
@@ -65,21 +69,13 @@ async def create_run(
     request_id = get_request_id()
     task_id = None
     event_observer = None
-    owner = None
+    factory = None
     if body.conversation_id:
-        if credentials is None:
-            raise LoginRequiredError()
         try:
             factory = get_session_factory()
         except RuntimeError:
-            raise LoginRequiredError() from None
+            raise DatabaseUnavailableError() from None
         async with factory() as session:
-            owner = await AuthService(session).user_for_token(credentials.credentials)
-            if owner is None:
-                raise LoginRequiredError()
-            from app.authorization.application.authorization_service import AuthorizationService
-
-            await AuthorizationService(session).require_permission(owner.id, "agent.execute")
             try:
                 conversation = await SqlPlanningStore(session)._conversation(body.conversation_id, owner.id)
             except PlanningNotFound:
@@ -115,51 +111,53 @@ async def create_run(
         )
     quota_user_id = None
     if getattr(request.app.state, "database_ready", False):
-        if owner is None:
-            if credentials is None:
-                raise LoginRequiredError()
-            try:
-                factory = get_session_factory()
-            except RuntimeError:
-                raise LoginRequiredError() from None
-            async with factory() as session:
-                owner = await AuthService(session).user_for_token(credentials.credentials)
-                if owner is None:
-                    raise LoginRequiredError()
-                await QuotaService(session).authorize(owner.id)
-                await session.commit()
-        else:
-            async with factory() as session:
-                await QuotaService(session).authorize(owner.id)
-                await session.commit()
+        try:
+            quota_factory = factory or get_session_factory()
+        except RuntimeError:
+            raise DatabaseUnavailableError() from None
+        async with quota_factory() as session:
+            await QuotaService(session).authorize(owner.id)
+            await session.commit()
         quota_user_id = str(owner.id)
     observer = quota_event_observer(event_observer, quota_user_id, task_id or request_id)
+    workspace_scope = scope_dirname(request.headers.get("x-workspace-key"))
+    execution = await load_execution_context(
+        str(owner.id),
+        runtime_mode="agent",
+        run_id=task_id,
+        conversation_id=body.conversation_id,
+        workspace_scope=workspace_scope,
+    )
+    token = CURRENT_EXECUTION.set(execution)
     try:
         view = await runtime.start(
             body,
             request_id,
-            workspace_scope=scope_dirname(request.headers.get("x-workspace-key")),
+            workspace_scope=workspace_scope,
             mcp_user_id=user_id,
             mcp_service=mcp,
             task_id=task_id,
             event_observer=observer,
+            owner_id=str(owner.id),
         )
     except Exception:
         if task_id:
             async with factory() as session:
                 task = await session.get(AgentTask, uuid.UUID(hex=task_id))
-                execution = await session.scalar(
+                execution_row = await session.scalar(
                     select(TaskExecution).where(TaskExecution.task_id == uuid.UUID(hex=task_id))
                 )
                 if task is not None:
                     task.status = "failed"
                     task.error_code = "AGENT_START_FAILED"
-                if execution is not None:
-                    execution.status = "failed"
-                    execution.error_code = "AGENT_START_FAILED"
-                    execution.finished_at = datetime.now(UTC)
+                if execution_row is not None:
+                    execution_row.status = "failed"
+                    execution_row.error_code = "AGENT_START_FAILED"
+                    execution_row.finished_at = datetime.now(UTC)
                 await session.commit()
         raise
+    finally:
+        CURRENT_EXECUTION.reset(token)
     return AgentTaskResponse.model_validate(view)
 
 
@@ -170,12 +168,13 @@ async def read_run(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_optional_bearer)] = None,
 ) -> AgentTaskResponse:
     _known_task(task_id)
-    await _verify_persisted_owner(task_id, credentials)
-    try:
-        return AgentTaskResponse.model_validate(runtime.get(task_id))
-    except AgentTaskNotFoundError:
-        async with await _owned_persisted_task(task_id, credentials) as persisted:
-            return AgentTaskResponse.model_validate(persisted.payload)
+    actor_id = await authenticate_request_user(credentials)
+    record = _owned_memory_task(runtime, task_id, actor_id)
+    if record is not None:
+        return AgentTaskResponse.model_validate(record.view())
+    await _verify_persisted_owner(task_id, actor_id)
+    async with await _owned_persisted_task(task_id, credentials) as persisted:
+        return AgentTaskResponse.model_validate(persisted.payload)
 
 
 @router.post("/runs/{task_id}/cancel", response_model=AgentTaskResponse, summary="取消 Agent 运行")
@@ -185,7 +184,11 @@ async def cancel_run(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_optional_bearer)] = None,
 ) -> AgentTaskResponse:
     _known_task(task_id)
-    await _verify_persisted_owner(task_id, credentials)
+    actor_id = await authenticate_request_user(credentials)
+    if _owned_memory_task(runtime, task_id, actor_id) is not None:
+        view = await runtime.cancel(task_id)
+        return AgentTaskResponse.model_validate(view)
+    await _verify_persisted_owner(task_id, actor_id)
     try:
         view = await runtime.cancel(task_id)
     except AgentTaskNotFoundError:
@@ -238,7 +241,9 @@ async def stream_run(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_optional_bearer)] = None,
 ) -> StreamingResponse:
     _known_task(task_id)
-    await _verify_persisted_owner(task_id, credentials)
+    actor_id = await authenticate_request_user(credentials)
+    if _owned_memory_task(runtime, task_id, actor_id) is None:
+        await _verify_persisted_owner(task_id, actor_id)
     try:
         publisher = runtime.publisher_for(task_id)
     except AgentTaskNotFoundError:
@@ -257,6 +262,17 @@ async def stream_run(
 def _known_task(task_id: str) -> None:
     if not _TASK_ID.fullmatch(task_id):
         raise AgentTaskNotFoundError()
+
+
+def _owned_memory_task(runtime: AgentRuntime, task_id: str, actor_id: str) -> TaskRecord | None:
+    """内存任务按服务端记录的所有者比对，不看 task_id 是否为 UUID。"""
+    try:
+        record = runtime.tasks.get(task_id)
+    except AgentTaskNotFoundError:
+        return None
+    if record.owner_id != actor_id:
+        raise AgentTaskNotFoundError()
+    return record
 
 
 class _OwnedPersistedTask:
@@ -299,23 +315,18 @@ async def _owned_persisted_task(
     return _OwnedPersistedTask(session, payload)
 
 
-async def _verify_persisted_owner(
-    task_id: str,
-    credentials: HTTPAuthorizationCredentials | None,
-) -> None:
+async def _verify_persisted_owner(task_id: str, actor_id: str) -> None:
     try:
         task_uuid = uuid.UUID(task_id)
+    except ValueError:
+        raise AgentTaskNotFoundError() from None
+    try:
         factory = get_session_factory()
-    except (ValueError, RuntimeError):
-        return
+    except RuntimeError:
+        raise DatabaseUnavailableError() from None
     async with factory() as session:
         task = await session.get(AgentTask, task_uuid)
-        if task is None:
-            return
-        if credentials is None:
-            raise AgentTaskNotFoundError()
-        owner = await AuthService(session).user_for_token(credentials.credentials)
-        if owner is None or task.user_id != owner.id:
+        if task is None or str(task.user_id) != actor_id:
             raise AgentTaskNotFoundError()
 
 

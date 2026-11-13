@@ -96,14 +96,19 @@ class AgentRuntime:
         mcp_service: object | None = None,
         task_id: str | None = None,
         event_observer: Callable[[EventEnvelope], None] | None = None,
+        owner_id: str | None = None,
     ) -> dict[str, object]:
         try:
+            from app.authorization.application.execution_guard import CURRENT_EXECUTION
+
+            execution = CURRENT_EXECUTION.get()
             granted = agent_tool_names(
                 self._registry,
                 self._settings,
                 request.toolsets,
                 request.grants,
                 mcp_user_id,
+                permissions=None if execution is None else execution.effective_permissions,
             )
             remote: list = []
             want_remote = mcp_service is not None and mcp_user_id is not None
@@ -140,14 +145,17 @@ class AgentRuntime:
         if selected & {"research", "workspace", "data", "weather"} or set(granted) & sensitive:
             prompt = f"{prompt}\n\n{UNTRUSTED_PROMPT}"
         registry = overlay_tools(self._settings, self._registry, remote) if remote else self._registry
-        record = self._tasks.create(request_id, task_id=task_id)
+        record = self._tasks.create(request_id, task_id=task_id, owner_id=owner_id)
         record.publisher = EventPublisher(
             request_id=record.request_id,
             task_id=record.task_id,
             max_queue_size=policy.max_event_queue_size,
             observer=event_observer,
         )
-        prompt = self._apply_registered_skills(prompt, request, record.task_id, mcp_user_id)
+        prompt, skill_result = self._apply_registered_skills(prompt, request, record.task_id, mcp_user_id)
+        user_id_for_meter = owner_id or mcp_user_id
+        if skill_result is not None and user_id_for_meter:
+            await self._record_skill_usage(user_id_for_meter, record.task_id, skill_result)
         worker = asyncio.create_task(
             self._execute(record, request.message, prompt, policy, workspace_scope, mcp_user_id, registry),
             name=f"agent:{record.task_id}",
@@ -161,12 +169,12 @@ class AgentRuntime:
         request: AgentRequest,
         task_id: str,
         principal_id: str | None,
-    ) -> str:
+    ) -> tuple[str, Any | None]:
         if self.skill_runtime is None or not request.skill_mode:
-            return prompt
+            return prompt, None
         from app.skills.discovery_models import DiscoveryMode
 
-        updated, _result = self.skill_runtime.apply(  # type: ignore[attr-defined]
+        updated, result = self.skill_runtime.apply(  # type: ignore[attr-defined]
             prompt,
             principal_id=principal_id or "",
             task_id=task_id,
@@ -177,7 +185,44 @@ class AgentRuntime:
         )
         if principal_id:
             self._skill_principals[task_id] = principal_id
-        return updated
+        return updated, result
+
+    async def _record_skill_usage(self, user_id: str, task_id: str, result: Any) -> None:
+        """技能激活后写 SkillUsageRecord。指令 Token 用正文长度粗估。"""
+        if not result or not getattr(result, "activation_ids", None):
+            return
+        adapter = self.skill_runtime
+        if adapter is None:
+            return
+        orchestrator = getattr(adapter, "orchestrator", None)
+        if orchestrator is None:
+            return
+        store = getattr(orchestrator, "store", None)
+        if store is None:
+            return
+        principal = self._skill_principals.get(task_id) or user_id
+        snapshots = list(store.for_task(task_id, principal_id=principal))
+        if not snapshots:
+            return
+        from app.authorization.application.quota_bridge import record_skill_in_new_session
+        from app.metering.attribute import estimate_tokens
+
+        for snapshot in snapshots:
+            tokens = estimate_tokens(getattr(snapshot, "instruction_body", "") or "")
+            await record_skill_in_new_session(
+                user_id,
+                {
+                    "skill_execution_id": getattr(snapshot, "activation_id", ""),
+                    "skill_id": getattr(snapshot, "skill_id", ""),
+                    "skill_name": getattr(snapshot, "skill_name", ""),
+                    "skill_version": getattr(snapshot, "skill_version", ""),
+                    "instruction_tokens": tokens or None,
+                    "status": "completed",
+                    "duration_ms": int(getattr(result, "duration_ms", 0) or 0),
+                },
+                task_id=task_id,
+                trace_id=task_id,
+            )
 
     def get(self, task_id: str) -> dict[str, object]:
         return self._tasks.get(task_id).view()

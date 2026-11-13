@@ -7,6 +7,7 @@ from app.models import Base
 EXPECTED_TABLES = {
     "users",
     "user_credentials",
+    "ask_runs",
     "sessions",
     "messages",
     "agent_tasks",
@@ -51,6 +52,8 @@ EXPECTED_TABLES = {
 
 ON_DELETE = {
     ("user_credentials", "user_id"): "CASCADE",
+    ("ask_runs", "owner_id"): "RESTRICT",
+    ("ask_runs", "conversation_id"): "CASCADE",
     ("sessions", "user_id"): "RESTRICT",
     ("messages", "session_id"): "CASCADE",
     ("agent_tasks", "user_id"): "RESTRICT",

@@ -169,6 +169,7 @@ async def generate_images(
         image_count=image_count or None,
         extra=extra,
         meters=[meter] if meter else None,
+        trace_id=get_request_id(),
     )
     if not isinstance(payload, dict):
         return {}
@@ -257,6 +258,7 @@ async def stream_chat(
                 prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens,
                 meters=meters or None,
+                trace_id=request_id,
             )
 
     return StreamingResponse(proxy(), media_type="text/event-stream")

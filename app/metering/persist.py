@@ -41,17 +41,18 @@ async def persist_meters(
     conversation_id: str | None,
     quota_amount: int,
     request_id: str | None = None,
+    trace_id: str | None = None,
 ) -> None:
     """写入模型调用明细，并记一笔 consume 流水。额度数字仍由 QuotaService 扣减。"""
     owner = _user(user_id)
     written: list[LlmUsageRecord] = []
     for index, meter in enumerate(meters):
         key = settlement_key if len(meters) == 1 else f"{settlement_key}:{index}"
-        row = await _insert_call(session, owner, key, meter, conversation_id, request_id)
+        row = await _insert_call(session, owner, key, meter, conversation_id, request_id, trace_id=trace_id)
         if row is not None:
             written.append(row)
     anchor = written[0].id if written else None
-    await _insert_quota_tx(session, owner, settlement_key, quota_amount, anchor)
+    await _insert_quota_tx(session, owner, settlement_key, quota_amount, anchor, trace_id=trace_id)
 
 
 async def persist_tool(
@@ -61,6 +62,8 @@ async def persist_tool(
     *,
     conversation_id: str | None,
     task_id: str | None,
+    trace_id: str | None = None,
+    parent_span_id: str | None = None,
 ) -> None:
     call_id = str(payload.get("tool_call_id") or "")
     name = str(payload.get("tool_name") or "")
@@ -80,6 +83,9 @@ async def persist_tool(
             session.add(
                 ToolUsageRecord(
                     user_id=owner,
+                    trace_id=trace_id,
+                    span_id=_span(payload),
+                    parent_span_id=parent_span_id,
                     conversation_id=conversation_id,
                     task_id=task_id,
                     tool_call_id=call_id,
@@ -88,9 +94,60 @@ async def persist_tool(
                     status=str(payload.get("status") or "completed"),
                     duration_ms=payload.get("duration_ms"),
                     external_requests=payload.get("external_requests"),
-                    external_cost=None,
+                    external_cost=payload.get("external_cost"),
+                    currency=payload.get("currency"),
                     error=payload.get("error"),
                     retry_count=int(payload.get("retry_count") or 0),
+                )
+            )
+            await session.flush()
+    except IntegrityError:
+        return
+
+
+async def persist_skill(
+    session: AsyncSession,
+    user_id: uuid.UUID | str,
+    payload: dict[str, Any],
+    *,
+    conversation_id: str | None = None,
+    task_id: str | None = None,
+    trace_id: str | None = None,
+) -> None:
+    """写一条 Skill 注入/执行记录。指令 Token 已计入模型输入，这里不另扣额度。"""
+    execution_id = str(payload.get("skill_execution_id") or "").strip()
+    skill_id = str(payload.get("skill_id") or payload.get("skill_name") or "").strip()
+    if not execution_id or not skill_id:
+        return
+    owner = _user(user_id)
+    existing = await session.scalar(
+        select(SkillUsageRecord.id).where(
+            SkillUsageRecord.user_id == owner,
+            SkillUsageRecord.skill_execution_id == execution_id,
+        )
+    )
+    if existing is not None:
+        return
+    try:
+        async with session.begin_nested():
+            session.add(
+                SkillUsageRecord(
+                    user_id=owner,
+                    trace_id=trace_id,
+                    span_id=_span(payload),
+                    parent_span_id=payload.get("parent_span_id"),
+                    llm_usage_id=payload.get("llm_usage_id"),
+                    skill_id=skill_id,
+                    skill_name=payload.get("skill_name"),
+                    skill_version=payload.get("skill_version"),
+                    skill_execution_id=execution_id,
+                    conversation_id=conversation_id,
+                    task_id=task_id,
+                    instruction_tokens=payload.get("instruction_tokens"),
+                    status=str(payload.get("status") or "completed"),
+                    duration_ms=payload.get("duration_ms"),
+                    direct_cost=payload.get("direct_cost"),
+                    currency=payload.get("currency"),
                 )
             )
             await session.flush()
@@ -105,6 +162,8 @@ async def _insert_call(
     meter: dict[str, Any],
     conversation_id: str | None,
     request_id: str | None,
+    *,
+    trace_id: str | None = None,
 ) -> LlmUsageRecord | None:
     existing = await session.scalar(
         select(LlmUsageRecord).where(
@@ -127,6 +186,9 @@ async def _insert_call(
     )
     row = LlmUsageRecord(
         user_id=owner,
+        trace_id=trace_id or meter.get("trace_id"),
+        span_id=meter.get("span_id"),
+        parent_span_id=meter.get("parent_span_id"),
         conversation_id=conversation_id,
         request_id=request_id or meter.get("request_id"),
         task_id=meter.get("task_id"),
@@ -280,6 +342,8 @@ async def _insert_quota_tx(
     settlement_key: str,
     amount: int,
     llm_usage_id: uuid.UUID | None,
+    *,
+    trace_id: str | None = None,
 ) -> None:
     existing = await session.scalar(
         select(QuotaTransaction.id).where(
@@ -295,6 +359,7 @@ async def _insert_quota_tx(
             session.add(
                 QuotaTransaction(
                     user_id=owner,
+                    trace_id=trace_id,
                     llm_usage_id=llm_usage_id,
                     settlement_key=settlement_key,
                     action="consume",
@@ -304,6 +369,13 @@ async def _insert_quota_tx(
             await session.flush()
     except IntegrityError:
         return
+
+
+def _span(payload: dict[str, Any]) -> str | None:
+    value = payload.get("span_id")
+    if value is None:
+        return None
+    return str(value)[:64] or None
 
 
 def usage_public(usage: Any) -> dict[str, Any]:

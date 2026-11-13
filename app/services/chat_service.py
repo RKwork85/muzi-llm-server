@@ -512,6 +512,7 @@ class ChatService:
     ) -> AsyncIterator[str]:
         messages = [dict(item) for item in prepared.provider_request.messages]
         rounds = 0
+        call_counts: dict[str, int] = {}
         ledger_text = "\n".join(
             content_text(item.get("content") or "") for item in messages if item.get("role") == "user"
         )
@@ -768,23 +769,71 @@ class ChatService:
                 if runner is None:
                     yield _sse_error(prepared.request_id, InternalError())
                     return
-                tool_started = time.perf_counter()
-                tool_messages = await runner.execute(calls, allowed=frozenset(allowed))
-                tool_elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
+                # 每个工具按 max_calls_per_run 限次：本轮内超出上限的调用不再执行，
+                # 回一条错误结果让模型停止再调它（与 Agent 循环行为一致）。
+                runnable: list[ToolCall] = []
+                blocked_ids: set[str] = set()
+                for call in calls:
+                    spec = runner.registry.get(call.name)
+                    limit = spec.max_calls_per_run if spec is not None else None
+                    if limit is not None and call_counts.get(call.name, 0) >= limit:
+                        blocked_ids.add(call.id)
+                    else:
+                        runnable.append(call)
+                executed: list[dict[str, str]] = []
+                tool_elapsed_ms = 0
+                if runnable:
+                    tool_started = time.perf_counter()
+                    executed = await runner.execute(runnable, allowed=frozenset(allowed))
+                    tool_elapsed_ms = int((time.perf_counter() - tool_started) * 1000)
+                    for call in runnable:
+                        call_counts[call.name] = call_counts.get(call.name, 0) + 1
+                executed_iter = iter(executed)
+                tool_messages = [
+                    _tool_limit_message(call) if call.id in blocked_ids else next(executed_iter)
+                    for call in calls
+                ]
                 messages.extend(tool_messages)
                 for slot_index, call, tool_message in zip(call_indexes, calls, tool_messages, strict=True):
-                    yield format_sse(
-                        "resource",
-                        {
-                            "request_id": prepared.request_id,
-                            "kind": "tool",
-                            "tool_name": call.name,
-                            "tool_call_id": call.id,
-                            "status": "completed",
-                            "duration_ms": tool_elapsed_ms,
-                            "retry_count": 0,
-                        },
-                    )
+                    if call.id in blocked_ids:
+                        yield format_sse(
+                            "tool",
+                            {
+                                "request_id": prepared.request_id,
+                                "name": call.name,
+                                "round": rounds,
+                                "index": slot_index,
+                                "phase": "done",
+                                "detail": f"已达到「{call.name}」的调用次数上限，本轮不再执行",
+                                "preview": "",
+                            },
+                        )
+                        continue
+                    resource_payload: dict[str, Any] = {
+                        "request_id": prepared.request_id,
+                        "kind": "tool",
+                        "tool_name": call.name,
+                        "tool_call_id": call.id,
+                        "status": "completed",
+                        "duration_ms": tool_elapsed_ms,
+                        "retry_count": 0,
+                    }
+                    spec = runner.registry.get(call.name)
+                    if spec is not None and spec.pricing is not None:
+                        from app.metering.tool_pricing import quote_tool_money, quote_tool_tokens
+
+                        success = _tool_succeeded(str(tool_message["content"]))
+                        resource_payload["status"] = "completed" if success else "failed"
+                        if spec.pricing.model == "external":
+                            resource_payload["external_requests"] = 1 if success else 0
+                            money = quote_tool_money(spec.pricing, success=success)
+                            if money is not None:
+                                resource_payload["external_cost"] = str(money)
+                                resource_payload["currency"] = spec.pricing.currency
+                        tokens = quote_tool_tokens(spec.pricing, success=success)
+                        if tokens > 0:
+                            resource_payload["external_tokens"] = tokens
+                    yield format_sse("resource", resource_payload)
                     detail, preview = _tool_public(call.name, call.arguments, tool_message["content"])
                     cards, total = _tool_cards(call.name, call.arguments, tool_message["content"])
                     payload: dict[str, Any] = {
@@ -1182,6 +1231,15 @@ def _tool_public(name: str, arguments: str, content: str) -> tuple[str, str]:
     return _argument_detail(name, arguments), _result_preview(content)
 
 
+def _tool_succeeded(content: str) -> bool:
+    """外部工具成功判定：result 能解析为正常结构算成功。
+
+    web_search / web_fetch 成功时 result 是 JSON 对象；失败时 ToolService 把错误码
+    作为 result 字符串返回，无法解析为对象。
+    """
+    return _tool_payload(content) is not None
+
+
 def _diagram_source(content: str) -> str:
     """流程图和序列图的源码交给页面直接画，不依赖模型再贴一次。"""
     payload = _tool_payload(content)
@@ -1463,6 +1521,22 @@ def _calls_from_slots(slots: dict[int, dict[str, str]]) -> list[ToolCall]:
     if not calls or len(calls) > 5:
         raise InvalidModelResponseError()
     return calls
+
+
+def _tool_limit_message(call: ToolCall) -> dict[str, str]:
+    """达到调用次数上限时回给模型的工具结果，提示不要再调用该工具。"""
+    return {
+        "role": "tool",
+        "tool_call_id": call.id,
+        "content": json.dumps(
+            {
+                "source": "server_tool",
+                "name": call.name,
+                "error": {"code": "TOOL_CALL_LIMIT", "message": "已达到该工具的调用次数上限"},
+            },
+            ensure_ascii=False,
+        ),
+    }
 
 
 def _assistant_message(result: CompletionResult) -> dict[str, Any]:

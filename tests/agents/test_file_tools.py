@@ -26,6 +26,12 @@ from app.tools.web_tools import CURRENT_SETTINGS
 from app.tools.workspace_scope import CURRENT_WORKSPACE_SCOPE, scope_dirname
 from tests.conftest import make_settings
 from tests.fakes import FakeProvider, make_result, make_tool_call
+from tests.support_agent_access import AGENT_HEADERS, allow_legacy_agent_api
+
+
+@pytest.fixture(autouse=True)
+def _legacy_agent_api(monkeypatch) -> None:
+    allow_legacy_agent_api(monkeypatch)
 
 
 def _bind(root):
@@ -243,13 +249,13 @@ def test_workspace_round_trip_hides_absolute_path(tmp_path) -> None:
     with TestClient(app) as http:
         created = http.post(
             "/api/v1/agents/runs",
-            headers={"X-Workspace-Key": key},
+            headers={"X-Workspace-Key": key, **AGENT_HEADERS},
             json={"message": "读取 note.txt", "prompt_name": "default", "toolsets": ["workspace"]},
         )
         task_id = created.json()["task_id"]
         finished = None
         for _ in range(40):
-            body = http.get(f"/api/v1/agents/runs/{task_id}").json()
+            body = http.get(f"/api/v1/agents/runs/{task_id}", headers=AGENT_HEADERS).json()
             if body["status"] in {"completed", "failed", "cancelled", "limit_reached"}:
                 finished = body
                 break

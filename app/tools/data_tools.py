@@ -556,7 +556,7 @@ def _sample_limit() -> int:
 
 
 def register_data_tools(registry) -> None:
-    from app.tools.registry import ToolSpec
+    from app.tools.registry import ToolPricing, ToolSpec 
 
     specs = (
         ("import_dataset", ImportArgs, import_dataset),
@@ -583,6 +583,7 @@ def register_data_tools(registry) -> None:
                 toolset="data",
                 max_calls_per_run=8,
                 timeout_s=20,
+                pricing=ToolPricing(model="fixed_tokens", fixed_tokens=2000),  # ← 新增
             )
         )
     for name, model, handler in (

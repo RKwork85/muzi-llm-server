@@ -74,6 +74,7 @@ class UsageTurn(BaseModel):
     call_count: int = 0
     summary_count: int = 0
     tool_count: int = 0
+    skill_count: int = 0
     image_count: int | None = None
     result: str
     link: str | None = None
@@ -85,11 +86,28 @@ class UsageTurn(BaseModel):
     technical: TechnicalDetail
 
 
+class UsageModeStat(BaseModel):
+    mode: str
+    billed: int = 0
+    count: int = 0
+
+
 class UsageSummary(BaseModel):
     total: int = 0
     chat: int = 0
     image: int = 0
+    summary_tokens: int = 0
     count: int = 0
+    by_mode: list[UsageModeStat] = Field(default_factory=list)
+
+
+class SummaryComposition(BaseModel):
+    cache_split: bool = False
+    fresh_input: TokenFigure
+    cache_read: TokenFigure
+    output: TokenFigure
+    total: TokenFigure
+    note: str | None = None
 
 
 class Composition(BaseModel):
@@ -99,6 +117,7 @@ class Composition(BaseModel):
     output: TokenFigure
     total: TokenFigure
     billed_total: int = 0
+    summary: SummaryComposition | None = None
     note: str | None = None
 
 

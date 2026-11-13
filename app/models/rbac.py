@@ -319,6 +319,7 @@ class UsageRecord(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         ForeignKey("users.id", name="fk_usage_records_user_id", ondelete="CASCADE"),
         nullable=False,
     )
+    trace_id: Mapped[str | None] = mapped_column(String(64))
     metric: Mapped[str] = mapped_column(String(64), nullable=False)
     amount: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     source: Mapped[str] = mapped_column(String(32), nullable=False, default="legacy", server_default=text("'legacy'"))

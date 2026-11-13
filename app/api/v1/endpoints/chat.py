@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import json
+import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Request
@@ -11,18 +12,24 @@ from fastapi.responses import StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.agent_access import require_agent_operator
+from app.authorization.application.execution_guard import CURRENT_EXECUTION, load_execution_context
 from app.api.deps import get_authenticated_user, get_chat_service
 from app.api.v1.endpoints.mcp import optional_mcp
 from app.mcp.service import McpService
 from app.api.errors import documented_errors, stream_preflight_errors
 from app.core.context import get_request_id
 from app.core.database.session import get_session_factory
+from app.chat.ask_runs import AskRunDecision, open_ask_run, request_fingerprint, seal_ask_run
 from app.core.exceptions import (
+    AskRunConflictError,
+    AskRunInProgressError,
     InvalidRequestError,
     LoginRequiredError,
     PlanningResourceNotFoundError,
     ToolRoundLimitError,
 )
+from app.core.sse import format_sse
 from app.services.auth_service import AuthService
 from app.authorization.application.audit_service import QuotaService
 from app.authorization.application.quota_bridge import record_tool_in_new_session, settle_in_new_session
@@ -69,6 +76,43 @@ def _stream_event(frame: str) -> tuple[str, dict[str, object]] | None:
     return event_name, value if isinstance(value, dict) else {}
 
 
+async def _begin_persisted_ask(session, owner: User, conversation_id: str, prepared, external_id: str, external_type: str):
+    """先提交运行行和开始事件，再允许流式输出。"""
+
+    store = SqlPlanningStore(session)
+    conversation = await store._conversation(conversation_id, owner.id, for_update=True)
+    raw_user = next(
+        (item.get("content", "") for item in reversed(prepared.provider_request.messages) if item.get("role") == "user"),
+        "",
+    )
+    user_text = content_text(raw_user) or "[附件]"
+    opened = await open_ask_run(
+        session,
+        owner_id=owner.id,
+        conversation_id=conversation.id,
+        external_id=external_id,
+        external_id_type=external_type,
+        fingerprint=request_fingerprint(user_text),
+    )
+    if opened.decision is not AskRunDecision.CREATED or opened.run_id is None:
+        return opened
+    session.add(ConversationMessage(session_id=conversation.id, role="user", content=user_text))
+    await store._emit_conversation(
+        conversation.id,
+        PlanningEventType.CHAT_RUN_STARTED,
+        {"run_id": str(opened.run_id), "client_run_id": external_id},
+    )
+    await session.commit()
+    return opened
+
+
+async def _replay_finished_ask(status: str | None):
+    if status == "completed":
+        yield format_sse("done", {"finish_reason": "stop"})
+        return
+    yield format_sse("error", {"message": "该请求已经结束", "code": status or "unknown"})
+
+
 async def _persisted_stream(
     service: ChatService,
     prepared,
@@ -85,11 +129,6 @@ async def _persisted_stream(
     except PlanningNotFound:
         raise PlanningResourceNotFoundError() from None
     conversation_title = (conversation.title or "")[:200]
-    raw_user = next((item.get("content", "") for item in reversed(prepared.provider_request.messages) if item.get("role") == "user"), "")
-    user_text = content_text(raw_user) or "[附件]"
-    session.add(ConversationMessage(session_id=conversation.id, role="user", content=user_text))
-    await store._emit_conversation(conversation.id, PlanningEventType.CHAT_RUN_STARTED, {"run_id": run_id})
-    await session.commit()
     assistant_text = ""
     reasoning_text = ""
     tool_preview = False
@@ -103,6 +142,37 @@ async def _persisted_stream(
     settled_total = 0
     settled_prompt = 0
     settled_completion = 0
+    terminal_sealed = False
+
+    async def seal_terminal() -> bool:
+        nonlocal terminal_sealed
+        if terminal_sealed:
+            return False
+        status = {
+            PlanningEventType.CHAT_DONE: "completed",
+            PlanningEventType.CHAT_ERROR: "failed",
+            PlanningEventType.CHAT_CANCELLED: "cancelled",
+        }.get(terminal_type)
+        if status is None:
+            return False
+        applied = await seal_ask_run(session, uuid.UUID(run_id), owner.id, status, "terminal_event")
+        if not applied:
+            terminal_sealed = True
+            return False
+        if terminal_type == PlanningEventType.CHAT_DONE and (assistant_text or reasoning_text):
+            session.add(
+                ConversationMessage(
+                    session_id=conversation.id,
+                    role="assistant",
+                    content=assistant_text,
+                    metadata_json={"reasoning_content": reasoning_text} if reasoning_text else {},
+                )
+            )
+        await store._emit_conversation(conversation.id, terminal_type, terminal_payload)
+        await session.commit()
+        terminal_sealed = True
+        return True
+
     try:
         async for frame in service.iter_sse(prepared, request.is_disconnected, workspace_scope):
             parsed = _stream_event(frame)
@@ -164,6 +234,7 @@ async def _persisted_stream(
                         conversation_id=conversation_id,
                         conversation_title=conversation_title,
                         meter=payload.get("meter") if isinstance(payload.get("meter"), dict) else None,
+                        trace_id=run_id,
                     )
                     if settled is not None:
                         settled_total += round_total
@@ -178,7 +249,19 @@ async def _persisted_stream(
                         payload,
                         conversation_id=conversation_id,
                         task_id=run_id,
+                        trace_id=run_id,
                     )
+                    external_tokens = int(payload.get("external_tokens") or 0)
+                    if external_tokens > 0:
+                        await settle_in_new_session(
+                            owner.id,
+                            source="tool",
+                            settlement_key=f"{run_id}:tool:{payload.get('tool_call_id')}",
+                            amount=external_tokens,
+                            kind="chat",
+                            extra={"task_id": run_id, "tool_name": payload.get("tool_name"), "external": True},
+                            trace_id=run_id,
+                        )
                 elif event_name in {"tool", "status"}:
                     event_type = PlanningEventType.CHAT_TOOL if event_name == "tool" else PlanningEventType.CHAT_STATUS
                     await store._emit_conversation(conversation.id, event_type, {"run_id": run_id, **payload})
@@ -187,20 +270,16 @@ async def _persisted_stream(
                 elif event_name == "done":
                     terminal_type = PlanningEventType.CHAT_DONE
                     terminal_payload = {"run_id": run_id, **payload}
+                    if not await seal_terminal():
+                        continue
                 elif event_name == "error":
                     terminal_type = PlanningEventType.CHAT_ERROR
                     terminal_payload = {"run_id": run_id, **payload}
+                    if not await seal_terminal():
+                        continue
             yield frame
-        if terminal_type == PlanningEventType.CHAT_DONE and (assistant_text or reasoning_text):
-            session.add(
-                ConversationMessage(
-                    session_id=conversation.id,
-                    role="assistant",
-                    content=assistant_text,
-                    metadata_json={"reasoning_content": reasoning_text} if reasoning_text else {},
-                )
-            )
-        await store._emit_conversation(conversation.id, terminal_type, terminal_payload)
+        if not terminal_sealed:
+            await seal_terminal()
     except BaseException:
         await session.rollback()
         raise
@@ -215,6 +294,7 @@ async def _persisted_stream(
                 model=prepared.provider_request.model,
                 conversation_id=conversation_id,
                 conversation_title=conversation_title,
+                trace_id=run_id,
             )
         try:
             await session.commit()
@@ -259,7 +339,16 @@ async def create_completion(
 ) -> ChatCompletionResponse:
     """使用服务端提示词和 DeepSeek Chat Completions。不执行工具。"""
     owner = await _authorize_model_user(request, credentials)
-    result = await service.complete(body)
+    execution = None
+    token = None
+    if owner is not None:
+        execution = await load_execution_context(str(owner.id), runtime_mode="ask")
+        token = CURRENT_EXECUTION.set(execution)
+    try:
+        result = await service.complete(body)
+    finally:
+        if token is not None:
+            CURRENT_EXECUTION.reset(token)
     if owner is not None:
         usage = result.usage
         purpose = body.usage_purpose if body.usage_purpose == "summary" else None
@@ -274,6 +363,7 @@ async def create_completion(
             conversation_id=_usage_conversation_id(body),
             conversation_title=body.conversation_title,
             purpose=purpose,
+            trace_id=result.request_id,
         )
     return result
 
@@ -342,6 +432,7 @@ async def _settle_chat_usage(
     purpose: str | None = None,
     source: str = "chat",
     meter: dict | None = None,
+    trace_id: str | None = None,
 ):
     from app.metering.context import take_meters
 
@@ -365,6 +456,7 @@ async def _settle_chat_usage(
         completion_tokens=completion_tokens,
         extra=extra or None,
         meters=meters or None,
+        trace_id=trace_id,
     )
 
 
@@ -417,6 +509,9 @@ async def stream_completion(
     """
     if body.stream is False:
         raise InvalidRequestError("该接口只提供流式输出")
+    operator = None
+    if body.mode == "agent":
+        operator = await require_agent_operator(credentials)
     remote: list = []
     user_id = await mcp.user_id_from_request(request) if mcp is not None else None
     if body.mode == "agent" and mcp is not None and user_id is not None:
@@ -461,39 +556,101 @@ async def stream_completion(
         await session.commit()
     elif _database_ready(request):
         owner = await _authorize_model_user(request, credentials)
+    principal_id = str(operator.id) if operator is not None else (str(owner.id) if owner is not None else None)
+    execution = None
+    if principal_id is not None:
+        execution = await load_execution_context(
+            principal_id,
+            runtime_mode=body.mode,
+            conversation_id=body.conversation_id,
+            workspace_scope=scope_dirname(request.headers.get("x-workspace-key")),
+        )
 
-    async def stream_body():
-        if body.conversation_id and owner is not None:
-            run_id = body.client_run_id or prepared.request_id
-            await chat_run_registry.register(run_id, str(owner.id))
+    async def _with_execution(frames):
+        token = CURRENT_EXECUTION.set(execution) if execution is not None else None
+        try:
+            async for frame in frames:
+                yield frame
+        finally:
+            if token is not None:
+                CURRENT_EXECUTION.reset(token)
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "Access-Control-Expose-Headers": "X-Run-Id",
+    }
+    if body.conversation_id and owner is not None:
+        assert session is not None
+        external_id = body.client_run_id or prepared.request_id
+        external_type = "client_run_id" if body.client_run_id else "request_id"
+        try:
+            opened = await _begin_persisted_ask(
+                session,
+                owner,
+                body.conversation_id,
+                prepared,
+                external_id,
+                external_type,
+            )
+        except Exception:
+            await session.close()
+            raise
+        if opened.decision is AskRunDecision.CONFLICT:
+            await session.close()
+            raise AskRunConflictError()
+        if opened.decision is AskRunDecision.IN_PROGRESS or opened.run_id is None:
+            await session.close()
+            raise AskRunInProgressError()
+        server_run_id = str(opened.run_id)
+        headers["X-Run-Id"] = server_run_id
+        if opened.decision is AskRunDecision.REPLAY:
+            await session.close()
+            return StreamingResponse(
+                _replay_finished_ask(opened.status),
+                media_type="text/event-stream",
+                headers=headers,
+            )
+
+        async def persisted_body():
+            await chat_run_registry.register(server_run_id, str(owner.id))
+            if external_id != server_run_id:
+                await chat_run_registry.register(external_id, str(owner.id))
             try:
-                assert session is not None
-                async for frame in _persisted_stream(
-                    service,
-                    prepared,
-                    request,
-                    scope_dirname(request.headers.get("x-workspace-key")),
-                    session,
-                    owner,
-                    body.conversation_id,
-                    run_id,
+                async for frame in _with_execution(
+                    _persisted_stream(
+                        service,
+                        prepared,
+                        request,
+                        scope_dirname(request.headers.get("x-workspace-key")),
+                        session,
+                        owner,
+                        body.conversation_id,
+                        server_run_id,
+                    )
                 ):
                     yield frame
             finally:
-                await chat_run_registry.unregister(run_id)
-                if session is not None:
-                    await session.close()
-            return
+                await chat_run_registry.unregister(server_run_id)
+                if external_id != server_run_id:
+                    await chat_run_registry.unregister(external_id)
+                await session.close()
+
+        return StreamingResponse(persisted_body(), media_type="text/event-stream", headers=headers)
+
+    async def stream_body():
         usage_total = 0
         usage_prompt = 0
         usage_completion = 0
         from app.metering.context import add_meter
 
         try:
-            async for frame in service.iter_sse(
-                prepared,
-                request.is_disconnected,
-                scope_dirname(request.headers.get("x-workspace-key")),
+            async for frame in _with_execution(
+                service.iter_sse(
+                    prepared,
+                    request.is_disconnected,
+                    scope_dirname(request.headers.get("x-workspace-key")),
+                )
             ):
                 parsed = _stream_event(frame)
                 if parsed and parsed[0] == "usage":
@@ -516,7 +673,19 @@ async def stream_completion(
                         parsed[1],
                         conversation_id=body.conversation_id,
                         task_id=prepared.request_id,
+                        trace_id=prepared.request_id,
                     )
+                    external_tokens = int(parsed[1].get("external_tokens") or 0)
+                    if external_tokens > 0:
+                        await settle_in_new_session(
+                            owner.id,
+                            source="tool",
+                            settlement_key=f"{prepared.request_id}:tool:{parsed[1].get('tool_call_id')}",
+                            amount=external_tokens,
+                            kind="chat",
+                            extra={"task_id": prepared.request_id, "tool_name": parsed[1].get("tool_name"), "external": True},
+                            trace_id=prepared.request_id,
+                        )
                 yield frame
         finally:
             if owner is not None:
@@ -528,20 +697,14 @@ async def stream_completion(
                     completion_tokens=usage_completion,
                     model=prepared.provider_request.model,
                     conversation_id=body.conversation_id,
+                    trace_id=prepared.request_id,
                 )
             else:
                 from app.metering.context import take_meters
 
                 take_meters()
 
-    return StreamingResponse(
-        stream_body(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return StreamingResponse(stream_body(), media_type="text/event-stream", headers=headers)
 
 
 @router.post("/runs/{run_id}/cancel", summary="取消 Chat 运行")
@@ -598,6 +761,7 @@ async def create_tool_call(
                 completion_tokens=completion_tokens,
                 model=body.model,
                 source="tool_call",
+                trace_id=get_request_id(),
             )
         raise
     if owner is not None:
@@ -610,5 +774,6 @@ async def create_tool_call(
             completion_tokens=usage.completion_tokens if usage is not None else 0,
             model=result.model,
             source="tool_call",
+            trace_id=result.request_id,
         )
     return result
