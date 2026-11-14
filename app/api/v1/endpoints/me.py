@@ -216,6 +216,8 @@ def _preferences_out(user: User) -> UserPreferencesOut:
         background=BackgroundSettings(
             color_chat=background.get("color_chat", DEFAULT_COLOR_CHAT),
             color_primary=background.get("color_primary", DEFAULT_COLOR_PRIMARY),
+            image_url=background.get("image_url"),
+            blur=background.get("blur", 0),
         )
     )
 
@@ -238,6 +240,8 @@ async def update_preferences(
         preferences["background"] = {
             "color_chat": body.background.color_chat,
             "color_primary": body.background.color_primary,
+            "image_url": body.background.image_url,
+            "blur": body.background.blur,
         }
     user.preferences = preferences
     await session.flush()

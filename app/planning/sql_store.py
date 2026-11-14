@@ -831,6 +831,11 @@ class SqlPlanningStore:
         conversation.mode = "agent"
         updated = self._revise(current, status=PlanStatus.READY_FOR_HANDOFF)
         await self._store_revision(row, current, updated)
+        await self._emit(row, PlanningEventType.HANDOFF_CREATED, {
+            "handoff": revisions.build_handoff(updated).model_dump(mode="json"),
+            "mode": "agent",
+            "revision": updated.revision,
+        })
         await self._emit(row, PlanningEventType.MODE_CHANGED, {"mode": "agent", "revision": updated.revision})
         return updated
 

@@ -12,7 +12,15 @@ import re
 from datetime import UTC, datetime
 from typing import Any
 
-from app.planning.contracts import Assumption, AssumptionStatus, PlanSnapshot, PlanStatus, PlanStep
+from app.planning.contracts import (
+    Assumption,
+    AssumptionStatus,
+    HandoffStep,
+    PlanHandoff,
+    PlanSnapshot,
+    PlanStatus,
+    PlanStep,
+)
 
 # M3 影响分析用的停用词：从假设文本中剔除后做关键词匹配，降低误报。
 _STOPWORDS = frozenset(
@@ -336,3 +344,23 @@ def compute_plan_diff(old: PlanSnapshot, new: PlanSnapshot) -> dict[str, Any]:
         },
         "constraints": {"before": old.constraints, "after": new.constraints},
     }
+
+
+def build_handoff(plan: PlanSnapshot) -> PlanHandoff:
+    """从已审批的计划快照构造交接记录。
+
+    M7-T03：交接（handoff）复用已有 Plan 持久化，不创建平行真相源——交接快照
+    直接从 `plan` 的权威字段派生，`authorization` 固定为 `revalidate_at_execution`，
+    表示「交接时并不授予执行权限，Agent 执行前仍需重新校验」。这样 handoff 只是
+    一份可审计、可追溯的投影，而不是第二份权威状态。
+    """
+    return PlanHandoff(
+        conversation_id=plan.conversation_id,
+        approved_plan_id=plan.plan_id,
+        approved_revision=plan.revision,
+        goal=plan.goal,
+        confirmed_decisions={item.key: item.value for item in plan.decisions},
+        constraints=list(plan.constraints),
+        steps=[HandoffStep(id=item.id, title=item.title) for item in plan.steps],
+        authorization="revalidate_at_execution",
+    )

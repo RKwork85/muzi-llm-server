@@ -1,198 +1,212 @@
-DeepSeek 接入服务。代码版本见 `app/__init__.py`，当前是 `0.1.0`。
+# muzi-llm-server
+
+DeepSeek 接入服务（FastAPI），为前端提供对话、Agent、数据处理、历史记录、鉴权、计费等能力。代码版本见 `app/__init__.py`。
 
 它提供两条互不调用的路径：
 
-- 对话：`ChatService` 使用只含 `calculator` 和 `get_current_time` 的注册表。
-- Agent：`AgentRuntime` 使用完整注册表。模型只能调用本次请求允许的工具，服务端执行后把结果交回模型。
+- 对话：`ChatService` 使用受限工具注册表，负责普通对话与受控 Function Calling。
+- Agent：`AgentRuntime` 使用完整注册表，模型只能调用本次请求允许的工具，服务端执行后把结果交回模型。
 
-两条路径共用 DeepSeek Provider、提示词和服务配置。HTTP 层不拼 SDK 请求，Provider 不保存业务提示词。
+两条路径共用 DeepSeek Provider、提示词和服务配置。
 
-## 目录
+## 目录结构
 
 ```text
 app/
   main.py              # 入口、生命周期、异常和 request_id
   api/                 # 健康检查和 /api/v1
-  core/                # 配置、日志、错误码、SSE
-  agents/              # 任务、循环、策略、产物
-  services/            # 对话编排、提示词、第一阶段工具执行
+  core/                # 配置、日志、错误码、SSE、数据库
+  agents/              # Agent 任务、循环、策略、产物
+  services/            # 对话编排、提示词、工具执行
   providers/           # AsyncOpenAI 适配
   tools/               # 工具注册和各工具实现
   data/                # 表格处理、任务文件、上传客户端
-  prompts/system/      # default、calculator、json_assistant
   schemas/
+alembic/               # 数据库迁移
+deploy/docker/         # PostgreSQL / Redis 的 Docker Compose
 ```
 
 配置从环境变量和本机 `.env` 读取。`.env.example` 只有占位符。
 
-## 环境
+## 环境要求
 
-建议 Python 3.11 及以上。
+- Python 3.11 及以上
+- Docker + Docker Compose（用于 PostgreSQL 和 Redis）
+- pip
 
-```powershell
-py -3.13 -m venv .venv
-.\.venv\Scripts\Activate.ps1
+## 快速开始（开发环境）
+
+```bash
+# 1. 进入后端目录
+cd muzi-llm-server
+
+# 2. 创建并激活虚拟环境
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1     # Windows PowerShell
+# source .venv/bin/activate      # macOS / Linux
+
+# 3. 安装依赖
 python -m pip install -r requirements.txt
-Copy-Item .env.example .env
+
+# 4. 准备环境变量
+Copy-Item .env.example .env      # Windows PowerShell
+# cp .env.example .env           # macOS / Linux
+
+# 5. 启动数据库（PostgreSQL + Redis）
+cd deploy/docker
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\init-env.ps1
+docker compose up -d
+docker compose ps
+cd ../..
+
+# 6. 执行数据库迁移
+python -m alembic upgrade head
+
+# 7. 启动服务
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
 ```
 
-在 `.env` 中填写 `DEEPSEEK_API_KEY`。不要把真实密钥提交到仓库。
+启动后：
+
+- Swagger：`http://127.0.0.1:8001/docs`
+- 存活检查：`http://127.0.0.1:8001/health`
+- 就绪检查：`http://127.0.0.1:8001/ready`
+
+## 安装依赖
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+生产环境建议锁定版本，例如：
+
+```bash
+python -m pip freeze > requirements.lock.txt
+python -m pip install -r requirements.lock.txt
+```
+
+## 项目配置
+
+### 后端环境变量
+
+复制 `.env.example` 为 `.env` 后填写。密钥只放在本机 `.env`，不提交到仓库。常用变量：
 
 | 变量 | 作用 | 默认 |
 |---|---|---|
-| `DEEPSEEK_API_KEY` | 上游密钥。为空时进程可以启动，调用模型时返回 `CONFIGURATION_ERROR` | 空 |
+| `DEEPSEEK_API_KEY` | DeepSeek 密钥。为空时进程可启动，调用模型返回 `CONFIGURATION_ERROR` | 空 |
 | `DEEPSEEK_BASE_URL` | OpenAI SDK 的 base URL，不要带 `/chat/completions` | `https://api.deepseek.com` |
 | `DEEPSEEK_MODEL` | 默认模型，必须在白名单内 | `deepseek-flash` |
 | `DEEPSEEK_MODEL_ALLOWLIST` | 允许的模型，逗号分隔 | `deepseek-flash,deepseek-v4-pro` |
-| `DEEPSEEK_TIMEOUT_SECONDS` | 上游超时 | `60` |
-| `DEEPSEEK_MAX_RETRIES` | 只对超时、连接失败和 5xx 重试 | `2` |
-| `DEEPSEEK_THINKING` | `enabled` 或 `disabled`。本服务默认显式关闭 | `disabled` |
-| `EXPOSE_REASONING` | 是否把思维链返回给客户端 | `false` |
-| `MAX_TOOL_ROUNDS` | 对话接口默认可执行的工具轮数 | `10` |
-| `TOOL_ROUND_HARD_LIMIT` | 对话接口轮数硬上限，最大 10 | `10` |
-| `TOOL_TIMEOUT_SECONDS` | 第一阶段单个工具超时 | `2` |
-| `TOOL_RESULT_MAX_CHARS` | 回传给模型的工具结果长度上限 | `4000` |
-| `REQUIRE_API_KEY_ON_STARTUP` | 为 `true` 且没有 Key 时拒绝加载配置 | `false` |
+| `LLM_PROVIDER` | 模型提供方 | `deepseek` |
 | `LOG_LEVEL` | 日志级别 | `INFO` |
-| `AGENT_MAX_ACTIVE_TASKS` | 同时存在的 Agent 任务数 | `8` |
-| `AGENT_TASK_TTL_SECONDS` | 内存任务保留时间。不删除数据文件 | `300` |
-| `TOOLS_NETWORK_ENABLED` | 是否允许 `research` | `false` |
-| `TOOLS_WORKSPACE_ROOT` | 只读工作区。不能是项目根 | 空 |
-| `DATA_STORE_ROOT` | 数据处理目录。不能是项目根 | `data_store` |
-| `DATA_FILE_TTL_SECONDS` | 数据文件保留时间 | `3600` |
-| `DATA_DOWNLOAD_TTL_SECONDS` | 本机下载令牌保留时间 | `600` |
-| `OSS_UPLOAD_BASE_URL` | 上传服务地址。空则上传工具返回 `OSS_UNAVAILABLE` | 空 |
-| `OSS_UPLOAD_PREFIX` | 上传路径前缀 | `agent-data` |
-| `OSS_UPLOAD_TIMEOUT_SECONDS` | 上传超时 | `20` |
+| `RUNTIME_ENV` | 运行环境，生产填 `production` | `development` |
 
-其余字段和取值范围见 `app/core/config.py` 与 `.env.example`。改 `.env` 后需要重启进程。
+其余字段与取值范围见 `app/core/config.py` 与 `.env.example`，改 `.env` 后需重启进程。
 
-缺少 Key 时，响应只有「模型服务配置不完整」，不会回显变量值。日志会去掉 API Key 和 `Authorization: Bearer`。
+### 数据库连接
 
-## 启动
+数据库地址来自环境变量，业务代码不写死主机名：
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+| 变量 | 作用 |
+|---|---|
+| `POSTGRES_HOST` | PostgreSQL 主机，本机运行填 `127.0.0.1` |
+| `POSTGRES_PORT` | PostgreSQL 端口，默认 `5432` |
+| `POSTGRES_DB` | 数据库名，固定 `muzi_llm` |
+| `POSTGRES_USER` | 数据库用户，固定 `muzi_admin` |
+| `POSTGRES_PASSWORD` | 数据库密码，与 `deploy/docker/.env` 保持一致 |
+| `REDIS_HOST` | Redis 主机，本机运行填 `127.0.0.1` |
+| `REDIS_PORT` | Redis 端口，默认 `6379` |
+| `REDIS_PASSWORD` | Redis 密码，与 `deploy/docker/.env` 保持一致 |
+| `DATABASE_STARTUP_REQUIRED` | 启动时强制数据库可用，生产填 `true` |
+
+### 对象存储（可选）
+
+文件上传工具依赖 qs-oss 服务：
+
+| 变量 | 作用 |
+|---|---|
+| `OSS_UPLOAD_BASE_URL` | 上传服务地址，指向 qs-oss。留空则上传工具返回 `OSS_UNAVAILABLE` |
+| `OSS_UPLOAD_PREFIX` | 上传路径前缀，默认 `agent-data` |
+
+本服务不保存对象存储 AccessKey，凭证只放在 qs-oss 服务端。
+
+## 数据库
+
+数据库由 `deploy/docker` 下的 Docker Compose 管理，PostgreSQL 18 + Redis 7，数据保存在命名卷。
+
+### 启动与停止
+
+```bash
+cd deploy/docker
+docker compose up -d
+docker compose ps
+docker compose stop
+docker compose down
 ```
 
-- Swagger：<http://127.0.0.1:8000/docs>
-- OpenAPI：<http://127.0.0.1:8000/openapi.json>
-- 存活检查：<http://127.0.0.1:8000/health>
-- 就绪检查：<http://127.0.0.1:8000/ready>（只看是否配置了 Key，不请求 DeepSeek）
+`docker compose down` 不删除数据；只有确认清空数据时才用 `docker compose down -v`。
 
-应用启动时创建 AsyncOpenAI 客户端，并在关闭时释放。SDK 自带重试已关闭。数据目录不是项目根时会创建目录，并清理其中已过期的文件。
+### 密码初始化
 
-## 错误
+`init-env.ps1` 会在 `.env` 缺失时生成数据库密码：
 
-```json
-{
-  "error": {
-    "code": "UPSTREAM_TIMEOUT",
-    "message": "模型服务请求超时",
-    "request_id": "..."
-  }
-}
+```bash
+cd deploy/docker
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\init-env.ps1
 ```
 
-常见错误码：`CONFIGURATION_ERROR`、`UPSTREAM_AUTH_ERROR`、`UPSTREAM_RATE_LIMIT`、`UPSTREAM_TIMEOUT`、`UPSTREAM_ERROR`、`INVALID_MODEL_RESPONSE`、`INVALID_TOOL_ARGUMENTS`、`TOOL_NOT_ALLOWED`、`TOOL_EXECUTION_ERROR`、`TOOL_ROUND_LIMIT`、`REQUEST_VALIDATION_ERROR`、`MODEL_NOT_ALLOWED`、`PROMPT_NOT_FOUND`、`PROMPT_VARIABLE_MISSING`、`AGENT_TASK_NOT_FOUND`、`AGENT_TASK_LIMIT`、`INTERNAL_ERROR`。策略拒绝使用 `AgentPolicyRejectedError` 中的具体代码。未知下载令牌是 `ARTIFACT_NOT_FOUND`（404），过期令牌是 `DOWNLOAD_EXPIRED`（410）。
+生成后把 `deploy/docker/.env` 里的 `POSTGRES_PASSWORD`、`REDIS_PASSWORD` 同步填写到后端 `.env`。
 
-请求校验失败一律返回 `REQUEST_VALIDATION_ERROR`，响应里不包含字段细节。
+### 迁移
 
-## 对话接口
-
-客户端消息只允许 `user` 和 `assistant`。`system` 由 `prompt_name` 选择 `app/prompts/system/` 下的模板。`tool` 消息只由服务端写入。请求体不能自带可执行工具。
-
-### 非流式
-
-`POST /api/v1/chat/completions`
-
-```powershell
-$body = @{
-  messages = @(@{ role = "user"; content = "解释一下 FastAPI 的依赖注入" })
-  prompt_name = "default"
-  temperature = 0.7
-} | ConvertTo-Json -Depth 5
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/chat/completions -ContentType "application/json; charset=utf-8" -Body $body
+```bash
+# 在 muzi-llm-server 目录执行
+python -m alembic upgrade head
+python -m alembic current
 ```
 
-### 流式
+应用启动不会自动执行迁移。`downgrade` 会删表，只在确认目标库后手动执行：
 
-`POST /api/v1/chat/completions/stream`
-
-媒体类型为 `text/event-stream`。正常完成的顺序是 `delta`、可选的 `usage`、最后一条 `done`。`done` 和 `error` 不会出现在同一次响应里。流开始前的错误是普通 JSON。流开始后 HTTP 保持 200，上游失败变成 `event: error`。
-
-### JSON 模式
-
-`response_format.type` 为 `json_object` 时，系统提示词或用户消息里必须出现 `json`，最终内容必须能被 `json.loads` 解析。模板 `json_assistant` 需要变量 `task`。
-
-### 受控工具调用
-
-`POST /api/v1/chat/tool-calls`
-
-这个接口只有两个工具：
-
-- `calculator`：AST 白名单算术，不使用 `eval` 或 `exec`
-- `get_current_time`：当前 UTC 时间
-
-模型返回 `tool_calls` 后，服务端校验工具名和参数，执行处理函数，再以 `role=tool` 回传。默认最多 3 轮，硬上限 5。
-
-`GET /api/v1/models` 返回配置白名单，不表示上游的全部模型。
-
-## Agent 运行
-
-`POST /api/v1/agents/runs` 只创建任务并立刻返回 `task_id`。此时 `status` 通常是 `created`，`answer` 仍为空。执行在后台进行。
-
-用 `GET /api/v1/agents/runs/{task_id}` 查询，直到 `status` 变为 `completed`、`failed`、`cancelled` 或 `limit_reached`。取消用 `POST /api/v1/agents/runs/{task_id}/cancel`。事件流是 `GET /api/v1/agents/runs/{task_id}/events`。
-
-请求字段是 `message`、`prompt_name`，以及可选的 `toolsets`、`allowed_tools`、`policy`。省略 `toolsets` 时只有 `basic`。未知工具集是 `TOOLSET_UNKNOWN`，条件不满足的工具集是 `TOOLSET_UNAVAILABLE`。`policy` 只能把限额收紧，不能放宽。
-
-一次运行默认最多 3 次工具调用、4 步，同一次模型响应里最多 3 个工具调用。硬上限分别是 8、8 和 5。请求不能提高这些默认值。模型返回正文并结束时，服务端把正文保存为 `answer`，不会再从正文里补一次工具调用。
-
-```powershell
-$body = @{
-  message = "画一个用户登录流程图"
-  prompt_name = "default"
-  toolsets = @("basic", "diagram")
-} | ConvertTo-Json -Depth 5
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/api/v1/agents/runs -ContentType "application/json; charset=utf-8" -Body $body
+```bash
+python -m alembic downgrade base
 ```
 
-没有产物时响应不含 `artifacts`。有图或文件时才出现。事件里只有产物的 id、类型和大小，没有源码或文件字节。
+## 启动服务
 
-| toolset | 工具 | 何时可用 |
-|---|---|---|
-| `basic` | `calculator`、`get_current_time` | 始终。省略 `toolsets` 时只用这一组 |
-| `utility` | `format_json`、`text_stats`、`date_diff` | 始终 |
-| `diagram` | `create_flowchart`、`create_sequence_diagram`、`validate_mermaid` | 始终。只生成 Mermaid 源码，不渲染 |
-| `research` | `web_search`、`web_fetch` | `TOOLS_NETWORK_ENABLED=true` 且已配置 DeepSeek Key。抓取由 DeepSeek 服务器执行 |
-| `workspace` | `list_directory`、`read_text_file`、`search_text` | `TOOLS_WORKSPACE_ROOT` 是真实目录，且不是项目根 |
-| `data` | 见下一节 | `DATA_STORE_ROOT` 是真实目录，且不是项目根 |
+开发（带热重载）：
 
-`create_flowchart` 接收节点和边，不接收一段现成的 Mermaid 文本。生成的源码放在 `artifacts[].content`，类型是 `text/vnd.mermaid`。模型下一轮只看到产物摘要。
+```bash
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
+```
 
-## 数据处理和文件
+生产（不开启 reload）：
 
-`data` 工具集：
+```bash
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8001
+```
 
-- 读入和变换：`import_dataset`、`clean_data`、`deduplicate_data`、`normalize_data`、`classify_data`、`validate_data`
-- 导出和打包：`export_json`、`export_csv`、`export_excel`、`export_markdown`、`create_package`、`list_package_files`
-- 交付：`get_download_url`、`upload_to_oss`、`upload_files_to_oss`
+端口需与前端反向代理或 `VITE_API_BASE_URL` 保持一致（默认约定为 `8001`）。
 
-`import_dataset` 只接受 JSON 或 CSV 文本，或工作区内的相对路径。变换不改源表，每次返回新的数据集引用。工具结果只含引用、行数、列名和少量样例。
+## 生产部署
 
-导出的文件写在 `data_store/tasks/{task_id}/files/{file_id}`，磁盘名是文件编号。`get_download_url` 返回 `/api/v1/files/downloads/{token}`。`GET` 这个路径可下载文件。应用日志把令牌记成 `[redacted]`。
+生产环境至少满足以下条件：
 
-`OSS_UPLOAD_BASE_URL` 有值时，`upload_to_oss` 调用上传服务的 `/upload/single`，`upload_files_to_oss` 调用 `/upload/multiple`。返回地址只采用响应里的 `url`。本服务不保存对象存储 AccessKey，也不调用 `/upload/text` 或 `/upload/batch_from_local`。
+1. 在 `.env` 中设置 `RUNTIME_ENV=production` 和 `DATABASE_STARTUP_REQUIRED=true`，并填写数据库密码。
+2. 启动 PostgreSQL / Redis 并完成迁移。
+3. 填写 `DEEPSEEK_API_KEY`。
+4. 需要文件上传时，启动 qs-oss 服务并配置 `OSS_UPLOAD_BASE_URL`。
 
-默认 3 次工具调用放不下「导入、变换、导出、再下载或上传」整条链。后一步必须看到前一步返回的 id，不能在同一次模型响应里排完这条依赖链。
+注意：生产模式下若 `DATABASE_STARTUP_REQUIRED=false` 或数据库不可用，进程会拒绝启动，防止回退到内存授权。
 
-## 边界
+## 必要说明
 
-- 不执行模型给出的任意代码，不注册 Shell。
-- 不提供任意路径的写入、删除或移动。数据文件只写在数据目录内由服务端生成的 id 下。工作区工具只读。
-- 外部 HTTP 有三条：对话补全、`research` 触发的搜索和抓取、配置了上传地址时的文件上传。
-- 工具参数先做 JSON 和 Pydantic 校验，未知字段拒绝。
-- 日志记录 request id、路径、状态、耗时、模型和 usage，不记录消息正文和密钥。
-- 没有登录、计费、长期记忆、数据库、Redis、Celery、MCP、RAG 或前端界面。
-- 没有 Mermaid 服务端渲染。要看到图，由客户端渲染 `artifacts` 或回答正文里的源码。
+- 缺少 Key 时，响应只有「模型服务配置不完整」，不会回显变量值；日志会抹掉 API Key 和 `Authorization: Bearer`。
+- 数据库不会在应用启动时自动建表，必须先执行 `alembic upgrade head`。
+- Agent 任务保存在进程内存中，生产环境默认使用单进程（单 worker）；需要多 worker 横向扩展时需引入共享存储。
+- 数据与工作区目录不能指向项目根：`DATA_STORE_ROOT` 与 `TOOLS_WORKSPACE_ROOT` 的配置受此限制。
+- 不执行模型给出的任意代码，不提供任意路径的写入、删除或移动。
+- `.env` 已被 git 忽略，不要提交真实密钥。
+
+## 错误码
+
+错误响应统一包含 `error.code`、`error.message`、`error.request_id`。常见错误码：`CONFIGURATION_ERROR`、`UPSTREAM_AUTH_ERROR`、`UPSTREAM_RATE_LIMIT`、`UPSTREAM_TIMEOUT`、`UPSTREAM_ERROR`、`INVALID_MODEL_RESPONSE`、`INVALID_TOOL_ARGUMENTS`、`TOOL_NOT_ALLOWED`、`TOOL_EXECUTION_ERROR`、`TOOL_ROUND_LIMIT`、`REQUEST_VALIDATION_ERROR`、`MODEL_NOT_ALLOWED`、`PROMPT_NOT_FOUND`、`AGENT_TASK_NOT_FOUND`、`AGENT_TASK_LIMIT`、`INTERNAL_ERROR` 等。

@@ -325,3 +325,65 @@ async def test_handoff_agent_events_and_result_are_durable(planning_db):
             assert final_plan.status.value == "completed"
     finally:
         await _delete_fixture_rows(factory, user_id, conversation_id)
+
+
+async def test_handoff_created_event_is_persisted_and_replayable(planning_db):
+    """M7-T03：`handoff.created` 事件落库到 plan_events，并可通过 events_after 恢复。"""
+    from sqlalchemy import select
+
+    from app.models.tables import User
+
+    factory = planning_db
+    user_id, conversation_id = await _new_owner_and_conversation(factory)
+    try:
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            plan = await store.create_plan(owner, str(conversation_id), "Design permissions")
+            drafting, _ = await store.apply_proposal(
+                plan.plan_id,
+                owner,
+                plan,
+                DecisionProposal(
+                    protocol_version="1.0",
+                    action="update_plan",
+                    goal=plan.goal,
+                    steps=[{"id": "step_1", "title": "Define roles"}],
+                ),
+            )
+            for_review, _ = await store.apply_proposal(
+                plan.plan_id,
+                owner,
+                drafting,
+                DecisionProposal(
+                    protocol_version="1.0",
+                    action="request_approval",
+                    goal=plan.goal,
+                    steps=[{"id": "step_1", "title": "Define roles"}],
+                ),
+            )
+            approved = await store.approve(plan.plan_id, owner, for_review.revision)
+            ready = await store.switch_mode(plan.plan_id, owner, approved.revision, "agent")
+            assert ready.status.value == "ready_for_handoff"
+            await session.commit()
+
+        # 用全新会话恢复事件，验证 handoff.created 持久化且可重放。
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            events, next_sequence = await store.events_after(plan.plan_id, owner, 0)
+            handoff_events = [item for item in events if item.type.value == "handoff.created"]
+            assert len(handoff_events) == 1
+            payload = handoff_events[0].payload
+            assert payload["mode"] == "agent"
+            assert payload["handoff"]["protocol_version"] == "1.0"
+            assert payload["handoff"]["approved_plan_id"] == plan.plan_id
+            assert payload["handoff"]["authorization"] == "revalidate_at_execution"
+            assert payload["handoff"]["steps"] == [{"id": "step_1", "title": "Define roles"}]
+            # 会话级事件恢复也能看到 handoff.created（plan 归属同一会话）。
+            conversation_events, _ = await store.conversation_events_after(str(conversation_id), owner, 0)
+            assert any(item.type.value == "handoff.created" for item in conversation_events)
+    finally:
+        await _delete_fixture_rows(factory, user_id, conversation_id)
