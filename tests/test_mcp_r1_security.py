@@ -22,7 +22,7 @@ def _legacy_agent_api(monkeypatch) -> None:
     allow_legacy_agent_api(monkeypatch)
 
 from app.agents.toolsets import agent_tool_names
-from app.core.exceptions import LoginRequiredError, ToolExecutionError, ToolNotAllowedError
+from app.core.exceptions import LoginRequiredError, McpUnavailableError, ToolExecutionError, ToolNotAllowedError
 from app.main import create_app
 from app.mcp.oauth_guard import (
     OAuthFlowError,
@@ -105,13 +105,13 @@ async def test_malicious_metadata_does_not_receive_tokens() -> None:
     async with httpx.AsyncClient(transport=transport, base_url="http://mcp.test") as client:
         service = _service(client, _catalog("http://mcp.test/mcp"), {"token-a": "user-a"})
         fake.state.world["authorization_servers"] = ["http://mcp.test.evil"]
-        with pytest.raises(LoginRequiredError):
+        with pytest.raises(McpUnavailableError):
             await service.begin("user-a", "demo")
         assert int(fake.state.world.get("token_hits") or 0) == 0
 
         fake.state.world["authorization_servers"] = ["http://mcp.test"]
         fake.state.world["token_endpoint"] = "http://10.1.1.1/token"
-        with pytest.raises(LoginRequiredError):
+        with pytest.raises(McpUnavailableError):
             await service.begin("user-a", "demo")
         assert int(fake.state.world.get("token_hits") or 0) == 0
 

@@ -16,8 +16,9 @@ import httpx
 from fastapi import Request
 
 from app.core.config import Settings
-from app.core.exceptions import ConnectorNotFoundError, LoginRequiredError, McpUnavailableError
+from app.core.exceptions import ConnectorNotFoundError, InvalidRequestError, LoginRequiredError, McpUnavailableError
 from app.mcp.catalog import Connector, load_catalog
+from app.mcp.community import search_community_hybrid, slug_connector_name
 from app.mcp.crypto import TokenCipher
 from app.mcp.execution import CURRENT_MCP_SCOPE, context_for, run_mcp
 from app.mcp.http_client import release_hub, shared_hub
@@ -26,7 +27,15 @@ from app.mcp.observe import metrics
 from app.mcp.oauth_guard import OAuthFlowError, issuers_equal, metadata_url_for_issuer, screen_endpoint, trusted_issuer
 from app.mcp.protocol import MAX_TOOL_PAGES, ProtocolError, parse_tools_page, tools_list_params
 from app.mcp.pool import ClientPool, pool_from_template
-from app.mcp.store import ClientRecord, ConnectionRecord, MemoryStore, SqlStore, StateRecord
+from app.mcp.store import (
+    BridgeCredentialRecord,
+    ClientRecord,
+    CommunityConnectorRecord,
+    ConnectionRecord,
+    MemoryStore,
+    SqlStore,
+    StateRecord,
+)
 from app.models.mixins import utcnow
 from app.tools.mcp_client import McpArgs, _description, _schema
 from app.tools.registry import ToolRegistry, ToolSpec
@@ -51,7 +60,14 @@ class McpService:
         self.settings = settings
         self.store = store
         self.pool = client if isinstance(client, ClientPool) else pool_from_template(client, settings)
-        self.catalog = catalog if catalog is not None else load_catalog(allow_insecure=settings.mcp_allow_insecure)
+        self.catalog = (
+            catalog
+            if catalog is not None
+            else load_catalog(
+                allow_insecure=settings.mcp_allow_insecure,
+                env={"MCP_PUBLIC_BASE_URL": settings.mcp_public_base_url},
+            )
+        )
         self.users = users
         self._resolver = resolver
         self._cipher: TokenCipher | None = None
@@ -86,6 +102,26 @@ class McpService:
                 return item
         raise ConnectorNotFoundError()
 
+    async def resolve_connector(self, name: str) -> Connector:
+        """先查静态目录，再查社区安装的远程连接器。社区连接器 issuer 为空，走资源 origin。"""
+        for item in self.catalog:
+            if item.name == name:
+                return item
+        record = await self.store.get_community_connector(name)
+        if record is not None:
+            return self._from_community(record)
+        raise ConnectorNotFoundError()
+
+    def _from_community(self, record: CommunityConnectorRecord) -> Connector:
+        return Connector(
+            name=record.name,
+            display_name=record.display_name,
+            transport=record.transport,
+            url=record.url,
+            allow_write=False,
+            issuer="",
+        )
+
     async def user_id_from_request(self, request: Request) -> str | None:
         raw = _bearer(request)
         if not raw:
@@ -107,8 +143,11 @@ class McpService:
 
     async def list_for(self, user_id: str | None) -> list[dict[str, Any]]:
         connections = {item.connector_name: item for item in await self.store.list_connections(user_id)} if user_id else {}
+        items: list[Connector] = list(self.catalog)
+        for record in await self.store.list_community_connectors():
+            items.append(self._from_community(record))
         rows: list[dict[str, Any]] = []
-        for item in self.catalog:
+        for item in items:
             connection = connections.get(item.name)
             rows.append(
                 {
@@ -123,7 +162,7 @@ class McpService:
         return rows
 
     async def begin(self, user_id: str, name: str) -> str:
-        connector = self.connector(name)
+        connector = await self.resolve_connector(name)
         metadata = await self._metadata(user_id, connector)
         client = await self._client_registration(user_id, connector, metadata)
         verifier = secrets.token_urlsafe(32)
@@ -173,7 +212,7 @@ class McpService:
         saved = await self.store.pop_state(hashlib.sha256(state.encode("utf-8")).hexdigest())
         if saved is None:
             raise LoginRequiredError()
-        connector = self.connector(saved.connector_name)
+        connector = await self.resolve_connector(saved.connector_name)
         bound = self._open_verifier(saved.code_verifier_encrypted, saved.user_id, saved.connector_name)
         if not self._iss_matches(bound, iss):
             logger.info("mcp oauth rejected connector=%s reason=issuer_mismatch", connector.name)
@@ -209,7 +248,7 @@ class McpService:
         return connector.name
 
     async def discover(self, user_id: str, name: str) -> list[dict[str, Any]]:
-        connector = self.connector(name)
+        connector = await self.resolve_connector(name)
         listed = await self._list(user_id, connector)
         tools: list[dict[str, Any]] = []
         for item in listed:
@@ -236,9 +275,144 @@ class McpService:
         return chosen
 
     async def disconnect(self, user_id: str, name: str) -> None:
-        self.connector(name)
+        await self.resolve_connector(name)
         await self.store.delete_connection(user_id, name)
+        await self.store.delete_bridge_credential(user_id, name)
         await self._drop_client(user_id, name)
+
+    async def configure_bridge(self, user_id: str, name: str, credentials: dict[str, Any]) -> None:
+        """保存多租户 bridge（企微/飞书）凭据并签发绑定用户的 MCP 连接。"""
+        await self.resolve_connector(name)
+        sealed = self.keys().encrypt(
+            json.dumps(credentials, separators=(",", ":")),
+            user_id=user_id,
+            connector_id=name,
+            credential_type="bridge_credentials",
+        )
+        await self.store.save_bridge_credential(BridgeCredentialRecord(user_id, name, sealed))
+        if await self.store.get_client(name) is None:
+            await self.store.save_client(ClientRecord(connector_name=name, client_id=f"bridge-{name}"))
+        from app.bridge.server import issue_bridge_tokens
+
+        tokens = issue_bridge_tokens(self.settings, user_id, name, sealed)
+        base = self.settings.mcp_public_base_url.rstrip("/")
+        await self._save_token(
+            user_id,
+            name,
+            tokens,
+            previous=None,
+            binding={
+                "issuer": f"{base}/bridge/{name}",
+                "token_endpoint": f"{base}/bridge/{name}/token",
+            },
+        )
+
+    async def bridge_credentials_status(self, user_id: str, name: str) -> dict[str, Any]:
+        """返回该连接器凭据是否已配置，以及用于权限开通的公开标识。绝不返回密钥。"""
+        record = await self.store.get_bridge_credential(user_id, name)
+        result: dict[str, Any] = {"configured": record is not None, "connector": name}
+        if record is not None:
+            try:
+                plain = self.keys().decrypt(
+                    record.credentials_encrypted,
+                    user_id=user_id,
+                    connector_id=name,
+                    credential_type="bridge_credentials",
+                )
+                data = json.loads(plain)
+                if isinstance(data, dict):
+                    if name == "feishu" and str(data.get("app_id", "")).strip():
+                        result["app_id"] = str(data["app_id"]).strip()
+                    elif name == "wecom" and str(data.get("corp_id", "")).strip():
+                        result["corp_id"] = str(data["corp_id"]).strip()
+            except (KeyConfigurationError, ValueError, json.JSONDecodeError):
+                pass
+        return result
+
+    async def search_community(
+        self, query: str, sort: str, limit: int, page: int, installable_only: bool = False
+    ) -> dict[str, Any]:
+        """搜索社区目录：awesome 全文搜索 + 热度排序 + 交叉匹配官方 remote 端点。"""
+        return await search_community_hybrid(
+            query,
+            sort,
+            limit,
+            page,
+            base_url=self.settings.mcp_registry_base_url,
+            installable_only=installable_only,
+        )
+
+    async def community_connectors(self) -> list[dict[str, Any]]:
+        """已安装的社区连接器目录。"""
+        rows: list[dict[str, Any]] = []
+        for record in await self.store.list_community_connectors():
+            rows.append(
+                {
+                    "name": record.name,
+                    "qualified_name": record.qualified_name,
+                    "display_name": record.display_name,
+                    "description": record.description,
+                    "transport": record.transport,
+                    "url": record.url,
+                    "icon_url": record.icon_url or "",
+                    "website_url": record.website_url or "",
+                }
+            )
+        return rows
+
+    async def install_community(
+        self,
+        qualified_name: str,
+        transport: str,
+        url: str,
+        display_name: str,
+        description: str = "",
+        icon_url: str = "",
+        website_url: str = "",
+    ) -> dict[str, Any]:
+        """把社区远程连接器安装为平台目录项。URL 必须通过 SSRF 护栏校验。"""
+        if transport not in {"streamable_http", "sse"}:
+            raise InvalidRequestError("不支持的传输类型")
+        try:
+            screened = await screen_endpoint(
+                url,
+                allow_insecure=self.settings.mcp_allow_insecure,
+                resolver=self._resolver,
+                allow_unresolved_name=False,
+            )
+        except OAuthFlowError:
+            raise InvalidRequestError("连接地址不可用") from None
+        base = slug_connector_name(qualified_name)
+        name = base
+        existing = await self.store.get_community_connector(name)
+        if existing is not None and existing.qualified_name == qualified_name:
+            return {"name": existing.name, "qualified_name": qualified_name, "status": "installed"}
+        if existing is not None or any(item.name == name for item in self.catalog):
+            name = self._dedupe_name(base, qualified_name)
+        record = CommunityConnectorRecord(
+            name=name,
+            qualified_name=qualified_name,
+            display_name=(display_name.strip()[:100] or base),
+            description=description.strip()[:200],
+            transport=transport,
+            url=screened,
+            icon_url=(icon_url.strip()[:255] or None),
+            website_url=(website_url.strip()[:255] or None),
+        )
+        await self.store.save_community_connector(record)
+        return {"name": name, "qualified_name": qualified_name, "status": "installed"}
+
+    async def uninstall_community(self, name: str) -> None:
+        record = await self.store.get_community_connector(name)
+        if record is None:
+            raise ConnectorNotFoundError()
+        await self.store.delete_community_connector(name)
+        await self.store.delete_connections_by_connector(name)
+        await self.store.delete_client_by_connector(name)
+
+    def _dedupe_name(self, base: str, qualified_name: str) -> str:
+        digest = hashlib.sha1(qualified_name.encode("utf-8")).hexdigest()[:8]
+        return f"{base[:23]}_{digest}"
 
     async def tool_specs(self, user_id: str) -> list[ToolSpec]:
         specs: list[ToolSpec] = []
@@ -246,7 +420,7 @@ class McpService:
             if connection.status != "connected":
                 continue
             try:
-                connector = self.connector(connection.connector_name)
+                connector = await self.resolve_connector(connection.connector_name)
             except ConnectorNotFoundError:
                 continue
             listed = {
@@ -413,31 +587,37 @@ class McpService:
         return connection
 
     async def _metadata(self, user_id: str, connector: Connector) -> dict[str, str]:
+        """校验并返回连接器的标准 OAuth 元数据。
+
+        服务端不支持标准 MCP OAuth（缺失 oauth-protected-resource / authorization-server，
+        或 issuer 不匹配）时抛 ``McpUnavailableError``，向用户说明「该服务不支持一键连接」，
+        而不是误导性的「请先登录」——用户其实已登录，只是该第三方端点不接受标准授权。
+        """
         try:
             anchor = trusted_issuer(connector.url, connector.issuer)
             await self._screen(user_id, connector.name, connector.url)
         except OAuthFlowError as exc:
             logger.info("mcp oauth rejected connector=%s reason=%s", connector.name, exc.reason)
-            raise LoginRequiredError() from None
+            raise McpUnavailableError("该服务不支持平台一键连接") from None
         protected = await self._protected_metadata(user_id, connector)
         servers = protected.get("authorization_servers") if isinstance(protected, dict) else None
         announced = [item for item in servers if isinstance(item, str)] if isinstance(servers, list) else []
         if not any(issuers_equal(anchor, item) for item in announced):
             logger.info("mcp oauth rejected connector=%s reason=issuer_unlisted", connector.name)
-            raise LoginRequiredError()
+            raise McpUnavailableError("该服务不支持平台一键连接")
         try:
             document_url = await self._screen(user_id, connector.name, metadata_url_for_issuer(anchor))
             document = await self._json(user_id, connector.name, document_url)
         except OAuthFlowError as exc:
             logger.info("mcp oauth rejected connector=%s reason=%s", connector.name, exc.reason)
-            raise LoginRequiredError() from None
+            raise McpUnavailableError("该服务不支持平台一键连接") from None
         if not isinstance(document, dict) or not issuers_equal(anchor, str(document.get("issuer") or "")):
             logger.info("mcp oauth rejected connector=%s reason=issuer_mismatch", connector.name)
-            raise LoginRequiredError()
+            raise McpUnavailableError("该服务不支持平台一键连接")
         authorization = document.get("authorization_endpoint")
         token_endpoint = document.get("token_endpoint")
         if not isinstance(authorization, str) or not isinstance(token_endpoint, str):
-            raise LoginRequiredError()
+            raise McpUnavailableError("该服务不支持平台一键连接")
         try:
             authorization = await self._screen(user_id, connector.name, authorization)
             token_endpoint = await self._screen(user_id, connector.name, token_endpoint)
@@ -448,7 +628,7 @@ class McpService:
                 registration = ""
         except OAuthFlowError as exc:
             logger.info("mcp oauth rejected connector=%s reason=%s", connector.name, exc.reason)
-            raise LoginRequiredError() from None
+            raise McpUnavailableError("该服务不支持平台一键连接") from None
         return {
             "authorization_endpoint": authorization,
             "token_endpoint": token_endpoint,
@@ -462,7 +642,7 @@ class McpService:
         if existing is not None:
             return existing
         if not metadata["registration_endpoint"]:
-            raise LoginRequiredError()
+            raise McpUnavailableError("该服务不支持平台一键连接")
         response = await self._post(
             user_id,
             connector.name,
@@ -478,7 +658,7 @@ class McpService:
         body = response.json()
         client_id = body.get("client_id") if isinstance(body, dict) else None
         if not isinstance(client_id, str) or not client_id:
-            raise LoginRequiredError()
+            raise McpUnavailableError("该服务不支持平台一键连接")
         secret = body.get("client_secret") if isinstance(body, dict) else None
         record = ClientRecord(
             connector_name=connector.name,

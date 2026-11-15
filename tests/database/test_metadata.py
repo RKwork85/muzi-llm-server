@@ -21,6 +21,9 @@ EXPECTED_TABLES = {
     "mcp_connector_grants",
     "mcp_tool_grants",
     "mcp_authorization_audits",
+    "plugin_installations",
+    "bridge_credentials",
+    "community_connectors",
     "plans",
     "plan_revisions",
     "plan_decisions",
@@ -48,6 +51,13 @@ EXPECTED_TABLES = {
     "organization_members",
     "projects",
     "project_members",
+    "llm_usage_records",
+    "llm_usage_breakdowns",
+    "tool_usage_records",
+    "skill_usage_records",
+    "quota_transactions",
+    "model_pricing_versions",
+    "summary_updates",
 }
 
 ON_DELETE = {
@@ -68,6 +78,8 @@ ON_DELETE = {
     ("mcp_connector_grants", "user_id"): "CASCADE",
     ("mcp_tool_grants", "user_id"): "CASCADE",
     ("mcp_authorization_audits", "user_id"): "CASCADE",
+    ("plugin_installations", "user_id"): "CASCADE",
+    ("bridge_credentials", "user_id"): "CASCADE",
     ("plans", "conversation_id"): "CASCADE",
     ("plans", "owner_id"): "CASCADE",
     ("plan_revisions", "plan_id"): "CASCADE",
@@ -106,6 +118,15 @@ ON_DELETE = {
     ("projects", "organization_id"): "CASCADE",
     ("project_members", "project_id"): "CASCADE",
     ("project_members", "user_id"): "CASCADE",
+    ("llm_usage_records", "user_id"): "CASCADE",
+    ("llm_usage_breakdowns", "usage_record_id"): "CASCADE",
+    ("tool_usage_records", "user_id"): "CASCADE",
+    ("tool_usage_records", "llm_usage_id"): "SET NULL",
+    ("skill_usage_records", "user_id"): "CASCADE",
+    ("skill_usage_records", "llm_usage_id"): "SET NULL",
+    ("quota_transactions", "user_id"): "CASCADE",
+    ("quota_transactions", "llm_usage_id"): "SET NULL",
+    ("summary_updates", "user_id"): "CASCADE",
 }
 
 

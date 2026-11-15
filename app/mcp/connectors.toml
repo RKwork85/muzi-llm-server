@@ -1,8 +1,25 @@
 # 远程 MCP 目录。由部署维护，请求不能增加项目。
 # transport 可以是 streamable_http 或 sse。allow_write 默认关闭。
+# ${VAR} 会在加载时展开成环境变量。企业微信/飞书走进程内自建 MCP 桥接，
+# 地址基于 MCP_PUBLIC_BASE_URL。凭据多租户：每个用户在前端填写自己的凭据，
+# 后端用 KeyRing 加密存库（bridge_credentials 表），不在此文件也不在 .env。
 
 [notion]
 display_name = "Notion"
 transport = "streamable_http"
 url = "https://mcp.notion.com/mcp"
+allow_write = true
+
+[wecom]
+display_name = "企业微信"
+transport = "streamable_http"
+url = "${MCP_PUBLIC_BASE_URL}/bridge/wecom"
+issuer = "${MCP_PUBLIC_BASE_URL}/bridge/wecom"
+allow_write = true
+
+[feishu]
+display_name = "飞书"
+transport = "streamable_http"
+url = "${MCP_PUBLIC_BASE_URL}/bridge/feishu"
+issuer = "${MCP_PUBLIC_BASE_URL}/bridge/feishu"
 allow_write = true

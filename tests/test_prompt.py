@@ -32,8 +32,8 @@ def test_named_template_and_missing_variable() -> None:
 def test_plan_mode_prompt_is_loaded() -> None:
     service = PromptService()
     text = service.render("plan_mode", {})
-    assert "你当前处于 Plan 模式" in text
-    assert "工作权限" in text
+    assert "Interactive Planning Agent" in text
+    assert "Plan 模式执行边界" in text
     assert "{{" not in text
     assert "plan_mode" in service.names()
 
@@ -44,7 +44,7 @@ def test_plan_mode_prompt_is_injected_only_for_plan() -> None:
     service = object.__new__(ChatService)
     service.prompts = PromptService()
     plan_text = _mode_prompt("plan", [], service._plan_instructions())
-    assert "你当前处于 Plan 模式" in plan_text
+    assert "Interactive Planning Agent" in plan_text
     assert "只读" in plan_text
     # Ask 与 Agent 不应拼上 Plan 的说明
     assert _mode_prompt("ask", [], service._plan_instructions()) == ""

@@ -11,7 +11,8 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 
 from app.core.database.session import get_session_factory
-from app.core.exceptions import LoginRequiredError, McpUnavailableError
+from app.core.exceptions import InvalidRequestError, LoginRequiredError, McpUnavailableError
+from app.mcp.keys import KeyConfigurationError
 from app.mcp.pool import production_pool
 from app.mcp.service import McpService
 from app.mcp.store import SqlStore
@@ -22,6 +23,46 @@ router = APIRouter(prefix="/mcp", tags=["mcp"])
 
 class ToolSelection(BaseModel):
     tools: list[str] = Field(default_factory=list, max_length=32)
+
+
+class BridgeCredentials(BaseModel):
+    """多租户 bridge 凭据。按连接器只填对应字段，其余忽略。"""
+
+    corp_id: str = ""
+    agent_id: str = ""
+    secret: str = ""
+    app_id: str = ""
+    app_secret: str = ""
+
+
+class CommunityInstall(BaseModel):
+    """社区远程连接器安装请求。字段来自官方 MCP Registry 的 remote 条目。"""
+
+    qualified_name: str
+    transport: str
+    url: str
+    display_name: str = ""
+    description: str = ""
+    icon_url: str = ""
+    website_url: str = ""
+
+
+def _validate_bridge_credentials(name: str, body: BridgeCredentials) -> dict[str, str]:
+    if name == "wecom":
+        cred = {
+            "corp_id": body.corp_id.strip(),
+            "agent_id": body.agent_id.strip(),
+            "secret": body.secret.strip(),
+        }
+        if not all(cred.values()):
+            raise InvalidRequestError("corp_id、agent_id、secret 不能为空")
+        return cred
+    if name == "feishu":
+        cred = {"app_id": body.app_id.strip(), "app_secret": body.app_secret.strip()}
+        if not all(cred.values()):
+            raise InvalidRequestError("app_id、app_secret 不能为空")
+        return cred
+    raise InvalidRequestError("该连接器不支持凭据配置")
 
 
 @asynccontextmanager
@@ -123,3 +164,73 @@ async def disconnect(name: str, request: Request, service: McpService = Depends(
     user_id = await service.require_user(request)
     await service.disconnect(user_id, name)
     return {"status": "disconnected"}
+
+
+@router.get("/connectors/{name}/credentials", summary="查询 bridge 凭据是否已配置")
+async def get_credentials(name: str, request: Request, service: McpService = Depends(required_mcp)) -> dict[str, object]:
+    user_id = await service.require_user(request)
+    return await service.bridge_credentials_status(user_id, name)
+
+
+@router.put("/connectors/{name}/credentials", summary="保存当前用户的 bridge 凭据并建立连接")
+async def put_credentials(
+    name: str,
+    body: BridgeCredentials,
+    request: Request,
+    service: McpService = Depends(required_mcp),
+) -> dict[str, str]:
+    user_id = await service.require_user(request)
+    credentials = _validate_bridge_credentials(name, body)
+    try:
+        await service.configure_bridge(user_id, name, credentials)
+    except KeyConfigurationError:
+        raise McpUnavailableError("连接服务密钥未配置，暂无法保存凭据") from None
+    return {"status": "connected", "connector": name}
+
+
+@router.get("/community/search", summary="搜索社区目录（可安装 / 全部 + 热度排序）")
+async def community_search(
+    q: str = "",
+    sort: str = "stars",
+    limit: int = 40,
+    page: int = 1,
+    installable_only: bool = False,
+    service: McpService = Depends(required_mcp),
+) -> dict[str, object]:
+    return await service.search_community(q, sort, limit, page, installable_only)
+
+
+@router.get("/community/connectors", summary="已安装的社区连接器目录")
+async def community_list(service: McpService = Depends(required_mcp)) -> dict[str, object]:
+    return {"connectors": await service.community_connectors()}
+
+
+@router.post("/community/connectors", summary="安装社区远程连接器为平台目录项")
+async def community_install(
+    body: CommunityInstall,
+    request: Request,
+    service: McpService = Depends(required_mcp),
+) -> dict[str, str]:
+    await service.require_user(request)
+    if not body.qualified_name.strip() or not body.url.strip():
+        raise InvalidRequestError("qualified_name 与 url 不能为空")
+    return await service.install_community(
+        body.qualified_name.strip(),
+        body.transport,
+        body.url.strip(),
+        body.display_name,
+        body.description,
+        body.icon_url,
+        body.website_url,
+    )
+
+
+@router.delete("/community/connectors/{name}", summary="卸载社区远程连接器")
+async def community_uninstall(
+    name: str,
+    request: Request,
+    service: McpService = Depends(required_mcp),
+) -> dict[str, str]:
+    await service.require_user(request)
+    await service.uninstall_community(name)
+    return {"status": "uninstalled"}

@@ -25,6 +25,28 @@ from app.providers.parsing import parse_completion, parse_stream_chunk
 logger = logging.getLogger("muzi_llm")
 T = TypeVar("T")
 
+# 单条日志的异常描述上限。上游返回的正文可能很长，日志只保留能定位问题的头部。
+_DETAIL_LIMIT = 200
+# 指数退避的封顶值，避免配置写大后把用户等待拖到不可接受。
+_BACKOFF_CAP_SECONDS = 5.0
+
+
+def describe_exception(exc: BaseException) -> str:
+    """把异常链压成一行日志。
+
+    APIConnectionError 之类的包装异常本身只有 "Connection error."，
+    真正原因（DNS 失败、TLS 握手失败、连接被重置）在 __cause__ 里，逐层带上才能定位。
+    密钥由日志的 RedactingFilter 统一抹掉。
+    """
+    parts: list[str] = []
+    current: BaseException | None = exc
+    while current is not None and len(parts) < 4:
+        text = " ".join(str(current).split())[:_DETAIL_LIMIT]
+        parts.append(f"{type(current).__name__}: {text}" if text else type(current).__name__)
+        nxt = current.__cause__ or current.__context__
+        current = nxt if nxt is not current else None
+    return " <- ".join(parts)[: _DETAIL_LIMIT * 2]
+
 
 async def close_stream(stream: Any) -> None:
     if stream is None:
@@ -136,16 +158,22 @@ class DeepSeekProvider:
             except Exception as exc:
                 retry = is_retryable_provider_error(exc) and attempt < attempts
                 logger.warning(
-                    "upstream call failed request_id=%s type=%s status=%s attempt=%s retry=%s",
+                    "upstream call failed request_id=%s type=%s status=%s attempt=%s retry=%s detail=%s",
                     get_request_id(),
                     type(exc).__name__,
                     getattr(exc, "status_code", None),
                     attempt,
                     retry,
+                    describe_exception(exc),
                 )
                 if not retry:
                     raise map_provider_exception(exc) from None
-                delay = self._settings.deepseek_retry_backoff_seconds * attempt
+                delay = self._backoff_delay(attempt)
                 if delay > 0:
                     await asyncio.sleep(delay)
         raise UpstreamError()
+
+    def _backoff_delay(self, attempt: int) -> float:
+        """指数退避：0.2、0.4、0.8…… 让网络瞬断有机会自行恢复，又不把等待拖长。"""
+        delay = self._settings.deepseek_retry_backoff_seconds * (2 ** (attempt - 1))
+        return min(delay, _BACKOFF_CAP_SECONDS)

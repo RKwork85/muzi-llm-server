@@ -243,6 +243,9 @@ def create_app(
 
     app.include_router(health_router)
     app.include_router(api_router, prefix="/api/v1")
+    from app.bridge.server import router as bridge_router
+
+    app.include_router(bridge_router)
     return app
 
 

@@ -10,7 +10,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.mixins import utcnow
-from app.models.tables import McpConnection, McpOAuthClient, McpOAuthState
+from app.models.tables import BridgeCredential, CommunityConnector, McpConnection, McpOAuthClient, McpOAuthState
 
 
 @dataclass
@@ -40,11 +40,66 @@ class ConnectionRecord:
     selected_tools: list[str] = field(default_factory=list)
 
 
+@dataclass
+class BridgeCredentialRecord:
+    user_id: str
+    connector_name: str
+    credentials_encrypted: str
+
+
+@dataclass
+class CommunityConnectorRecord:
+    name: str
+    qualified_name: str
+    display_name: str
+    description: str
+    transport: str
+    url: str
+    icon_url: str | None = None
+    website_url: str | None = None
+
+
 class MemoryStore:
     def __init__(self) -> None:
         self.clients: dict[str, ClientRecord] = {}
         self.states: dict[str, StateRecord] = {}
         self.connections: dict[tuple[str, str], ConnectionRecord] = {}
+        self.bridge_credentials: dict[tuple[str, str], BridgeCredentialRecord] = {}
+        self.community_connectors: dict[str, CommunityConnectorRecord] = {}
+
+    async def save_bridge_credential(self, record: BridgeCredentialRecord) -> None:
+        self.bridge_credentials[(record.user_id, record.connector_name)] = record
+
+    async def get_bridge_credential(self, user_id: str, name: str) -> BridgeCredentialRecord | None:
+        return self.bridge_credentials.get((user_id, name))
+
+    async def delete_bridge_credential(self, user_id: str, name: str) -> None:
+        self.bridge_credentials.pop((user_id, name), None)
+
+    async def list_community_connectors(self) -> list[CommunityConnectorRecord]:
+        return list(self.community_connectors.values())
+
+    async def get_community_connector(self, name: str) -> CommunityConnectorRecord | None:
+        return self.community_connectors.get(name)
+
+    async def get_community_connector_by_qualified(self, qualified_name: str) -> CommunityConnectorRecord | None:
+        for record in self.community_connectors.values():
+            if record.qualified_name == qualified_name:
+                return record
+        return None
+
+    async def save_community_connector(self, record: CommunityConnectorRecord) -> None:
+        self.community_connectors[record.name] = record
+
+    async def delete_community_connector(self, name: str) -> None:
+        self.community_connectors.pop(name, None)
+
+    async def delete_connections_by_connector(self, name: str) -> None:
+        for key in [key for key in self.connections if key[1] == name]:
+            self.connections.pop(key, None)
+
+    async def delete_client_by_connector(self, name: str) -> None:
+        self.clients.pop(name, None)
 
     async def get_client(self, name: str) -> ClientRecord | None:
         return self.clients.get(name)
@@ -182,6 +237,110 @@ class SqlStore:
             )
         )
         await self.session.flush()
+
+    async def save_bridge_credential(self, record: BridgeCredentialRecord) -> None:
+        user_id = uuid.UUID(record.user_id)
+        row = await self.session.scalar(
+            select(BridgeCredential).where(
+                BridgeCredential.user_id == user_id,
+                BridgeCredential.connector_name == record.connector_name,
+            )
+        )
+        if row is None:
+            self.session.add(
+                BridgeCredential(
+                    user_id=user_id,
+                    connector_name=record.connector_name,
+                    credentials_encrypted=record.credentials_encrypted,
+                )
+            )
+        else:
+            row.credentials_encrypted = record.credentials_encrypted
+        await self.session.flush()
+
+    async def get_bridge_credential(self, user_id: str, name: str) -> BridgeCredentialRecord | None:
+        row = await self.session.scalar(
+            select(BridgeCredential).where(
+                BridgeCredential.user_id == uuid.UUID(user_id),
+                BridgeCredential.connector_name == name,
+            )
+        )
+        if row is None:
+            return None
+        return BridgeCredentialRecord(str(row.user_id), row.connector_name, row.credentials_encrypted)
+
+    async def delete_bridge_credential(self, user_id: str, name: str) -> None:
+        await self.session.execute(
+            delete(BridgeCredential).where(
+                BridgeCredential.user_id == uuid.UUID(user_id),
+                BridgeCredential.connector_name == name,
+            )
+        )
+        await self.session.flush()
+
+    async def list_community_connectors(self) -> list[CommunityConnectorRecord]:
+        rows = (await self.session.scalars(select(CommunityConnector).order_by(CommunityConnector.created_at))).all()
+        return [_community(row) for row in rows]
+
+    async def get_community_connector(self, name: str) -> CommunityConnectorRecord | None:
+        row = await self.session.scalar(select(CommunityConnector).where(CommunityConnector.name == name))
+        return None if row is None else _community(row)
+
+    async def get_community_connector_by_qualified(self, qualified_name: str) -> CommunityConnectorRecord | None:
+        row = await self.session.scalar(
+            select(CommunityConnector).where(CommunityConnector.qualified_name == qualified_name)
+        )
+        return None if row is None else _community(row)
+
+    async def save_community_connector(self, record: CommunityConnectorRecord) -> None:
+        row = await self.session.scalar(select(CommunityConnector).where(CommunityConnector.name == record.name))
+        if row is None:
+            self.session.add(
+                CommunityConnector(
+                    name=record.name,
+                    qualified_name=record.qualified_name,
+                    display_name=record.display_name,
+                    description=record.description,
+                    transport=record.transport,
+                    url=record.url,
+                    icon_url=record.icon_url,
+                    website_url=record.website_url,
+                )
+            )
+        else:
+            row.qualified_name = record.qualified_name
+            row.display_name = record.display_name
+            row.description = record.description
+            row.transport = record.transport
+            row.url = record.url
+            row.icon_url = record.icon_url
+            row.website_url = record.website_url
+        await self.session.flush()
+
+    async def delete_community_connector(self, name: str) -> None:
+        await self.session.execute(delete(CommunityConnector).where(CommunityConnector.name == name))
+        await self.session.flush()
+
+    async def delete_connections_by_connector(self, name: str) -> None:
+        await self.session.execute(delete(McpConnection).where(McpConnection.connector_name == name))
+        await self.session.flush()
+
+    async def delete_client_by_connector(self, name: str) -> None:
+        await self.session.execute(delete(McpOAuthClient).where(McpOAuthClient.connector_name == name))
+        await self.session.flush()
+
+
+def _community(row: CommunityConnector) -> CommunityConnectorRecord:
+    return CommunityConnectorRecord(
+        name=row.name,
+        qualified_name=row.qualified_name,
+        display_name=row.display_name,
+        description=row.description,
+        transport=row.transport,
+        url=row.url,
+        icon_url=row.icon_url,
+        website_url=row.website_url,
+    )
 
 
 def _connection(row: McpConnection) -> ConnectionRecord:

@@ -92,7 +92,7 @@ class ProposedInteraction(BaseModel):
     prompt: str = Field(min_length=1, max_length=2000)
     description: str | None = Field(default=None, max_length=4000)
     options: list[InteractionOption] = Field(default_factory=list, max_length=20)
-    form: list[FormField] | None = Field(default=None, max_length=20)
+    form: list[FormField] | None = Field(default=None, max_length=5)
     constraints: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
@@ -759,6 +759,7 @@ class InteractionOrchestrator:
 
     MAX_ASSUMPTIONS_PER_TURN = 20
     MAX_OPTIONS = 20
+    MAX_FORM_FIELDS = 5
     MAX_STEPS = 100
 
     def __init__(self) -> None:
@@ -778,7 +779,7 @@ class InteractionOrchestrator:
                 if proposal.interaction.type == "form":
                     if not proposal.interaction.form:
                         problems.append("form interaction requires form fields")
-                    elif len(proposal.interaction.form) > self.MAX_OPTIONS:
+                    elif len(proposal.interaction.form) > self.MAX_FORM_FIELDS:
                         problems.append("too many form fields in one interaction")
                 if len(proposal.interaction.options) > self.MAX_OPTIONS:
                     problems.append("too many options in one interaction")
@@ -870,8 +871,10 @@ class PlanningDecisionEngine:
             "  · text_input — one short single-line answer.\n"
             "  · text_area — one longer multi-line answer.\n"
             "  · confirmation — a yes/no gate.\n"
-            "  · form — collect SEVERAL related hard constraints in one card; each field is "
-            "text / textarea / number / single_select / multi_select.\n"
+            "  · form — collect a SMALL number of strongly-coupled hard constraints in one card "
+            "(at most 5 fields, and only when they must be answered together); each field is "
+            "text / textarea / number / single_select / multi_select. The client shows form "
+            "fields one step at a time, so keep the field list short.\n"
             "Write prompt, option labels, descriptions, and form field labels in the user's "
             "language.\n\n"
             "STEP 0 — Read the message like a person, not a form:\n"
@@ -903,10 +906,13 @@ class PlanningDecisionEngine:
             "which scenic spots or which cuisine). Ask once with a multi_select, or assume and disclose.\n"
             "   - TRIVIA: naming, colors, minor defaults that do not change the outcome. Always assume.\n"
             "Choose the interaction type that fits (see REGISTERED UI INTERACTION COMPONENTS "
-            "above): group SEVERAL related hard constraints into one form card (e.g. 出发地 + 交通 + "
-            "预算 + 同行人), otherwise use the single/multi/confirmation/text type that matches. "
-            "Ask only what is needed to proceed this turn. Write visible text in the user's "
-            "language.\n"
+            "above). Prefer ONE focused question per turn: a single_select, multi_select, "
+            "confirmation, or text_input that resolves the single most important open hard "
+            "constraint. Only use a form when 2-5 hard constraints are strongly coupled and must "
+            "be answered together (e.g. 出发地 + 交通方式 + 预算 when they jointly determine the "
+            "route); otherwise ask them one at a time across turns. Never dump 5+ unrelated "
+            "questions into one card — a crowded card overwhelms the user. Ask only what is "
+            "needed to proceed this turn. Write visible text in the user's language.\n"
             "2. The FIRST time the user expresses a clear goal, write it into the \"goal\" field "
             "even when the action is ask_user or respond, so the server records the real target "
             "instead of the user's opening words.\n"

@@ -97,7 +97,7 @@ def test_plan_stream_injects_plan_mode_prompt(app, provider: FakeProvider) -> No
     prepared = service.prepare_stream(request)
 
     system = prepared.provider_request.messages[0]["content"]
-    assert "你当前处于 Plan 模式" in system
+    assert "Interactive Planning Agent" in system
     assert PromptService().render("plan_mode")[:40] in system
     # 文件存在时不应再拼上内置的精简说明
     assert "你处于 Plan 模式。只能使用只读工具了解情况" not in system
@@ -108,7 +108,7 @@ def test_ask_stream_does_not_inject_plan_mode_prompt(app, provider: FakeProvider
     prepared = service.prepare_stream(StreamChatRequest.model_validate(chat_payload()))
 
     system = prepared.provider_request.messages[0]["content"]
-    assert "你当前处于 Plan 模式" not in system
+    assert "Interactive Planning Agent" not in system
 
 
 def test_ask_stream_runs_tool_then_answers(app, provider: FakeProvider) -> None:

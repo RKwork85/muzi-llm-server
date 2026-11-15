@@ -319,6 +319,8 @@ class QuotaService:
             quota.limit_value = after
             quota.display_value = after
             quota.limit_source = "manual"
+            if action == "reset":
+                quota.used_value = 0
         quota.adjust_reason = text
         quota.adjusted_by = actor_id
         quota.adjusted_at = utcnow()

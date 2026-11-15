@@ -391,7 +391,10 @@ def map_provider_exception(exc: Exception) -> AppError:
         return UpstreamRateLimitError()
     if name == "APITimeoutError" or isinstance(exc, TimeoutError):
         return UpstreamTimeoutError()
-    if name in {"InternalServerError", "APIConnectionError", "APIError"}:
+    if name == "APIConnectionError":
+        # 连接根本没建立（DNS、TLS、代理、网络瞬断），与上游 5xx 区分文案，便于自助排查。
+        return UpstreamError("连接模型服务失败，请检查网络后重试")
+    if name in {"InternalServerError", "APIError"}:
         return UpstreamError()
     if isinstance(status, int) and status >= 500:
         return UpstreamError()

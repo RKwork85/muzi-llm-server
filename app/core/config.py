@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-flash"
     deepseek_model_allowlist: str = "deepseek-flash,deepseek-v4-pro"
     deepseek_timeout_seconds: float = Field(default=60, gt=0, le=600)
-    deepseek_max_retries: int = Field(default=2, ge=0, le=5)
+    deepseek_max_retries: int = Field(default=3, ge=0, le=5)
     deepseek_retry_backoff_seconds: float = Field(default=0.2, ge=0, le=5)
     # 上游省略 thinking 时默认开启思考。本服务显式下发，避免温度和工具参数行为不稳定。
     deepseek_thinking: Literal["enabled", "disabled"] = "disabled"
@@ -129,6 +129,8 @@ class Settings(BaseSettings):
     mcp_public_base_url: str = "http://127.0.0.1:8000"
     mcp_frontend_base_url: str = "http://127.0.0.1:5500"
     mcp_allow_insecure: bool = False
+    # 官方 MCP Registry 根地址。国内访问慢时可指向自建镜像或加速代理。
+    mcp_registry_base_url: str = "https://registry.modelcontextprotocol.io"
     # 数据库只服务本进程。地址来自环境变量，业务代码不写死主机名。
     postgres_host: str = "127.0.0.1"
     postgres_port: int = Field(default=5432, ge=1, le=65535)

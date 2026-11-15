@@ -261,7 +261,7 @@ class Interaction(StrictContract):
     description: str | None = Field(default=None, max_length=4000)
     status: InteractionStatus
     options: list[InteractionOption] = Field(default_factory=list, max_length=20)
-    form: list[FormField] | None = Field(default=None, max_length=20)
+    form: list[FormField] | None = Field(default=None, max_length=5)
     plan_review: InteractionPlanReview | None = None
     constraints: dict[str, Any] = Field(default_factory=dict)
     expires_at: datetime | None = None

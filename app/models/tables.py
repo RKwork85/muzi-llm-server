@@ -620,6 +620,66 @@ class ArkFile(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     purpose: Mapped[str] = mapped_column(String(32), nullable=False)
 
 
+class PluginInstallation(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    __tablename__ = "plugin_installations"
+    __table_args__ = (
+        UniqueConstraint("user_id", "plugin_id", name="uq_plugin_installations_user_plugin"),
+        CheckConstraint("status IN ('installed', 'uninstalled')", name="ck_plugin_installations_status"),
+        Index("ix_plugin_installations_user", "user_id"),
+        {"comment": "用户对静态插件的显式状态。无记录时按目录默认值。MCP 连接器不在本表。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_plugin_installations_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    plugin_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="installed")
+
+
+class BridgeCredential(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """用户对自建 MCP 桥接（企业微信/飞书）的凭据。密文存储，不落明文。"""
+
+    __tablename__ = "bridge_credentials"
+    __table_args__ = (
+        UniqueConstraint("user_id", "connector_name", name="uq_bridge_credentials_user_connector"),
+        Index("ix_bridge_credentials_user", "user_id"),
+        {"comment": "用户对自建 bridge 连接器的凭据（企业微信/飞书）。AES-GCM 密文，密钥来自环境。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_bridge_credentials_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    connector_name: Mapped[str] = mapped_column(String(32), nullable=False)
+    credentials_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
+
+
+class CommunityConnector(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    """社区目录（官方 MCP Registry）安装的远程 MCP 连接器。全局目录，连接状态仍按用户隔离。"""
+
+    __tablename__ = "community_connectors"
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_community_connectors_name"),
+        UniqueConstraint("qualified_name", name="uq_community_connectors_qualified"),
+        CheckConstraint("name ~ '^[a-z][a-z0-9_]{0,31}$'", name="ck_community_connectors_name"),
+        CheckConstraint("transport IN ('streamable_http', 'sse')", name="ck_community_connectors_transport"),
+        Index("ix_community_connectors_qualified", "qualified_name"),
+        {"comment": "社区目录安装的远程 MCP 连接器。全局目录，连接仍按用户隔离。"},
+    )
+
+    name: Mapped[str] = mapped_column(String(32), nullable=False)
+    qualified_name: Mapped[str] = mapped_column(String(200), nullable=False)
+    display_name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str] = mapped_column(String(200), nullable=False, default="", server_default=text("''"))
+    transport: Mapped[str] = mapped_column(String(16), nullable=False)
+    url: Mapped[str] = mapped_column(String(2048), nullable=False)
+    icon_url: Mapped[str | None] = mapped_column(String(255))
+    website_url: Mapped[str | None] = mapped_column(String(255))
+
+
 def _register_listeners() -> None:
     from app.core.database.redaction import register_redaction_listeners
 
