@@ -34,9 +34,11 @@ from app.tools.data_tools import register_data_tools
 from app.tools.web_tools import FetchArgs, SearchArgs, web_fetch, web_search
 from app.skills.tools import (
     DiscoverSkillsArgs,
+    ExecuteSkillScriptArgs,
     LoadSkillArgs,
     ReadSkillResourceArgs,
     discover_skills,
+    execute_skill_script,
     load_skill,
     read_skill_resource,
 )
@@ -413,6 +415,24 @@ def build_agent_registry(search_calls: int = 5, fetch_calls: int = 5) -> ToolReg
             risk_level="low",
             toolset="skills",
             max_calls_per_run=16,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="execute_skill_script",
+            description=(
+                "执行一个可执行技能（SKILL.md 带 runtime 字段）声明的入口脚本。"
+                "先用 discover_skills 确认技能的 skill_id，再用本工具运行它。"
+                "args 是传给脚本的 JSON 对象，脚本在工作目录的 args.json 里读取。"
+                "脚本在隔离沙盒里运行，结果通过 stdout 返回。"
+            ),
+            args_model=ExecuteSkillScriptArgs,
+            handler=execute_skill_script,
+            access="sandbox_exec",
+            idempotent=False,
+            toolset="skills",
+            max_calls_per_run=3,
+            timeout_s=20,
         )
     )
     register_data_tools(registry)

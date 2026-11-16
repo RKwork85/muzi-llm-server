@@ -113,7 +113,8 @@ def test_context_keeps_system_text_and_budget(tmp_path: Path) -> None:
         task_id="task-multi",
         task_text="请使用 weekly-report 和 meeting-notes",
         surface="agent",
-        mode=DiscoveryMode.AUTO,
+        mode=DiscoveryMode.EXPLICIT,
+        explicit_names=("weekly-report", "meeting-notes"),
         system_text="系统安全策略",
     )
     built = ContextBuilder().build(
@@ -132,6 +133,26 @@ def test_context_keeps_system_text_and_budget(tmp_path: Path) -> None:
             snapshots=tuple(orchestrator.store.for_task("task-multi", principal_id="user-1")),
         )
     assert budget.value.code == "SKILL_CONTEXT_BUDGET_EXCEEDED"
+
+
+def test_skill_body_is_wrapped_in_skill_data_tags(tmp_path: Path) -> None:
+    registry, orchestrator = _service(tmp_path)
+    _enable(registry, _WEEKLY)
+    result = orchestrator.prepare(
+        principal_id="user-1",
+        task_id="task-wrap",
+        task_text="请使用 weekly-report",
+        surface="chat",
+        mode=DiscoveryMode.AUTO,
+        system_text="系统",
+    )
+    block = result.prompt_block
+    assert "<skill_data>" in block
+    assert "</skill_data>" in block
+    open_index = block.index("<skill_data>")
+    close_index = block.index("</skill_data>")
+    assert "按完成、进行中和阻塞来写" in block[open_index:close_index]
+    assert "系统" not in block[open_index:close_index]
 
 
 def test_repeat_activation_is_idempotent_and_concurrent(tmp_path: Path) -> None:

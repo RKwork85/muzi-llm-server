@@ -104,21 +104,24 @@ def create_app(
 
                 from app.skills.activation_store import ActivationStore
                 from app.skills.adapters import SkillPromptAdapter
+                from app.skills.audit import SkillAuditService
                 from app.skills.orchestrator import SkillOrchestrator
                 from app.skills.registry import FileSkillRegistry
 
                 skill_root = Path(raw_skills)
                 if not skill_root.is_absolute():
                     skill_root = ROOT / skill_root
+                skill_registry = FileSkillRegistry(skill_root, allow_system=True)
                 skill_runtime = SkillPromptAdapter(
                     SkillOrchestrator(
-                        FileSkillRegistry(skill_root, allow_system=True),
+                        skill_registry,
                         ActivationStore(skill_root / "runtime"),
                     )
                 )
                 app.state.chat_service.skill_runtime = skill_runtime
                 agent_runtime.skill_runtime = skill_runtime
                 app.state.skill_runtime = skill_runtime
+                app.state.skill_audit = SkillAuditService(skill_registry)
             app.state.web_client = web_client
             app.state.chat_service.ask_tools = ToolService(agent_registry, runtime_settings)
             app.state.chat_service.web_client = web_client

@@ -7,13 +7,17 @@
 from __future__ import annotations
 
 import json
+import os
 from contextvars import ContextVar
+from pathlib import Path
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.skills.errors import SkillError
 from app.skills.models import SkillActor, SkillQuery, SkillStatus
 from app.skills.resources import read_resource
+from app.tools.skill_runner import run_skill_script
 
 CURRENT_SKILL_RUNTIME: ContextVar[object | None] = ContextVar("skill_runtime", default=None)
 CURRENT_SKILL_PRINCIPAL: ContextVar[str | None] = ContextVar("skill_principal", default=None)
@@ -152,3 +156,68 @@ def _matches(
         haystacks.append(category.lower())
     haystacks.extend(tags)
     return any(keyword in item for item in haystacks)
+
+
+class ExecuteSkillScriptArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    skill_id: str = Field(min_length=1, max_length=64)
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+def execute_skill_script(args: ExecuteSkillScriptArgs) -> str:
+    """在隔离沙盒里执行技能声明的入口脚本。
+
+    脚本内容来自技能包内 runtime.entrypoint 指向的文件，args 会序列化为
+    JSON 写入沙盒工作目录下的 ``args.json``，脚本通过 ``open("args.json")``
+    读取输入。入口脚本及其同目录资源会被复制到沙盒临时目录，执行结束后
+    目录阅后即焚。
+    """
+    ctx = _context()
+    if ctx is None:
+        return _error("execute_skill_script", "SKILL_RUNTIME_UNAVAILABLE", "技能运行时未开启")
+    runtime, actor = ctx
+    registry = runtime.orchestrator.registry  # type: ignore[attr-defined]
+    try:
+        skill = registry.get(args.skill_id, actor=actor)
+        if skill.metadata.status != SkillStatus.ENABLED:
+            return _error("execute_skill_script", "SKILL_NOT_AVAILABLE", "技能未启用")
+        spec = skill.runtime
+        if spec is None or not spec.entrypoint:
+            return _error("execute_skill_script", "SKILL_NOT_EXECUTABLE", "该技能不可执行")
+        if spec.language != "python":
+            return _error("execute_skill_script", "SKILL_RUNTIME_UNSUPPORTED", "暂不支持该语言")
+        package = registry.package_dir(args.skill_id, skill.metadata.version, actor=actor)
+        entrypoint_rel = _validate_entrypoint(package, spec.entrypoint)
+        result = run_skill_script(package, entrypoint_rel, args.args, timeout=spec.timeout)
+        if "error" in result:
+            return json.dumps(
+                {"source": "server_tool", "name": "execute_skill_script", "error": result["error"]},
+                ensure_ascii=False,
+            )
+        return json.dumps(
+            {
+                "source": "local",
+                "skill_id": args.skill_id,
+                "exit_code": result["exit_code"],
+                "output": result["output"],
+                "truncated": result["truncated"],
+                "untrusted": True,
+            },
+            ensure_ascii=False,
+        )
+    except SkillError as exc:
+        return _error("execute_skill_script", exc.code, exc.message)
+
+
+def _validate_entrypoint(package: Path, entrypoint: str) -> str:
+    parts = [part for part in entrypoint.split("/") if part not in {"", "."}]
+    if not parts or any(part == ".." for part in parts):
+        raise SkillError("SKILL_PATH_INVALID", "脚本路径无效")
+    base = package.resolve()
+    target = package.joinpath(*parts).resolve()
+    if os.path.commonpath([str(base), str(target)]) != str(base):
+        raise SkillError("SKILL_PATH_INVALID", "脚本路径无效")
+    if not target.is_file():
+        raise SkillError("SKILL_NOT_FOUND", "入口脚本不存在")
+    return "/".join(parts)

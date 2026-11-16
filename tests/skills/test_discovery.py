@@ -145,6 +145,42 @@ def test_disabled_skill_is_not_selected_and_load_rechecks(tmp_path: Path) -> Non
     assert error.value.code == "SKILL_NOT_AVAILABLE"
 
 
+def test_auto_mode_locks_single_skill_selection(tmp_path: Path) -> None:
+    """AUTO 模式即使多个技能命中，也只自动注入一个（allow_multiple 锁定）。"""
+    registry = FileSkillRegistry(tmp_path)
+    _enable(registry, _ALPHA)
+    _enable(registry, _BETA)
+    actor = SkillActor(user_id="user-1")
+    outcome = SkillDiscoveryService(registry).discover(
+        actor=actor,
+        task_text="请使用 alpha-notes 和 beta-notes",
+        mode=DiscoveryMode.AUTO,
+    )
+    assert outcome.decision == DecisionKind.SELECT
+    assert len(outcome.selected_ids) == 1
+
+
+def test_recommended_caps_candidates_at_three(tmp_path: Path) -> None:
+    """RECOMMENDED 模式最多返回 3 个候选。"""
+    registry = FileSkillRegistry(tmp_path)
+    for index in range(4):
+        text = f"""---
+name: topic-{index}
+description: 整理周报素材
+---
+说明 {index}。
+"""
+        _enable(registry, text)
+    actor = SkillActor(user_id="user-1")
+    outcome = SkillDiscoveryService(registry).discover(
+        actor=actor,
+        task_text="整理周报素材",
+        mode=DiscoveryMode.RECOMMENDED,
+    )
+    assert outcome.decision == DecisionKind.RECOMMEND
+    assert len(outcome.candidates) <= 3
+
+
 def test_legacy_prompts_stay_in_place() -> None:
     """四条旧提示仍由 skill_notes 提供。v1.8 只把标题扩成插件/技能，正文和执行边界不变。"""
     from app.prompts.skills import SKILL_INSTRUCTIONS

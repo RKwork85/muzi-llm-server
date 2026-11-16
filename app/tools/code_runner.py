@@ -1,18 +1,21 @@
-"""在工作区里执行一段 Python。无 shell，超时后结束，输出里不保留本机路径。"""
+"""在隔离临时目录里执行一段 Python。
+
+无 shell、超时后结束、输出里不保留本机路径。每次执行都在一个新建的
+临时目录内进行（cwd 锁死在该目录），结束后整个目录「阅后即焚」删除，
+不残留脚本、字节码或中间文件。这是 Docker 容器池之前的过渡隔离：
+相对路径读写只落在临时目录，绝对路径逃逸由后续容器方案兜底。
+"""
 
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.tools.file_sandbox import FileDenied
-from app.tools.file_tools import workspace_root
+from app.tools.sandbox_dir import make_sandbox, purge, redact_paths, safe_env
 from app.tools.web_tools import CURRENT_SETTINGS
 
 _MAX_OUTPUT = 8000
@@ -32,38 +35,35 @@ class PythonArgs(BaseModel):
 
 
 def run_python(args: PythonArgs) -> str:
-    script: Path | None = None
+    sandbox: Path | None = None
     try:
         settings = CURRENT_SETTINGS.get()
-        root = workspace_root(settings)
-        timeout = 10 if settings is None else settings.tools_sandbox_timeout_seconds
-        script = _write_script(args.code)
+        if settings is None:
+            return _error("code_unavailable", "代码执行暂不可用")
+        timeout = settings.tools_sandbox_timeout_seconds
+        sandbox = make_sandbox("muzi_py_")
+        script = sandbox / "main.py"
+        script.write_text(args.code, encoding="utf-8")
         completed = subprocess.run(
             [sys.executable, "-I", "-P", "-u", str(script)],
-            cwd=str(root),
+            cwd=str(sandbox),
             shell=False,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
-            env=_safe_env(),
+            env=safe_env(),
             stdin=subprocess.DEVNULL,
             check=False,
         )
-    except FileDenied:
-        return _error("code_unavailable", "代码执行暂不可用")
     except subprocess.TimeoutExpired:
         return _error("code_timeout", "代码执行超时")
     except OSError:
         return _error("code_failed", "代码执行失败")
     finally:
-        if script is not None:
-            try:
-                script.unlink(missing_ok=True)
-            except OSError:
-                pass
-    output = _redact(f"{completed.stdout}{completed.stderr}", root, script)
+        purge(sandbox)
+    output = redact_paths(f"{completed.stdout}{completed.stderr}", sandbox, script_name="main.py")
     return json.dumps(
         {
             "language": "python",
@@ -73,31 +73,6 @@ def run_python(args: PythonArgs) -> str:
         },
         ensure_ascii=False,
     )
-
-
-def _write_script(code: str) -> Path:
-    handle = tempfile.NamedTemporaryFile(prefix="muzi_code_", suffix=".py", delete=False, mode="w", encoding="utf-8")
-    try:
-        handle.write(code)
-    finally:
-        handle.close()
-    return Path(handle.name)
-
-
-def _safe_env() -> dict[str, str]:
-    kept: dict[str, str] = {}
-    for key in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "PATH", "TEMP", "TMP"):
-        value = os.environ.get(key)
-        if value:
-            kept[key] = value
-    kept["PYTHONIOENCODING"] = "utf-8"
-    kept["PYTHONDONTWRITEBYTECODE"] = "1"
-    kept["PYTHONNOUSERSITE"] = "1"
-    return kept
-
-
-def _redact(text: str, root: Path, script: Path) -> str:
-    return text.replace(str(script), "main.py").replace(str(root), ".")
 
 
 def _error(code: str, message: str) -> str:

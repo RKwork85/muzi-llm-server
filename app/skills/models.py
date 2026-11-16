@@ -33,6 +33,7 @@ class SkillStatus(str, Enum):
     INSTALLED = "installed"
     ENABLED = "enabled"
     DISABLED = "disabled"
+    REJECTED = "rejected"
     UNINSTALLED = "uninstalled"
 
 
@@ -66,6 +67,7 @@ class SkillAction(str, Enum):
     DISABLE = "disable"
     UPDATE = "update"
     ROLLBACK = "rollback"
+    REJECT = "reject"
     UNINSTALL = "uninstall"
 
 
@@ -105,6 +107,27 @@ class SkillSource(BaseModel):
     label: str = Field(min_length=1, max_length=120)
 
 
+class SkillRuntimeSpec(BaseModel):
+    """SKILL.md 里 runtime 字段声明的执行环境。声明本身不授予执行权。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    language: Literal["python", "node"]
+    version: str = Field(default="", max_length=16)
+    entrypoint: str = Field(min_length=1, max_length=180)
+    dependencies: str = Field(default="", max_length=180)
+    timeout: int = Field(default=30, ge=1, le=300)
+    network: bool = False
+    memory_limit: int = Field(default=512, ge=16, le=8192)
+
+    @field_validator("entrypoint", "dependencies")
+    @classmethod
+    def _check_relpath(cls, value: str) -> str:
+        if ".." in value or value.startswith(("/", "\\")) or ":" in value or "\x00" in value:
+            raise ValueError("路径不合法")
+        return value
+
+
 class SkillMetadata(BaseModel):
     """发现阶段可见的字段。不包含 SKILL.md 正文。"""
 
@@ -124,6 +147,7 @@ class SkillMetadata(BaseModel):
     tags: tuple[str, ...] = ()
     bundle_id: str | None = Field(default=None, max_length=64)
     bundle_name: str | None = Field(default=None, max_length=64)
+    runtime: SkillRuntimeSpec | None = None
 
     @field_validator("name")
     @classmethod
@@ -175,6 +199,7 @@ class SkillManifest(BaseModel):
     license: str | None = Field(default=None, max_length=120)
     compatibility: str | None = Field(default=None, max_length=240)
     metadata: dict[str, str] = Field(default_factory=dict)
+    runtime: SkillRuntimeSpec | None = None
     instruction_sha256: str
     body_bytes: int = Field(ge=1, le=65536)
 
@@ -219,6 +244,7 @@ class Skill(BaseModel):
     source: SkillSource
     instruction_sha256: str
     active_count: int = Field(default=0, ge=0)
+    runtime: SkillRuntimeSpec | None = None
 
     @field_validator("instruction_sha256")
     @classmethod

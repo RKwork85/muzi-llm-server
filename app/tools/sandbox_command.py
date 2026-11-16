@@ -1,17 +1,20 @@
-"""工作区内的命令。无 shell，命令名必须事先授权，参数不能逃出工作区。"""
+"""在隔离临时目录里执行授权命令。无 shell，命令名必须事先授权，参数不能逃出。
+
+每次执行都在新建的临时目录内进行（cwd 锁死），结束后目录「阅后即焚」。
+命令的默认工作位置不再是宿主机工作区，中间产物不会残留。
+"""
 
 from __future__ import annotations
 
 import json
-import os
 import re
 import shutil
 import subprocess
+from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.tools.file_sandbox import FileDenied
-from app.tools.file_tools import workspace_root
+from app.tools.sandbox_dir import make_sandbox, purge, redact_paths, safe_env
 from app.tools.web_tools import CURRENT_SETTINGS
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
@@ -69,35 +72,38 @@ class CommandArgs(BaseModel):
 
 
 def run_command(args: CommandArgs) -> str:
+    sandbox: Path | None = None
     try:
         settings = CURRENT_SETTINGS.get()
-        root = workspace_root(settings)
+        if settings is None:
+            return _error("command_not_authorized", "命令未授权")
         name = args.command.lower()
         if name in _HARD_DENY or name not in _allowlist(settings):
             return _error("command_not_authorized", "命令未授权")
         executable = shutil.which(args.command)
         if not executable:
             return _error("command_not_authorized", "命令未授权")
-        timeout = 10 if settings is None else settings.tools_sandbox_timeout_seconds
+        timeout = settings.tools_sandbox_timeout_seconds
+        sandbox = make_sandbox("muzi_cmd_")
         completed = subprocess.run(
             [executable, *args.args],
-            cwd=str(root),
+            cwd=str(sandbox),
             shell=False,
             capture_output=True,
             text=True,
             encoding="utf-8",
             errors="replace",
             timeout=timeout,
-            env=_safe_env(),
+            env=safe_env(),
             check=False,
         )
-    except FileDenied:
-        return _error("command_not_authorized", "命令未授权")
     except subprocess.TimeoutExpired:
         return _error("command_timeout", "命令超时")
     except OSError:
         return _error("command_failed", "命令执行失败")
-    output = f"{completed.stdout}{completed.stderr}"
+    finally:
+        purge(sandbox)
+    output = redact_paths(f"{completed.stdout}{completed.stderr}", sandbox)
     truncated = len(output) > _MAX_OUTPUT
     return json.dumps(
         {
@@ -118,15 +124,6 @@ def _allowlist(settings: object) -> set[str]:
         if _NAME.fullmatch(name) and name not in _HARD_DENY:
             names.add(name)
     return names
-
-
-def _safe_env() -> dict[str, str]:
-    kept: dict[str, str] = {}
-    for key in ("SYSTEMROOT", "WINDIR", "COMSPEC", "PATHEXT", "PATH", "TEMP", "TMP"):
-        value = os.environ.get(key)
-        if value:
-            kept[key] = value
-    return kept
 
 
 def _error(code: str, message: str) -> str:

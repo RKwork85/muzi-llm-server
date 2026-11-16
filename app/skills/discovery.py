@@ -160,7 +160,10 @@ class SkillDiscoveryService:
                 policy_version=policy.version,
                 needs_clarification=ambiguous,
             )
-        chosen = strong if policy.allow_multiple else strong[:1]
+        # AUTO 模式锁定单技能自动注入：allow_multiple 恒视为 False，
+        # 避免一次性注入多个技能互相干扰或越权叠加。
+        multiple = False if mode == DiscoveryMode.AUTO else policy.allow_multiple
+        chosen = strong if multiple else strong[:1]
         chosen = chosen[: policy.max_selected]
         return DiscoveryOutcome(
             candidates=tuple(ranked),

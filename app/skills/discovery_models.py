@@ -27,10 +27,10 @@ class DecisionKind(str, Enum):
 class DiscoveryPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    version: str = "m3.1"
+    version: str = "m3.2"
     auto_select_threshold: float = Field(default=0.72, ge=0, le=1)
     recommend_threshold: float = Field(default=0.4, ge=0, le=1)
-    max_candidates: int = Field(default=5, ge=1, le=8)
+    max_candidates: int = Field(default=3, ge=1, le=8)
     max_selected: int = Field(default=3, ge=1, le=3)
     allow_multiple: bool = True
 

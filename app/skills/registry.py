@@ -25,6 +25,7 @@ from app.skills.models import (
     SkillManifest,
     SkillMetadata,
     SkillQuery,
+    SkillRuntimeSpec,
     SkillScope,
     SkillSource,
     SkillSourceKind,
@@ -62,6 +63,7 @@ class _Record(BaseModel):
     compatibility: str | None = None
     category: str | None = None
     metadata: dict[str, str] = {}
+    runtime: SkillRuntimeSpec | None = None
     instruction_sha256: str
     active_count: int = 0
     versions: list[_VersionEntry]
@@ -88,12 +90,7 @@ class FileSkillRegistry:
         bundle_id: str | None = None,
         bundle_name: str | None = None,
     ) -> Skill:
-        self._check_body(manifest, instructions)
-        assert_scope_writable(scope)
-        assert_source_enabled(source.kind)
-        owner = self._owner(scope, actor)
-        if self._conflict(scope, owner, manifest.name) is not None:
-            raise SkillError("SKILL_NAME_CONFLICT", "同名技能已存在")
+        owner = self._prepare(manifest, instructions, actor=actor, source=source, scope=scope)
         record = _Record(
             skill_id="sk_" + secrets.token_hex(6),
             name=manifest.name,
@@ -108,6 +105,7 @@ class FileSkillRegistry:
             compatibility=manifest.compatibility,
             category=_category(manifest),
             metadata=dict(manifest.metadata),
+            runtime=manifest.runtime,
             instruction_sha256=manifest.instruction_sha256,
             versions=[
                 _VersionEntry(
@@ -122,6 +120,44 @@ class FileSkillRegistry:
         self._write_package(record, instructions)
         self._save(record)
         return self._skill(record)
+
+    def _prepare(
+        self,
+        manifest: SkillManifest,
+        instructions: str,
+        *,
+        actor: SkillActor,
+        source: SkillSource,
+        scope: SkillScope,
+        pending_names: set[str] | None = None,
+    ) -> str | None:
+        """阶段一静态校验，不落盘。返回 owner，供落盘阶段复用。
+
+        ``pending_names`` 用于在同一次批量导入内检测同名冲突，避免
+        两个尚未写盘的技能互相不可见。
+        """
+        self._check_body(manifest, instructions)
+        assert_scope_writable(scope)
+        assert_source_enabled(source.kind)
+        owner = self._owner(scope, actor)
+        if pending_names is not None:
+            if manifest.name in pending_names:
+                raise SkillError("SKILL_NAME_CONFLICT", "同名技能已存在")
+            pending_names.add(manifest.name)
+        if self._conflict(scope, owner, manifest.name) is not None:
+            raise SkillError("SKILL_NAME_CONFLICT", "同名技能已存在")
+        return owner
+
+    def _rollback_skill(self, skill_id: str) -> None:
+        """删除一次批量导入中途失败后残留的记录与包目录。"""
+        record_path = self._root / "records" / f"{skill_id}.json"
+        try:
+            record_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        package_dir = self._root / "packages" / skill_id
+        if package_dir.exists():
+            shutil.rmtree(package_dir, ignore_errors=True)
 
     def get(self, skill_id: str, *, actor: SkillActor) -> Skill:
         return self._skill(self._visible(skill_id, actor))
@@ -139,6 +175,25 @@ class FileSkillRegistry:
                 continue
             found.append(self._metadata(record))
         return sorted(found, key=lambda item: item.name)
+
+    def installed(self, *, actor: SkillActor) -> list[SkillMetadata]:
+        """合并 system 全量 + 当前用户的 ENABLED 技能，同名时用户覆盖系统（Shadowing）。
+
+        返回体里用 scope 区分来源；同名技能只保留 user 那份。
+        """
+        enabled = [
+            item
+            for item in self.query(SkillQuery(actor=actor))
+            if item.status == SkillStatus.ENABLED
+        ]
+        best: dict[str, SkillMetadata] = {}
+        for meta in enabled:
+            existing = best.get(meta.name)
+            if existing is None:
+                best[meta.name] = meta
+            elif meta.scope == SkillScope.USER and existing.scope != SkillScope.USER:
+                best[meta.name] = meta
+        return sorted(best.values(), key=lambda item: item.name)
 
     def update(
         self,
@@ -192,6 +247,15 @@ class FileSkillRegistry:
         self._save(record)
         return self._skill(record)
 
+    def reject(self, skill_id: str, *, actor: SkillActor) -> Skill:
+        """安全审核不通过，标记拒绝。拒绝后不再对用户可见、也不可激活。"""
+        return self.apply(skill_id, SkillAction.REJECT, actor=actor)
+
+    def enable(self, skill_id: str, *, actor: SkillActor) -> Skill:
+        """把 REGISTERED 技能安装并启用。供审核通过后调用。"""
+        self.apply(skill_id, SkillAction.INSTALL, actor=actor)
+        return self.apply(skill_id, SkillAction.ENABLE, actor=actor)
+
     def reserve(self, skill_id: str, *, actor: SkillActor) -> Skill:
         record = self._visible(skill_id, actor)
         can_activate(self._skill(record))
@@ -242,26 +306,81 @@ class FileSkillRegistry:
         bundle_id: str | None = None,
         bundle_name: str | None = None,
     ) -> list[Skill]:
+        """两阶段导入目录：先静态校验全部 SKILL.md，再整体落盘。
+
+        阶段一失败时磁盘零写入；阶段二中途失败时回滚已写入的记录与包。
+        """
         root = directory.resolve()
         if not root.is_dir():
             raise SkillValidationError("SKILL_SOURCE_INVALID", "技能目录无效")
-        imported: list[Skill] = []
+        entries = self._collect_entries(root, actor=actor, scope=scope)
+        return self._import_entries(
+            entries,
+            actor=actor,
+            label=label,
+            scope=scope,
+            bundle_id=bundle_id,
+            bundle_name=bundle_name,
+        )
+
+    def _collect_entries(
+        self,
+        root: Path,
+        *,
+        actor: SkillActor,
+        scope: SkillScope,
+    ) -> list[tuple[Path, SkillManifest, str]]:
+        """阶段一：收集目录下所有 SKILL.md 并做纯静态校验，不落盘。"""
+        source = SkillSource(kind=SkillSourceKind.LOCAL_DIRECTORY, label="pending")
+        entries: list[tuple[Path, SkillManifest, str]] = []
+        pending_names: set[str] = set()
         for path in sorted(root.rglob("SKILL.md")):
             resolved = path.resolve()
             if not resolved.is_file() or os.path.commonpath([str(root), str(resolved)]) != str(root):
                 continue
-            manifest, body = parse_skill_markdown(resolved.read_text(encoding="utf-8"))
-            skill = self.register(
+            text = resolved.read_text(encoding="utf-8")
+            manifest, body = parse_skill_markdown(text)
+            self._prepare(
                 manifest,
                 body,
                 actor=actor,
-                source=SkillSource(kind=SkillSourceKind.LOCAL_DIRECTORY, label=label),
+                source=source,
                 scope=scope,
-                bundle_id=bundle_id,
-                bundle_name=bundle_name,
+                pending_names=pending_names,
             )
-            self._copy_tree(resolved.parent, skill.metadata.skill_id, skill.metadata.version)
-            imported.append(skill)
+            entries.append((resolved.parent, manifest, body))
+        return entries
+
+    def _import_entries(
+        self,
+        entries: list[tuple[Path, SkillManifest, str]],
+        *,
+        actor: SkillActor,
+        label: str,
+        scope: SkillScope,
+        bundle_id: str | None = None,
+        bundle_name: str | None = None,
+    ) -> list[Skill]:
+        """阶段二：整体落盘，失败回滚已写入的记录与包。"""
+        source = SkillSource(kind=SkillSourceKind.LOCAL_DIRECTORY, label=label)
+        imported: list[Skill] = []
+        try:
+            for source_dir, manifest, body in entries:
+                skill = self.register(
+                    manifest,
+                    body,
+                    actor=actor,
+                    source=source,
+                    scope=scope,
+                    bundle_id=bundle_id,
+                    bundle_name=bundle_name,
+                )
+                self._copy_tree(source_dir, skill.metadata.skill_id, skill.metadata.version)
+                imported.append(skill)
+        except Exception:
+            for skill in imported:
+                self._rollback_skill(skill.metadata.skill_id)
+            raise
         return imported
 
     def import_bundle(
@@ -272,32 +391,32 @@ class FileSkillRegistry:
         name: str,
         scope: SkillScope,
     ) -> SkillBundle:
-        """上传一个技能包 zip：整体安装，内含一个或多个技能。
+        """上传一个技能包 zip：两阶段提交，落盘后置为 REGISTERED。
 
-        解压到临时目录后按目录扫描，所有技能共享同一个 bundle_id。
-        校验通过后自动安装并启用，用户看到的只是一个技能包。
+        阶段一：解压到临时目录，静态校验全部 SKILL.md（不落盘），任何
+        一项失败整体拒绝，磁盘零写入。
+        阶段二：整体落盘；中途失败回滚已写入的记录与包，不留孤儿。
+
+        落盘后技能处于 REGISTERED 状态，等待异步安全审核通过后由
+        :meth:`enable` 启用为 ENABLED；审核不通过则 :meth:`reject`。
         """
         clean_name = _bundle_name(name)
         base = _extract_bundle(payload)
         try:
             bundle_id = "bu_" + secrets.token_hex(6)
-            skills = self.scan_directory(
-                base,
+            entries = self._collect_entries(base, actor=actor, scope=scope)
+            if not entries:
+                raise SkillValidationError("SKILL_PACKAGE_INVALID", "技能包缺少说明")
+            self._import_entries(
+                entries,
                 actor=actor,
                 label=clean_name,
                 scope=scope,
                 bundle_id=bundle_id,
                 bundle_name=clean_name,
             )
-            if not skills:
-                raise SkillValidationError("SKILL_PACKAGE_INVALID", "技能包缺少说明")
-            for skill in skills:
-                self.apply(skill.metadata.skill_id, SkillAction.INSTALL, actor=actor)
-                self.apply(skill.metadata.skill_id, SkillAction.ENABLE, actor=actor)
             return self._bundle(bundle_id, actor=actor)
         finally:
-            import shutil
-
             shutil.rmtree(base, ignore_errors=True)
 
     def list_bundles(self, *, actor: SkillActor) -> list[SkillBundle]:
@@ -506,6 +625,7 @@ class FileSkillRegistry:
             source=SkillSource(kind=record.source_kind, label=record.source_label),
             instruction_sha256=record.instruction_sha256,
             active_count=record.active_count,
+            runtime=record.runtime,
         )
 
     def _metadata(self, record: _Record) -> SkillMetadata:
@@ -524,6 +644,7 @@ class FileSkillRegistry:
             tags=_tags(record.metadata),
             bundle_id=record.bundle_id,
             bundle_name=record.bundle_name,
+            runtime=record.runtime,
         )
 
 

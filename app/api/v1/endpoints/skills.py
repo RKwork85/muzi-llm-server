@@ -8,6 +8,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import sys
+from pathlib import Path
+
 from fastapi import APIRouter, Depends, File, Request, UploadFile
 from pydantic import BaseModel, Field
 
@@ -26,6 +30,8 @@ class SkillCard(BaseModel):
     name: str
     description: str
     source: str = ""
+    scope: str = ""
+    executable: bool = False
 
 
 class SkillListResponse(BaseModel):
@@ -47,6 +53,13 @@ class BundleCard(BaseModel):
 
 class BundleListResponse(BaseModel):
     bundles: list[BundleCard] = Field(default_factory=list)
+
+
+class SkillHealthResponse(BaseModel):
+    skills_root_mounted: bool
+    runtime_attached: bool
+    sandbox_alive: bool
+    sandbox_backend: str = "subprocess"
 
 
 def _registry(request: Request) -> FileSkillRegistry:
@@ -84,9 +97,65 @@ def list_skills(request: Request) -> SkillListResponse:
                 name=meta.name,
                 description=meta.description,
                 source=skill.source.label,
+                scope=meta.scope.value,
+                executable=_is_executable(skill),
             )
         )
     return SkillListResponse(skills=cards)
+
+
+@router.get("/skills/installed", response_model=SkillListResponse, summary="合并系统与当前用户已安装技能")
+async def list_installed(
+    request: Request,
+    mcp: McpService | None = Depends(optional_mcp),
+) -> SkillListResponse:
+    """合并 system 全量 + 当前 user 的 ENABLED 技能，同名时用户覆盖系统。
+
+    返回体用 ``scope`` 区分 ``"system"`` / ``"user"``，前端据此在 ``/`` 菜单分区展示。
+    """
+    runtime = getattr(request.app.state, "skill_runtime", None)
+    if runtime is None:
+        return SkillListResponse()
+    registry = runtime.orchestrator.registry
+    user_id = await mcp.user_id_from_request(request) if mcp is not None else None
+    actor = SkillActor(user_id=user_id)
+    cards: list[SkillCard] = []
+    for meta in registry.installed(actor=actor):
+        skill = registry.get(meta.skill_id, actor=actor)
+        cards.append(
+            SkillCard(
+                id=meta.skill_id,
+                name=meta.name,
+                description=meta.description,
+                source=skill.source.label,
+                scope=meta.scope.value,
+                executable=_is_executable(skill),
+            )
+        )
+    return SkillListResponse(skills=cards)
+
+
+def _is_executable(skill) -> bool:
+    runtime = getattr(skill, "runtime", None)
+    return bool(runtime is not None and getattr(runtime, "entrypoint", None))
+
+
+@router.get("/skills/health", response_model=SkillHealthResponse, summary="技能系统健康检查")
+async def skills_health(request: Request) -> SkillHealthResponse:
+    """报告 skills_root 挂载、运行时附着与沙盒执行器连通性。"""
+    skill_runtime = getattr(request.app.state, "skill_runtime", None)
+    attached = False
+    if skill_runtime is not None:
+        chat_service = getattr(request.app.state, "chat_service", None)
+        agent_runtime = getattr(request.app.state, "agent_runtime", None)
+        attached_chat = chat_service is not None and getattr(chat_service, "skill_runtime", None) is skill_runtime
+        attached_agent = agent_runtime is not None and getattr(agent_runtime, "skill_runtime", None) is skill_runtime
+        attached = attached_chat and attached_agent
+    return SkillHealthResponse(
+        skills_root_mounted=skill_runtime is not None,
+        runtime_attached=attached,
+        sandbox_alive=Path(sys.executable).is_file(),
+    )
 
 
 @router.get("/skills/bundles", response_model=BundleListResponse, summary="列出技能包")
@@ -121,6 +190,11 @@ async def upload_bundle(
         )
     except SkillError as exc:
         raise SkillFlowError(exc.code, exc.message) from exc
+    audit = getattr(request.app.state, "skill_audit", None)
+    if audit is not None:
+        actor = SkillActor(user_id=user_id)
+        for meta in bundle.skills:
+            asyncio.create_task(audit.audit_and_settle(meta.skill_id, actor=actor))
     return _bundle_card(bundle)
 
 

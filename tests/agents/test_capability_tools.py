@@ -272,12 +272,17 @@ def test_sandbox_command_rejects_unlisted_and_escaping_arguments(tmp_path) -> No
         CURRENT_SETTINGS.reset(token)
 
 
-def test_run_python_executes_in_workspace_and_hides_local_paths(tmp_path) -> None:
-    marker = tmp_path / "note.txt"
-    marker.write_text("hello-code", encoding="utf-8")
+def test_run_python_runs_in_ephemeral_sandbox_and_hides_local_paths(tmp_path) -> None:
     token = CURRENT_SETTINGS.set(make_settings(tools_workspace_root=str(tmp_path), tools_sandbox_timeout_seconds=5))
     try:
-        payload = json.loads(run_python(PythonArgs(code="print(6 * 7)\nprint(open('note.txt', encoding='utf-8').read())\n")))
+        code = (
+            "import os\n"
+            "print(6 * 7)\n"
+            "print(os.getcwd())\n"
+            "open('note.txt', 'w', encoding='utf-8').write('hello-code')\n"
+            "print(open('note.txt', encoding='utf-8').read())\n"
+        )
+        payload = json.loads(run_python(PythonArgs(code=code)))
         missing = json.loads(run_python(PythonArgs(code="raise RuntimeError('boom')\n")))
     finally:
         CURRENT_SETTINGS.reset(token)
@@ -285,12 +290,16 @@ def test_run_python_executes_in_workspace_and_hides_local_paths(tmp_path) -> Non
     assert "42" in payload["output"]
     assert "hello-code" in payload["output"]
     assert str(tmp_path) not in payload["output"]
+    assert "muzi_py_" not in payload["output"]
+    # 阅后即焚：相对路径写出的文件只落在临时目录，不残留到 workspace
+    assert not (tmp_path / "note.txt").exists()
     assert missing["exit_code"] != 0
     assert "boom" in missing["output"]
     assert str(tmp_path) not in missing["output"]
+    assert "muzi_py_" not in missing["output"]
 
 
-def test_run_python_times_out_and_needs_a_workspace(tmp_path) -> None:
+def test_run_python_times_out_and_needs_settings(tmp_path) -> None:
     token = CURRENT_SETTINGS.set(make_settings(tools_workspace_root=str(tmp_path), tools_sandbox_timeout_seconds=0.2))
     try:
         timed_out = json.loads(run_python(PythonArgs(code="import time\ntime.sleep(5)\n")))
@@ -301,7 +310,7 @@ def test_run_python_times_out_and_needs_a_workspace(tmp_path) -> None:
     assert denied["error"]["code"] == "code_unavailable"
 
 
-def test_sandbox_command_runs_allowlisted_name_in_workspace(tmp_path) -> None:
+def test_sandbox_command_runs_allowlisted_name_in_ephemeral_dir(tmp_path) -> None:
     token = CURRENT_SETTINGS.set(
         make_settings(tools_workspace_root=str(tmp_path), tools_sandbox_commands="hostname")
     )
@@ -313,3 +322,4 @@ def test_sandbox_command_runs_allowlisted_name_in_workspace(tmp_path) -> None:
     assert payload["exit_code"] == 0
     assert payload["output"].strip()
     assert str(tmp_path) not in payload["output"]
+    assert "muzi_cmd_" not in payload["output"]

@@ -142,3 +142,60 @@ def test_directory_scan_and_version_pin(tmp_path: Path) -> None:
     registry.release(skill_id, actor=_actor())
     removed = registry.uninstall(skill_id, actor=_actor())
     assert removed.metadata.status == SkillStatus.UNINSTALLED
+
+
+_RUNTIME_TEXT = """---
+name: data-analysis
+description: 分析 CSV 并生成图表
+version: 1.0.0
+runtime:
+  language: python
+  version: "3.11"
+  entrypoint: scripts/main.py
+  dependencies: requirements.txt
+  timeout: 30
+  network: false
+  memory_limit: 512
+---
+分析数据。
+"""
+
+
+def test_parser_reads_runtime_block() -> None:
+    manifest, _body = parse_skill_markdown(_RUNTIME_TEXT)
+    runtime = manifest.runtime
+    assert runtime is not None
+    assert runtime.language == "python"
+    assert runtime.version == "3.11"
+    assert runtime.entrypoint == "scripts/main.py"
+    assert runtime.dependencies == "requirements.txt"
+    assert runtime.timeout == 30
+    assert runtime.network is False
+    assert runtime.memory_limit == 512
+
+
+def test_parser_rejects_escaping_runtime_entrypoint() -> None:
+    bad = _RUNTIME_TEXT.replace("scripts/main.py", "../evil.py")
+    with pytest.raises(SkillValidationError):
+        parse_skill_markdown(bad)
+
+
+def test_parser_allows_skill_without_runtime() -> None:
+    manifest, _body = parse_skill_markdown(_TEXT)
+    assert manifest.runtime is None
+
+
+def test_registry_persists_runtime_on_metadata(tmp_path: Path) -> None:
+    registry = FileSkillRegistry(tmp_path)
+    manifest, body = parse_skill_markdown(_RUNTIME_TEXT)
+    skill = registry.register(
+        manifest,
+        body,
+        actor=_actor(),
+        source=SkillSource(kind=SkillSourceKind.LOCAL_DIRECTORY, label="local"),
+        scope=SkillScope.USER,
+    )
+    assert skill.runtime is not None
+    assert skill.runtime.entrypoint == "scripts/main.py"
+    assert skill.metadata.runtime is not None
+    assert skill.metadata.runtime.language == "python"

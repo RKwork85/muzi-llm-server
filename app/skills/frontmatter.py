@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import hashlib
 
-from app.skills.errors import SkillValidationError
-from app.skills.models import SkillManifest
+from pydantic import ValidationError
 
-_KEYS = {"name", "description", "license", "compatibility", "metadata", "version"}
+from app.skills.errors import SkillValidationError
+from app.skills.models import SkillManifest, SkillRuntimeSpec
+
+_KEYS = {"name", "description", "license", "compatibility", "metadata", "version", "runtime"}
 _DEFAULT_VERSION = "1.0.0"
 
 
@@ -31,6 +33,7 @@ def parse_skill_markdown(text: str) -> tuple[SkillManifest, str]:
     metadata = fields.get("metadata") or {}
     if "version" in metadata and metadata["version"] != version:
         raise SkillValidationError("SKILL_VERSION_MISMATCH", "版本号不一致")
+    runtime = _parse_runtime(fields.get("runtime"))
     encoded = body.encode("utf-8")
     try:
         manifest = SkillManifest(
@@ -40,6 +43,7 @@ def parse_skill_markdown(text: str) -> tuple[SkillManifest, str]:
             license=fields.get("license"),
             compatibility=fields.get("compatibility"),
             metadata=metadata,
+            runtime=runtime,
             instruction_sha256=hashlib.sha256(encoded).hexdigest(),
             body_bytes=len(encoded),
         )
@@ -48,31 +52,44 @@ def parse_skill_markdown(text: str) -> tuple[SkillManifest, str]:
     return manifest, body
 
 
+def _parse_runtime(raw: object | None) -> SkillRuntimeSpec | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise SkillValidationError("SKILL_FRONTMATTER_INVALID", "技能清单格式无效")
+    try:
+        return SkillRuntimeSpec.model_validate(raw)
+    except ValidationError as exc:
+        raise SkillValidationError("SKILL_FRONTMATTER_INVALID", "技能运行时配置无效") from exc
+
+
 def _fields(header: str) -> dict[str, object]:
     found: dict[str, object] = {}
-    metadata: dict[str, str] | None = None
+    nested: str | None = None
+    nested_data: dict[str, str] | None = None
     for line in header.split("\n"):
         if not line.strip():
             continue
-        if line.startswith("  ") and metadata is not None:
+        if line.startswith("  ") and nested is not None:
             key, value = _pair(line.strip())
-            metadata[key] = value
+            nested_data[key] = value
             continue
         if line[:1].isspace():
             raise SkillValidationError("SKILL_FRONTMATTER_INVALID", "技能清单格式无效")
         key, value = _pair(line)
         if key not in _KEYS:
             raise SkillValidationError("SKILL_FRONTMATTER_INVALID", "技能清单含未知字段")
-        if key == "metadata":
+        if key in ("metadata", "runtime"):
             if value:
                 raise SkillValidationError("SKILL_FRONTMATTER_INVALID", "技能清单格式无效")
-            metadata = {}
-            found["metadata"] = metadata
+            nested_data = {}
+            found[key] = nested_data
+            nested = key
             continue
         if key in found:
             raise SkillValidationError("SKILL_FRONTMATTER_INVALID", "技能清单字段重复")
         found[key] = value
-        metadata = None
+        nested = None
     return found
 
 
@@ -86,4 +103,11 @@ def _pair(line: str) -> tuple[str, str]:
         raise SkillValidationError("SKILL_FRONTMATTER_INVALID", "技能清单格式无效")
     if len(value) > 1024:
         raise SkillValidationError("SKILL_FRONTMATTER_INVALID", "技能清单字段过长")
-    return key, value
+    return key, _unquote(value)
+
+
+def _unquote(value: str) -> str:
+    """剥离 YAML 字符串值两端成对的引号。"""
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+        return value[1:-1]
+    return value
