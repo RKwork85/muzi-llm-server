@@ -100,6 +100,47 @@ def test_audit_rejects_credential_theft_script(tmp_path: Path) -> None:
     assert registry.get(skill_id, actor=actor).metadata.status == SkillStatus.REJECTED
 
 
+def test_audit_allows_os_environ_copy_for_subprocess(tmp_path: Path) -> None:
+    """os.environ.copy() 是给子进程传环境的合法用法，不应误杀为窃取凭据。
+
+    真实案例：office 技能用 env = os.environ.copy() 给 LibreOffice 传环境。
+    """
+    registry = FileSkillRegistry(tmp_path)
+    actor = SkillActor(user_id="user-1")
+    members = _script_skill("office", "处理文档", "import os\nenv = os.environ.copy()\n")
+    bundle = _import(registry, members, actor)
+    skill_id = bundle.skills[0].skill_id
+    service = SkillAuditService(registry)
+    verdict = _settle(service, skill_id, actor)
+    assert verdict.safe is True
+    assert registry.get(skill_id, actor=actor).metadata.status == SkillStatus.ENABLED
+
+
+def test_audit_allows_getenv_with_non_sensitive_name(tmp_path: Path) -> None:
+    """os.getenv("HOME") 这类无害用法不应误杀。"""
+    registry = FileSkillRegistry(tmp_path)
+    actor = SkillActor(user_id="user-1")
+    members = _script_skill("path", "找目录", "import os\nhome = os.getenv('HOME')\n")
+    bundle = _import(registry, members, actor)
+    skill_id = bundle.skills[0].skill_id
+    service = SkillAuditService(registry)
+    verdict = _settle(service, skill_id, actor)
+    assert verdict.safe is True
+
+
+def test_audit_rejects_getenv_with_sensitive_name(tmp_path: Path) -> None:
+    """读取敏感环境变量名仍判为窃取凭据。"""
+    registry = FileSkillRegistry(tmp_path)
+    actor = SkillActor(user_id="user-1")
+    members = _script_skill("thief", "读密钥", "import os\nkey = os.getenv('AWS_SECRET_ACCESS_KEY')\n")
+    bundle = _import(registry, members, actor)
+    skill_id = bundle.skills[0].skill_id
+    service = SkillAuditService(registry)
+    verdict = _settle(service, skill_id, actor)
+    assert verdict.safe is False
+    assert verdict.category == "credential_theft"
+
+
 def test_rejected_skill_not_installed(tmp_path: Path) -> None:
     registry = FileSkillRegistry(tmp_path)
     actor = SkillActor(user_id="user-1")

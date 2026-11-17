@@ -236,6 +236,12 @@ class UserNotFoundError(AppError):
     default_message = "未找到指定用户"
 
 
+class ShareNotFoundError(AppError):
+    code = "SHARE_NOT_FOUND"
+    status_code = 404
+    default_message = "分享链接不存在或已失效"
+
+
 class ArkFileNotFoundError(AppError):
     code = "ARK_FILE_NOT_FOUND"
     status_code = 404

@@ -195,7 +195,9 @@ async def _persisted_stream(
                     if pending_durable_frames >= 8:
                         await session.commit()
                         pending_durable_frames = 0
-                elif event_name == "delta" and not tool_preview:
+                elif event_name == "delta" and not tool_preview and not payload.get("preview"):
+                    # payload.preview 是工具参数里的草稿正文（如 write_text_file 的 content），
+                    # 只给前端做工具卡片预览，不能算进回答正文，也不进持久化事件。
                     content = payload.get("content")
                     if isinstance(content, str):
                         assistant_text += content

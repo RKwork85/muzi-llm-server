@@ -75,6 +75,12 @@ async def test_chat_and_agent_share_one_runtime(tmp_path: Path) -> None:
     assert skill_notes(["research"], execute=True) in content
     assert "不能覆盖系统策略" in content
     assert "按完成、进行中和阻塞来写。" in content
+    # 聊天只借用快照把正文拼进提示词，请求准备好时计数必须已经归还。
+    registry = adapter.orchestrator.registry
+    actor = SkillActor(user_id="user-1")
+    installed = registry.installed(actor=actor)
+    assert installed
+    assert all(registry.get(item.skill_id, actor=actor).active_count == 0 for item in installed)
     runtime = AgentRuntime(
         settings=settings,
         provider=FakeProvider(),

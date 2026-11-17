@@ -146,7 +146,10 @@ def test_prefix_escape_binary_size_depth_and_deadline(tmp_path) -> None:
     try:
         binary = json.loads(read_text_file(ReadArgs(path="wide.bin")))
         missing = json.loads(read_text_file(ReadArgs(path="missing.txt")))
-        assert binary == missing
+        # 二进制文件与「路径不存在」必须是两种语义，否则模型会误判为路径错误
+        assert binary["error"]["code"] == "file_not_text"
+        assert missing["error"]["code"] == "file_unavailable"
+        assert binary["error"] != missing["error"]
         oversized = json.loads(read_text_file(ReadArgs(path="big.txt")))
         assert oversized["error"]["code"] == "file_too_large"
         found = json.loads(search_text(SearchArgs(query="deep-hit", max_matches=5)))

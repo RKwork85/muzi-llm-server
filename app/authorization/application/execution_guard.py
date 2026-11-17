@@ -102,7 +102,9 @@ class ExecutionGuard:
                 return _passthrough()
             if not context.user_id or "skill.execute" not in context.effective_permissions:
                 return _deny("skill.execute", "permission_denied" if context.user_id else "identity_missing")
-            return _allow("skill.execute", audit=False)
+            # execute_skill_script（access=sandbox_exec）实际运行脚本，属于敏感执行，须留审计；
+            # discover/load/read 只是读取技能说明与资源（access=read_local），不审计。
+            return _allow("skill.execute", audit=access in SENSITIVE_ACCESS)
 
         if access in SENSITIVE_ACCESS:
             permission = mode_permission_code(context.runtime_mode if context else "ask", access)
@@ -159,7 +161,11 @@ async def load_execution_context(
     conversation_id: str | None = None,
     workspace_scope: str | None = None,
 ) -> ExecutionContext:
-    """从授权服务读取权限。失败时返回空权限，不把客户端密钥写成所有权。"""
+    """从授权服务读取权限。失败时返回空权限。
+
+    合法的工作区 scope 会登记为该用户的 workspace 归属（首次使用即绑定）；
+    非 32 位十六进制的密钥不会被写入所有权。
+    """
     permissions: set[str] = set()
     owned: frozenset[str] = frozenset()
     source = "unavailable"
@@ -175,6 +181,7 @@ async def load_execution_context(
 
             async with factory() as session:
                 permissions = set(await AuthorizationService(session).get_effective_permissions(user_id))
+                await _ensure_workspace_grant(session, user_id, workspace_scope)
                 owned = await _owned_workspaces(session, user_id)
                 source = "rbac"
         except (SQLAlchemyError, RuntimeError, AttributeError):
@@ -238,6 +245,46 @@ async def record_tool_audit(decision: ToolDecision, tool_name: str) -> None:
             await session.commit()
     except Exception:
         logger.info("tool authorization audit skipped tool=%s", tool_name)
+
+
+async def _ensure_workspace_grant(session: object, user_id: str, workspace_scope: str | None) -> None:
+    """首次使用某个合法工作区 scope 时，登记为该用户的 workspace 授权。
+
+    只有 32 位十六进制 scope 才会写入；任意客户端密钥不会成为所有权。
+    """
+    if not is_user_scope(workspace_scope):
+        return
+    try:
+        actor = uuid.UUID(str(user_id))
+    except ValueError:
+        return
+    try:
+        from app.models.rbac import ResourceGrant
+
+        existing = await session.scalar(  # type: ignore[attr-defined]
+            select(ResourceGrant.id).where(
+                ResourceGrant.user_id == actor,
+                ResourceGrant.resource_type == "workspace",
+                ResourceGrant.resource_id == workspace_scope,
+            )
+        )
+        if existing is not None:
+            return
+        session.add(  # type: ignore[attr-defined]
+            ResourceGrant(
+                user_id=actor,
+                resource_type="workspace",
+                resource_id=workspace_scope,
+                grant_type="allow",
+            )
+        )
+        await session.commit()  # type: ignore[attr-defined]
+    except Exception:
+        logger.info("workspace grant registration unavailable user_id=%s", user_id)
+        try:
+            await session.rollback()  # type: ignore[attr-defined]
+        except Exception:
+            pass
 
 
 async def _owned_workspaces(session: object, user_id: str) -> frozenset[str]:

@@ -14,6 +14,7 @@ from app.tools.file_sandbox import (
     MAX_SCAN_FILES,
     MAX_SNIPPET_CHARS,
     FileDenied,
+    FileNotText,
     FileTooLarge,
     blocked_name,
     confined,
@@ -166,6 +167,8 @@ def read_text_file(args: ReadArgs) -> str:
         )
     except FileTooLarge:
         return _too_large()
+    except FileNotText:
+        return _not_text()
     except FileDenied:
         return _unavailable()
 
@@ -201,7 +204,7 @@ def search_text(args: SearchArgs) -> str:
                 break
             try:
                 text = load_text(path)
-            except (FileDenied, FileTooLarge):
+            except (FileDenied, FileTooLarge, FileNotText):
                 continue
             for number, line in enumerate(text.splitlines(), start=1):
                 if args.query not in line:
@@ -290,6 +293,21 @@ def _too_large() -> str:
             "error": {"code": "file_too_large", "message": "文件超出大小上限"},
             "untrusted": True,
             "truncated": True,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _not_text() -> str:
+    """二进制/非 UTF-8 文件：明确告诉模型换工具，而不是「路径不可用」。"""
+    return json.dumps(
+        {
+            "source": "workspace",
+            "error": {
+                "code": "file_not_text",
+                "message": "该文件不是 UTF-8 文本（可能是 .docx/.pdf/.doc 等二进制文件），请改用对应的文档工具读取。",
+            },
+            "untrusted": True,
         },
         ensure_ascii=False,
     )

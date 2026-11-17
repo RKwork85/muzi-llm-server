@@ -40,7 +40,14 @@ class StaticPatternAuditor:
         re.compile(r"无视(?:系统)?(?:提示词|指令|规则)", re.IGNORECASE),
     )
     _CREDENTIAL = (
-        re.compile(r"os\.environ|os\.getenv|getenv\s*\(|process\.env", re.IGNORECASE),
+        # 整体读取/外发环境变量。os.environ.copy() 是给子进程传环境的合法用法，排除之。
+        re.compile(r"os\.environ(?!\.copy\s*\()|process\.env", re.IGNORECASE),
+        # 读取单个「敏感名称」的环境变量；os.getenv("HOME") 这类无害用法不误杀。
+        re.compile(
+            r"(?:os\.environ\s*\[\s*['\"]|os\.environ\.get\s*\(\s*['\"]|os\.getenv\s*\(\s*['\"]|getenv\s*\(\s*['\"])"
+            r"[\w-]*(?:api[_-]?key|access[_-]?key|secret|token|password|passwd|credential|private[_-]?key)",
+            re.IGNORECASE,
+        ),
         re.compile(r"\.aws[\\/]credentials|id_rsa|id_ed25519|\.netrc|\bnpmrc\b", re.IGNORECASE),
         re.compile(r"(?:api[_-]?key|secret|password|token)\s*[:=]\s*['\"][A-Za-z0-9_\-]{8,}", re.IGNORECASE),
     )

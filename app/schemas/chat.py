@@ -105,7 +105,9 @@ class ChatMessageIn(BaseModel):
     content 支持纯文本或 OpenAI 兼容的多模态内容块数组：
     - text: {"type": "text", "text": "..."}
     - 图片: {"type": "image_url", "image_url": {"url": "...", "detail": "auto"}}
-    - 视频/文件: 仅方舟（ark）provider 使用 file_id 形式。
+    - 视频: 仅方舟（ark）provider 使用 file_id 形式。
+    - 文件: 方舟用嵌套 {"type": "file", "file": {"file_id": "..."}}；
+      DeepSeek 用扁平 {"type": "file", "file_id": "..."}。
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -149,7 +151,10 @@ class ChatMessageIn(BaseModel):
                     raise ValueError("视频内容块缺少 url 或 file_id")
             elif btype == "file":
                 src = block.get("file")
-                if not isinstance(src, dict) or not (src.get("file_id") or src.get("url")):
+                flat_id = block.get("file_id")
+                has_nested = isinstance(src, dict) and bool(src.get("file_id") or src.get("url"))
+                has_flat = isinstance(flat_id, str) and bool(flat_id.strip())
+                if not has_nested and not has_flat:
                     raise ValueError("文件内容块缺少 file_id 或 url")
         if total_text > _MAX_TEXT_CHARS:
             raise ValueError("消息文本过长")

@@ -108,6 +108,46 @@ def test_explicit_workspace_toolset_does_not_grant_write_or_delete(tmp_path) -> 
     assert names == {"list_directory", "read_text_file", "search_text"}
 
 
+def test_code_toolset_unlocks_run_python_but_run_command_needs_grant(tmp_path) -> None:
+    """Phase 4：前端按用户权限动态传 toolset。
+
+    - developer（有 agent.command.execute）传 ['skills','code']：run_python 进名单，
+      模型能 load_skill 后现场写代码处理用户文件；run_command 仍需显式 grant。
+    - member（只有 skill.execute）传 ['skills']：只有技能工具，run_python 不可见，
+      不会出现「传了 code 却被执行层拒」的空转。
+    """
+    registry = build_agent_registry()
+    settings = make_settings(
+        tools_workspace_root=str(tmp_path),
+        skills_root=str(tmp_path / "skills"),
+    )
+
+    developer = set(
+        agent_tool_names(
+            registry,
+            settings,
+            toolsets=["skills", "code"],
+            grants=None,
+            permissions={"agent.execute", "skill.execute", "agent.command.execute"},
+        )
+    )
+    assert {"run_python", "discover_skills", "load_skill", "read_skill_resource", "execute_skill_script"} <= developer
+    assert "run_command" not in developer
+
+    member = set(
+        agent_tool_names(
+            registry,
+            settings,
+            toolsets=["skills"],
+            grants=None,
+            permissions={"agent.execute", "skill.execute"},
+        )
+    )
+    assert {"discover_skills", "load_skill", "read_skill_resource", "execute_skill_script"} <= member
+    assert "run_python" not in member
+    assert "run_command" not in member
+
+
 def test_write_docx_is_a_real_word_package_and_text_writer_refuses_it(tmp_path) -> None:
     import xml.etree.ElementTree as ET
     import zipfile

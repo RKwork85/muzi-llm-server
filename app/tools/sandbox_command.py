@@ -9,12 +9,15 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import subprocess
-from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.tools.sandbox_dir import make_sandbox, purge, redact_paths, safe_env
+from app.tools.sandbox import (
+    SandboxExecutionError,
+    SandboxSpec,
+    SandboxTimeoutError,
+    get_provider,
+)
 from app.tools.web_tools import CURRENT_SETTINGS
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
@@ -41,7 +44,6 @@ _HARD_DENY = frozenset(
     }
 )
 _BLOCKED_ARGS = frozenset({"-c", "/c", "-command", "-encodedcommand", "--command"})
-_MAX_OUTPUT = 8000
 
 
 class CommandArgs(BaseModel):
@@ -72,45 +74,32 @@ class CommandArgs(BaseModel):
 
 
 def run_command(args: CommandArgs) -> str:
-    sandbox: Path | None = None
+    settings = CURRENT_SETTINGS.get()
+    if settings is None:
+        return _error("command_not_authorized", "命令未授权")
+    name = args.command.lower()
+    if name in _HARD_DENY or name not in _allowlist(settings):
+        return _error("command_not_authorized", "命令未授权")
+    executable = shutil.which(args.command)
+    if not executable:
+        return _error("command_not_authorized", "命令未授权")
+    spec = SandboxSpec(
+        argv=[args.command, *args.args],
+        timeout=settings.tools_sandbox_timeout_seconds,
+        sandbox_prefix="muzi_cmd_",
+    )
     try:
-        settings = CURRENT_SETTINGS.get()
-        if settings is None:
-            return _error("command_not_authorized", "命令未授权")
-        name = args.command.lower()
-        if name in _HARD_DENY or name not in _allowlist(settings):
-            return _error("command_not_authorized", "命令未授权")
-        executable = shutil.which(args.command)
-        if not executable:
-            return _error("command_not_authorized", "命令未授权")
-        timeout = settings.tools_sandbox_timeout_seconds
-        sandbox = make_sandbox("muzi_cmd_")
-        completed = subprocess.run(
-            [executable, *args.args],
-            cwd=str(sandbox),
-            shell=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            env=safe_env(),
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
+        result = get_provider(settings).run(spec)
+    except SandboxTimeoutError:
         return _error("command_timeout", "命令超时")
-    except OSError:
+    except SandboxExecutionError:
         return _error("command_failed", "命令执行失败")
-    finally:
-        purge(sandbox)
-    output = redact_paths(f"{completed.stdout}{completed.stderr}", sandbox)
-    truncated = len(output) > _MAX_OUTPUT
     return json.dumps(
         {
             "command": args.command,
-            "exit_code": completed.returncode,
-            "output": output[:_MAX_OUTPUT],
-            "truncated": truncated,
+            "exit_code": result.exit_code,
+            "output": result.output,
+            "truncated": result.truncated,
         },
         ensure_ascii=False,
     )

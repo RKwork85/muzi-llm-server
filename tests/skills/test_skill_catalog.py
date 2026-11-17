@@ -50,6 +50,8 @@ def test_catalog_lists_enabled_system_skills(tmp_path: Path) -> None:
             "source": "superpowers",
             "scope": "system",
             "executable": False,
+            "icon": "",
+            "display_name": "",
         }
     ]
 

@@ -189,7 +189,15 @@ def execute_skill_script(args: ExecuteSkillScriptArgs) -> str:
             return _error("execute_skill_script", "SKILL_RUNTIME_UNSUPPORTED", "暂不支持该语言")
         package = registry.package_dir(args.skill_id, skill.metadata.version, actor=actor)
         entrypoint_rel = _validate_entrypoint(package, spec.entrypoint)
-        result = run_skill_script(package, entrypoint_rel, args.args, timeout=spec.timeout)
+        result = run_skill_script(
+            package,
+            entrypoint_rel,
+            args.args,
+            timeout=spec.timeout,
+            dependencies=spec.dependencies,
+            network=spec.network,
+            memory_limit=spec.memory_limit,
+        )
         if "error" in result:
             return json.dumps(
                 {"source": "server_tool", "name": "execute_skill_script", "error": result["error"]},

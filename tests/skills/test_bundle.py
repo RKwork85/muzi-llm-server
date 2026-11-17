@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from app.skills.errors import SkillError, SkillValidationError
-from app.skills.models import SkillActor, SkillScope, SkillStatus
+from app.skills.errors import SkillError, SkillStateError, SkillValidationError
+from app.skills.models import SkillAction, SkillActor, SkillScope, SkillStatus
 from app.skills.registry import FileSkillRegistry
 
 
@@ -52,6 +52,24 @@ def test_bundle_import_lists_and_uninstalls(tmp_path: Path) -> None:
     assert registry.read_instructions(listed[0].skills[0].skill_id, "1.0.0", actor=actor)
     registry.uninstall_bundle(bundle.bundle_id, actor=actor)
     assert registry.list_bundles(actor=actor) == []
+
+
+def test_bundle_uninstall_is_atomic_when_any_skill_is_busy(tmp_path: Path) -> None:
+    """包内任一技能仍在用就整体拒绝，不能留下半卸载的技能包。"""
+    registry = FileSkillRegistry(tmp_path)
+    actor = SkillActor(user_id="user-1")
+    bundle = registry.import_bundle(_bundle_zip(), actor=actor, name="superpowers.zip", scope=SkillScope.USER)
+    busy, idle = bundle.skills[0].skill_id, bundle.skills[1].skill_id
+    registry.apply(busy, SkillAction.INSTALL, actor=actor)
+    registry.apply(busy, SkillAction.ENABLE, actor=actor)
+    registry.reserve(busy, actor=actor)
+    with pytest.raises(SkillStateError) as error:
+        registry.uninstall_bundle(bundle.bundle_id, actor=actor)
+    assert error.value.code == "SKILL_IN_USE"
+    # 校验失败时一个技能都不落盘，包仍然完整
+    assert registry.get(busy, actor=actor).metadata.status == SkillStatus.ENABLED
+    assert registry.get(idle, actor=actor).metadata.status == SkillStatus.REGISTERED
+    assert len(registry.list_bundles(actor=actor)) == 1
 
 
 def test_bundle_rejects_empty_or_escaping(tmp_path: Path) -> None:
@@ -109,6 +127,66 @@ def test_bundle_rejects_invalid_skill_with_zero_disk_write(tmp_path: Path) -> No
     # 零写入：records 无 sk_*.json，packages 无残留
     assert list((tmp_path / "records").glob("sk_*.json")) == []
     assert not (tmp_path / "packages").exists() or list((tmp_path / "packages").iterdir()) == []
+    assert registry.list_bundles(actor=actor) == []
+
+
+def test_bundle_accepts_compressed_resources_that_expand_over_1mb(tmp_path: Path) -> None:
+    """重资源技能包：压缩后很小但解压后超 1MB，在新上限内应能导入。
+
+    典型是 office 技能内嵌 XSD schema：zip 约 160KB，解压后 1.15MB，
+    单个 schema 文件可达 246KB。旧上限 1MB 会误拒。
+    """
+    registry = FileSkillRegistry(tmp_path)
+    actor = SkillActor(user_id="user-1")
+    big_schema = b"x" * 300_000  # 300KB，超过旧 256KB 单文件上限
+    payload = _zip_of(
+        {
+            "skills/office/SKILL.md": _skill_text("office", "Office 文档处理"),
+            "skills/office/scripts/schemas/a.xsd": big_schema.decode("latin-1"),
+            "skills/office/scripts/schemas/b.xsd": ("y" * 900_000),
+            "skills/office/scripts/schemas/c.xsd": ("z" * 100_000),
+        }
+    )
+    bundle = registry.import_bundle(payload, actor=actor, name="office.zip", scope=SkillScope.USER)
+    assert bundle.skill_count == 1
+    assert registry.list_bundles(actor=actor)
+
+
+def test_bundle_still_rejects_package_over_limit(tmp_path: Path) -> None:
+    registry = FileSkillRegistry(tmp_path)
+    actor = SkillActor(user_id="user-1")
+    # 6MB 解压总量超过 5MB 上限
+    payload = _zip_of(
+        {
+            "skills/big/SKILL.md": _skill_text("big", "超大"),
+            "skills/big/blob.bin": "b" * (5_000_001),
+        }
+    )
+    with pytest.raises(SkillValidationError) as error:
+        registry.import_bundle(payload, actor=actor, name="big.zip", scope=SkillScope.USER)
+    assert error.value.code == "SKILL_PACKAGE_TOO_LARGE"
+    assert registry.list_bundles(actor=actor) == []
+
+
+def test_bundle_imports_from_file_like_stream(tmp_path: Path) -> None:
+    """import_bundle 接受 file-like 输入（流式），不再强制 bytes。"""
+    registry = FileSkillRegistry(tmp_path)
+    actor = SkillActor(user_id="user-1")
+    payload = _zip_of({"skills/a/SKILL.md": _skill_text("a", "流式技能")})
+    bundle = registry.import_bundle(io.BytesIO(payload), actor=actor, name="stream.zip", scope=SkillScope.USER)
+    assert bundle.skill_count == 1
+    assert registry.list_bundles(actor=actor)
+
+
+def test_bundle_can_uninstall_a_rejected_skill(tmp_path: Path) -> None:
+    """审核被拒（REJECTED）的技能也应能卸载，不能卡死在「当前状态不能执行该动作」。"""
+    registry = FileSkillRegistry(tmp_path)
+    actor = SkillActor(user_id="user-1")
+    bundle = registry.import_bundle(_bundle_zip(), actor=actor, name="rejected.zip", scope=SkillScope.USER)
+    for meta in bundle.skills:
+        registry.reject(meta.skill_id, actor=actor)
+        assert registry.get(meta.skill_id, actor=actor).metadata.status == SkillStatus.REJECTED
+    registry.uninstall_bundle(bundle.bundle_id, actor=actor)
     assert registry.list_bundles(actor=actor) == []
 
 

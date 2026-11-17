@@ -237,6 +237,25 @@ async def test_ask_mode_tool_permissions_follow_mode_scoped_codes() -> None:
         CURRENT_EXECUTION.reset(token)
 
 
+async def test_skill_execution_audits_as_sensitive() -> None:
+    """execute_skill_script（access=sandbox_exec）在 skills 分支下也要留审计，读取类技能工具不审计。"""
+    from app.authorization.application.execution_guard import ExecutionGuard
+
+    token = CURRENT_EXECUTION.set(_context("agent", set(_MEMBER)))
+    guard = ExecutionGuard()
+    try:
+        run = guard.decide(tool_name="execute_skill_script", toolset="skills", access="sandbox_exec")
+        assert run.allowed is True
+        assert run.permission == "skill.execute"
+        assert run.audit is True
+
+        read = guard.decide(tool_name="discover_skills", toolset="skills", access="read_local")
+        assert read.allowed is True
+        assert read.audit is False
+    finally:
+        CURRENT_EXECUTION.reset(token)
+
+
 async def test_workspace_key_is_not_ownership() -> None:
     key_a = "a" * 43
     key_b = "b" * 43

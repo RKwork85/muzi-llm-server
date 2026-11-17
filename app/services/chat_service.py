@@ -305,7 +305,7 @@ class ChatService:
             extra = f"{extra}\n\n{UNTRUSTED_PROMPT}" if extra else UNTRUSTED_PROMPT
         if extra:
             system["content"] = f"{system['content']}\n\n{extra}"
-        self._apply_registered_skills(body, system, prepared.request_id, mcp_user_id)
+        self._apply_registered_skills(body, system, prepared, mcp_user_id)
         prepared.runtime_mode = mode
         full = system["content"] if isinstance(system.get("content"), str) else ""
         tail = full[len(prepared.system_text) :] if full.startswith(prepared.system_text) else ""
@@ -326,7 +326,7 @@ class ChatService:
         self,
         body: StreamChatRequest,
         system: dict[str, Any],
-        request_id: str,
+        prepared: PreparedChat,
         principal_id: str | None,
     ) -> None:
         if self.skill_runtime is None or not body.skill_mode:
@@ -337,17 +337,37 @@ class ChatService:
         from app.skills.discovery_models import DiscoveryMode
 
         task = next((content_text(item.content) for item in reversed(body.messages) if item.role == "user"), "")
-        prompt, _result = self.skill_runtime.apply(
-            system["content"],
-            principal_id=principal_id or "",
-            task_id=request_id,
-            task_text=task,
-            surface="chat",
-            mode=DiscoveryMode(body.skill_mode),
-            conversation_id=request_id,
-            explicit_skill_ids=tuple(body.explicit_skill_ids),
-        )
-        system["content"] = prompt
+        activated = False
+        try:
+            prompt, result = self.skill_runtime.apply(
+                system["content"],
+                principal_id=principal_id or "",
+                task_id=prepared.request_id,
+                task_text=task,
+                surface="chat",
+                mode=DiscoveryMode(body.skill_mode),
+                conversation_id=prepared.request_id,
+                explicit_skill_ids=tuple(body.explicit_skill_ids),
+            )
+            system["content"] = prompt
+            activated = bool(getattr(result, "skill_ids", ()))
+        finally:
+            # 聊天只需要快照把正文拼进提示词：正文已经在 provider_request 里，
+            # 这里必须归还计数，否则技能会一直显示“仍有任务在使用”。
+            if activated:
+                self._close_skill_task(prepared.request_id, principal_id or "")
+
+    def _close_skill_task(self, task_id: str, principal_id: str) -> None:
+        if not principal_id or self.skill_runtime is None:
+            return
+        orchestrator = getattr(self.skill_runtime, "orchestrator", None)
+        close = getattr(orchestrator, "complete", None)
+        if close is None:
+            return
+        try:
+            close(task_id, principal_id=principal_id)
+        except Exception:  # 收口失败不能影响已经准备好的请求
+            logger.info("skill activation close skipped task=%s", task_id)
 
     def ensure_ready(self) -> None:
         ensure = getattr(self.provider, "ensure_ready", None)
@@ -640,9 +660,16 @@ class ChatService:
                                     )
                                 piece = previews.push(index, slot["name"], slot["arguments"])
                                 if piece:
+                                    # preview=True：这是工具参数里的草稿正文，不是回答正文。
+                                    # 前端只把它贴到工具卡片上，不并入消息 content，
+                                    # 否则生成的整段脚本会被当成回答持久化。
                                     yield format_sse(
                                         "delta",
-                                        {"request_id": prepared.request_id, "content": piece},
+                                        {
+                                            "request_id": prepared.request_id,
+                                            "content": piece,
+                                            "preview": True,
+                                        },
                                     )
                         if chunk.usage is not None:
                             round_usage = chunk.usage
@@ -826,9 +853,13 @@ class ChatService:
 
                         success = _tool_succeeded(str(tool_message["content"]))
                         resource_payload["status"] = "completed" if success else "failed"
-                        tokens = quote_tool_tokens(spec.pricing, tool_name=call.name, success=success)
-                        if tokens > 0:
-                            resource_payload["external_tokens"] = tokens
+                        # 不能复用 tokens：它是上面 ContextVar 的 (var, token) 列表，
+                        # 被覆盖成 int 后 finally 里的 reversed(tokens) 会直接抛 TypeError。
+                        priced_tokens = quote_tool_tokens(
+                            spec.pricing, tool_name=call.name, success=success
+                        )
+                        if priced_tokens > 0:
+                            resource_payload["external_tokens"] = priced_tokens
                     yield format_sse("resource", resource_payload)
                     detail, preview = _tool_public(call.name, call.arguments, tool_message["content"])
                     cards, total = _tool_cards(call.name, call.arguments, tool_message["content"])

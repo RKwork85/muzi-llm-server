@@ -680,6 +680,51 @@ class CommunityConnector(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     website_url: Mapped[str | None] = mapped_column(String(255))
 
 
+class ChatShare(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
+    """公开分享的对话快照。任何人凭 share_id 只读访问，页面注明来源。"""
+
+    __tablename__ = "chat_shares"
+    __table_args__ = (
+        UniqueConstraint("share_id", name="uq_chat_shares_share_id"),
+        Index("ix_chat_shares_owner_created", "owner_id", "created_at"),
+        Index("ix_chat_shares_share_id", "share_id"),
+        {"comment": "公开分享的对话快照，凭 share_id 只读访问。"},
+    )
+
+    share_id: Mapped[str] = mapped_column(String(32), nullable=False)
+    owner_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_chat_shares_owner_id", ondelete="SET NULL"),
+    )
+    chat_id: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default=text("''"))
+    title: Mapped[str] = mapped_column(String(200), nullable=False, default="", server_default=text("''"))
+    snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=_JSON_OBJECT
+    )
+    source_name: Mapped[str] = mapped_column(String(120), nullable=False, default="", server_default=text("''"))
+    source_username: Mapped[str | None] = mapped_column(String(32))
+
+
+class SkillCustomization(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """用户为已上传技能自定义的显示名与图标。以 data URL 存图标，避免对象存储依赖。"""
+
+    __tablename__ = "skill_customizations"
+    __table_args__ = (
+        UniqueConstraint("user_id", "skill_id", name="uq_skill_customizations_user_skill"),
+        Index("ix_skill_customizations_user", "user_id"),
+        {"comment": "用户为已上传技能自定义的显示名与图标。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_skill_customizations_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    skill_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    icon: Mapped[str | None] = mapped_column(Text)
+    display_name: Mapped[str | None] = mapped_column(String(120))
+
+
 def _register_listeners() -> None:
     from app.core.database.redaction import register_redaction_listeners
 

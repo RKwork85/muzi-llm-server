@@ -11,7 +11,9 @@ import secrets
 import shutil
 import tempfile
 import zipfile
+from collections.abc import Mapping
 from pathlib import Path
+from typing import BinaryIO
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
@@ -35,8 +37,11 @@ from app.skills.models import (
 from app.skills.paths import normalize_resource_path
 from app.skills.state import assert_scope_writable, assert_source_enabled, can_activate, transition
 
-_MAX_PACKAGE = 1_000_000
-_MAX_RESOURCE = 262144
+# 技能包体积上限（防 zip 炸弹）。_MAX_PACKAGE 是解压后所有文件之和，
+# _MAX_RESOURCE 是解压后单个文件大小。技能包可能内嵌 XSD/模板等重资源，
+# 压缩后很小但解压后膨胀，故总量上限按解压后计。
+_MAX_PACKAGE = 5_000_000
+_MAX_RESOURCE = 2_097_152
 
 
 class _VersionEntry(BaseModel):
@@ -271,7 +276,7 @@ class FileSkillRegistry:
         self._save(record)
         return self._skill(record)
 
-    def import_zip(self, payload: bytes, *, actor: SkillActor, label: str, scope: SkillScope) -> Skill:
+    def import_zip(self, payload: bytes | BinaryIO, *, actor: SkillActor, label: str, scope: SkillScope) -> Skill:
         archive, members = _open_zip(payload)
         try:
             text = members["SKILL.md"].decode("utf-8")
@@ -385,7 +390,7 @@ class FileSkillRegistry:
 
     def import_bundle(
         self,
-        payload: bytes,
+        payload: bytes | BinaryIO,
         *,
         actor: SkillActor,
         name: str,
@@ -457,12 +462,29 @@ class FileSkillRegistry:
         ]
         if not records:
             raise SkillError("BUNDLE_NOT_FOUND", "技能包不存在")
+        visible = [record for record in records if self._can_see(record, actor)]
+        if not visible:
+            raise SkillError("BUNDLE_NOT_FOUND", "技能包不存在")
         bundle = self._bundle(bundle_id, actor=actor)
-        for record in records:
-            if not self._can_see(record, actor):
-                continue
+        # 先把包内每个技能都校验一遍，任何一个仍在用就整体拒绝，
+        # 避免卸载到一半才报 SKILL_IN_USE，留下半卸载的技能包。
+        for record in visible:
+            transition(record.status, SkillAction.UNINSTALL, active_count=record.active_count)
+        for record in visible:
             self.apply(record.skill_id, SkillAction.UNINSTALL, actor=actor)
         return bundle
+
+    def sync_active_counts(self, counts: Mapping[str, int]) -> dict[str, int]:
+        """把安装记录的活跃计数对齐到运行快照，返回被修正的 skill_id 与旧值。"""
+        fixed: dict[str, int] = {}
+        for record in self._records():
+            expected = counts.get(record.skill_id, 0)
+            if record.active_count == expected:
+                continue
+            fixed[record.skill_id] = record.active_count
+            record.active_count = expected
+            self._save(record)
+        return fixed
 
     def _bundle(self, bundle_id: str, *, actor: SkillActor) -> SkillBundle:
         metas: list[SkillMetadata] = []
@@ -688,13 +710,26 @@ def _render(record: _Record, body: str) -> str:
     return "\n".join(lines) + "\n" + body
 
 
-def _open_zip(payload: bytes) -> tuple[zipfile.ZipFile, dict[str, bytes]]:
-    if len(payload) > _MAX_PACKAGE:
-        raise SkillValidationError("SKILL_PACKAGE_TOO_LARGE", "技能包过大")
+def _open_archive(payload: bytes | BinaryIO) -> zipfile.ZipFile:
+    """把 bytes 或已打开的二进制流包装成 ZipFile。
+
+    流式输入（如 UploadFile 的底层 spooled 文件）直接复用，不再全量读入内存
+    复制一份 bytes；只有 bytes 输入才做压缩后大小的预检（流式输入靠解压后总量兜底）。
+    """
+    if isinstance(payload, (bytes, bytearray)):
+        if len(payload) > _MAX_PACKAGE:
+            raise SkillValidationError("SKILL_PACKAGE_TOO_LARGE", "技能包过大")
+        source: BinaryIO = io.BytesIO(payload)
+    else:
+        source = payload
     try:
-        archive = zipfile.ZipFile(io.BytesIO(payload))
+        return zipfile.ZipFile(source)
     except zipfile.BadZipFile as exc:
         raise SkillValidationError("SKILL_PACKAGE_INVALID", "技能包无效") from exc
+
+
+def _open_zip(payload: bytes | BinaryIO) -> tuple[zipfile.ZipFile, dict[str, bytes]]:
+    archive = _open_archive(payload)
     total = 0
     names: list[str] = []
     for info in archive.infolist():
@@ -777,14 +812,9 @@ def _bundle_entry_path(name: str) -> str | None:
     return "/".join(parts)
 
 
-def _extract_bundle(payload: bytes) -> Path:
+def _extract_bundle(payload: bytes | BinaryIO) -> Path:
     """把技能包 zip 安全解压到临时目录，返回目录路径（调用方负责清理）。"""
-    if len(payload) > _MAX_PACKAGE:
-        raise SkillValidationError("SKILL_PACKAGE_TOO_LARGE", "技能包过大")
-    try:
-        archive = zipfile.ZipFile(io.BytesIO(payload))
-    except zipfile.BadZipFile as exc:
-        raise SkillValidationError("SKILL_PACKAGE_INVALID", "技能包无效") from exc
+    archive = _open_archive(payload)
     base = Path(tempfile.mkdtemp(prefix="skill_bundle_"))
     try:
         total = 0

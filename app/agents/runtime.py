@@ -152,10 +152,10 @@ class AgentRuntime:
             max_queue_size=policy.max_event_queue_size,
             observer=event_observer,
         )
-        prompt, skill_result = self._apply_registered_skills(prompt, request, record.task_id, mcp_user_id)
-        user_id_for_meter = owner_id or mcp_user_id
-        if skill_result is not None and user_id_for_meter:
-            await self._record_skill_usage(user_id_for_meter, record.task_id, skill_result)
+        skill_principal_id = owner_id or mcp_user_id
+        prompt, skill_result = self._apply_registered_skills(prompt, request, record.task_id, skill_principal_id)
+        if skill_result is not None and skill_principal_id:
+            await self._record_skill_usage(skill_principal_id, record.task_id, skill_result)
         worker = asyncio.create_task(
             self._execute(record, request.message, prompt, policy, workspace_scope, mcp_user_id, registry),
             name=f"agent:{record.task_id}",

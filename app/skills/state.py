@@ -33,6 +33,8 @@ _NEXT: dict[tuple[SkillStatus | None, SkillAction], SkillStatus] = {
     (SkillStatus.INSTALLED, SkillAction.UNINSTALL): SkillStatus.UNINSTALLED,
     (SkillStatus.ENABLED, SkillAction.UNINSTALL): SkillStatus.UNINSTALLED,
     (SkillStatus.DISABLED, SkillAction.UNINSTALL): SkillStatus.UNINSTALLED,
+    # 审核被拒（REJECTED）的技能也要能卸载，否则用户无法清理审核不通过的包。
+    (SkillStatus.REJECTED, SkillAction.UNINSTALL): SkillStatus.UNINSTALLED,
 }
 
 

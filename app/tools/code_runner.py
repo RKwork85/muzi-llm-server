@@ -9,16 +9,16 @@
 from __future__ import annotations
 
 import json
-import subprocess
-import sys
-from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.tools.sandbox_dir import make_sandbox, purge, redact_paths, safe_env
+from app.tools.sandbox import (
+    SandboxExecutionError,
+    SandboxSpec,
+    SandboxTimeoutError,
+    get_provider,
+)
 from app.tools.web_tools import CURRENT_SETTINGS
-
-_MAX_OUTPUT = 8000
 
 
 class PythonArgs(BaseModel):
@@ -35,41 +35,28 @@ class PythonArgs(BaseModel):
 
 
 def run_python(args: PythonArgs) -> str:
-    sandbox: Path | None = None
+    settings = CURRENT_SETTINGS.get()
+    if settings is None:
+        return _error("code_unavailable", "代码执行暂不可用")
+    spec = SandboxSpec(
+        argv=["python", "-I", "-P", "-u", "main.py"],
+        files={"main.py": args.code.encode("utf-8")},
+        timeout=settings.tools_sandbox_timeout_seconds,
+        sandbox_prefix="muzi_py_",
+        redact_script_name="main.py",
+    )
     try:
-        settings = CURRENT_SETTINGS.get()
-        if settings is None:
-            return _error("code_unavailable", "代码执行暂不可用")
-        timeout = settings.tools_sandbox_timeout_seconds
-        sandbox = make_sandbox("muzi_py_")
-        script = sandbox / "main.py"
-        script.write_text(args.code, encoding="utf-8")
-        completed = subprocess.run(
-            [sys.executable, "-I", "-P", "-u", str(script)],
-            cwd=str(sandbox),
-            shell=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-            env=safe_env(),
-            stdin=subprocess.DEVNULL,
-            check=False,
-        )
-    except subprocess.TimeoutExpired:
+        result = get_provider(settings).run(spec)
+    except SandboxTimeoutError:
         return _error("code_timeout", "代码执行超时")
-    except OSError:
+    except SandboxExecutionError:
         return _error("code_failed", "代码执行失败")
-    finally:
-        purge(sandbox)
-    output = redact_paths(f"{completed.stdout}{completed.stderr}", sandbox, script_name="main.py")
     return json.dumps(
         {
             "language": "python",
-            "exit_code": completed.returncode,
-            "output": output[:_MAX_OUTPUT],
-            "truncated": len(output) > _MAX_OUTPUT,
+            "exit_code": result.exit_code,
+            "output": result.output,
+            "truncated": result.truncated,
         },
         ensure_ascii=False,
     )

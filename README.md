@@ -100,6 +100,7 @@ python -m pip install -r requirements.lock.txt
 | `LLM_PROVIDER` | 模型提供方 | `deepseek` |
 | `LOG_LEVEL` | 日志级别 | `INFO` |
 | `RUNTIME_ENV` | 运行环境，生产填 `production` | `development` |
+| `SHARE_PUBLIC_BASE_URL` | 分享链接的对外站点。生产固定用它，开发端用请求来源 host | `https://muzihhh.com` |
 
 其余字段与取值范围见 `app/core/config.py` 与 `.env.example`，改 `.env` 后需重启进程。
 

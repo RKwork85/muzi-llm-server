@@ -191,6 +191,31 @@ def test_repeat_activation_is_idempotent_and_concurrent(tmp_path: Path) -> None:
         move(RuntimePhase.COMPLETED, "activate")
 
 
+def test_reconcile_reclaims_stale_activations(tmp_path: Path) -> None:
+    """进程遗留的活跃快照在启动对账时结束，active_count 回到 0，技能才能卸载。"""
+    registry, orchestrator = _service(tmp_path)
+    skill = _enable(registry, _WEEKLY)
+    actor = SkillActor(user_id="user-1")
+    result = orchestrator.prepare(
+        principal_id="user-1",
+        task_id="task-orphan",
+        task_text="请使用 weekly-report",
+        surface="chat",
+        mode=DiscoveryMode.AUTO,
+        system_text="系统",
+    )
+    assert result.activation_ids
+    assert registry.get(skill.metadata.skill_id, actor=actor).active_count == 1
+    fixed = orchestrator.reconcile()
+    assert fixed == {skill.metadata.skill_id: 1}
+    assert registry.get(skill.metadata.skill_id, actor=actor).active_count == 0
+    snapshot = orchestrator.store.get(result.activation_ids[0], principal_id="user-1")
+    assert snapshot.status == RuntimePhase.FAILED
+    assert snapshot.error_code == "SKILL_ACTIVATION_STALE"
+    # 再对账一次没有可变动的计数
+    assert orchestrator.reconcile() == {}
+
+
 def test_resource_paths_cannot_escape(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     package = tmp_path / "package"
     (package / "references").mkdir(parents=True)

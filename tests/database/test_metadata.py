@@ -58,6 +58,8 @@ EXPECTED_TABLES = {
     "quota_transactions",
     "model_pricing_versions",
     "summary_updates",
+    "chat_shares",
+    "skill_customizations",
 }
 
 ON_DELETE = {
@@ -127,6 +129,8 @@ ON_DELETE = {
     ("quota_transactions", "user_id"): "CASCADE",
     ("quota_transactions", "llm_usage_id"): "SET NULL",
     ("summary_updates", "user_id"): "CASCADE",
+    ("chat_shares", "owner_id"): "SET NULL",
+    ("skill_customizations", "user_id"): "CASCADE",
 }
 
 

@@ -118,6 +118,11 @@ def create_app(
                         ActivationStore(skill_root / "runtime"),
                     )
                 )
+                # 启动对账：回收上次进程遗留的活跃快照，修正被泄漏的 active_count。
+                try:
+                    skill_runtime.orchestrator.reconcile()
+                except Exception:
+                    logger.warning("skill reconcile failed", exc_info=True)
                 app.state.chat_service.skill_runtime = skill_runtime
                 agent_runtime.skill_runtime = skill_runtime
                 app.state.skill_runtime = skill_runtime

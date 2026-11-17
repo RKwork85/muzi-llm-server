@@ -27,6 +27,14 @@ class FileTooLarge(Exception):
     """普通文本超出字节上限。"""
 
 
+class FileNotText(Exception):
+    """文件存在但不是 UTF-8 文本（二进制、OLE/docx/pdf 等）。
+
+    与 FileDenied 区分开：调用方据此返回「不是文本文件，请用对应文档工具」，
+    而不是误导模型认为路径有问题。
+    """
+
+
 def confined(root: Path, candidate: Path) -> bool:
     try:
         candidate.relative_to(root)
@@ -92,8 +100,8 @@ def load_text(path: Path) -> str:
     if len(data) > MAX_FILE_BYTES:
         raise FileTooLarge()
     if b"\x00" in data:
-        raise FileDenied()
+        raise FileNotText()
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise FileDenied() from exc
+        raise FileNotText() from exc

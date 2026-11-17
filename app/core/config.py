@@ -85,6 +85,10 @@ class Settings(BaseSettings):
     tools_workspace_root: str = ""
     tools_sandbox_commands: str = ""
     tools_sandbox_timeout_seconds: float = Field(default=10, gt=0, le=20)
+    sandbox_backend: Literal["local", "agentbox"] = "local"
+    sandbox_docker_image: str = "python:3.12-slim"
+    sandbox_mem_mb: int = Field(default=512, gt=0, le=8192)
+    sandbox_network_enabled: bool = False
     tools_network_concurrency: int = Field(default=4, ge=1, le=8)
     # 人民币 → token 的汇率基准（1 token = 该值元）。工具扣费本身只认 token，
     # 此汇率仅供充值/定价系统把人民币换算成 token 额度时使用，示例 0.000001 表示 100 万 token = 1 元。
@@ -126,6 +130,9 @@ class Settings(BaseSettings):
     mcp_key_source: str = "local"
     mcp_previous_token_keys: str = Field(default="", repr=False)
     runtime_env: str = "development"
+    # 分享链接的对外站点根地址。
+    # 生产环境固定用该地址（默认 https://muzihhh.com）；开发环境优先回落到请求来源 host。
+    share_public_base_url: str = "https://muzihhh.com"
     mcp_public_base_url: str = "http://127.0.0.1:8000"
     mcp_frontend_base_url: str = "http://127.0.0.1:5500"
     mcp_allow_insecure: bool = False
@@ -186,6 +193,17 @@ class Settings(BaseSettings):
         parsed = urlparse(cleaned)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.path:
             raise ValueError("OSS_UPLOAD_BASE_URL 必须是不带路径和账号的 http(s) 地址")
+        return cleaned
+
+    @field_validator("share_public_base_url")
+    @classmethod
+    def _normalize_share_base_url(cls, value: str) -> str:
+        cleaned = value.strip().rstrip("/")
+        if not cleaned:
+            return ""
+        parsed = urlparse(cleaned)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("SHARE_PUBLIC_BASE_URL 必须是 http(s) 地址")
         return cleaned
 
     @field_validator("oss_upload_prefix")

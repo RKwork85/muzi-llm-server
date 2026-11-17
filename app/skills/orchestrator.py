@@ -203,6 +203,20 @@ class SkillOrchestrator:
                 self._release(snapshot.skill_id, principal_id)
         return done
 
+    def reconcile(self) -> dict[str, int]:
+        """启动对账：回收遗留的活跃快照，把安装记录的计数对齐到实际情况。"""
+        counts, reclaimed = self.store.reconcile()
+        fixed = self.registry.sync_active_counts(counts)
+        pruned = self.store.prune()
+        if reclaimed or fixed or pruned:
+            logger.info(
+                "skill reconcile reclaimed=%s pruned=%s fixed=%s",
+                reclaimed,
+                pruned,
+                ",".join(sorted(fixed)),
+            )
+        return fixed
+
     def _release(self, skill_id: str, principal_id: str) -> None:
         try:
             self.registry.release(skill_id, actor=SkillActor(user_id=principal_id))

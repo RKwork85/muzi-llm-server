@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from pathlib import Path
 
@@ -38,6 +39,15 @@ def test_current_time_format() -> None:
     assert "T" in text
 
 
+_SUBPROCESS_IMPORT = re.compile(
+    r"^\s*(?:import\s+subprocess\b|from\s+subprocess\s+import\b)", re.MULTILINE
+)
+
+
+def _references_subprocess_module(text: str) -> bool:
+    return _SUBPROCESS_IMPORT.search(text) is not None or "subprocess." in text
+
+
 def test_source_has_no_dynamic_execution() -> None:
     root = Path(__file__).resolve().parents[1] / "app"
     banned = ("eval(", "exec(", "os.system", "os.popen")
@@ -45,8 +55,10 @@ def test_source_has_no_dynamic_execution() -> None:
         text = path.read_text(encoding="utf-8")
         for token in banned:
             assert token not in text, f"{path} contains {token}"
-        if "subprocess" in text and path.name not in {"sandbox_command.py", "code_runner.py", "mcp_client.py"}:
-            raise AssertionError(f"{path} contains subprocess")
+        if path.name in {"subprocess_backend.py", "agentbox_backend.py", "mcp_client.py"}:
+            continue
+        if _references_subprocess_module(text):
+            raise AssertionError(f"{path} references the subprocess module")
 
 
 @pytest.mark.asyncio
