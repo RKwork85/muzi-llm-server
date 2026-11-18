@@ -38,18 +38,25 @@ from app.planning.api_schemas import (
     ConversationModeUpdate,
     PlanCreate,
     PlanEventList,
+    PlanMarkdownResponse,
     PlanMessage,
     PlanRuntimeResponse,
+    PlanTodoSetResponse,
 )
 from app.planning.contracts import (
+    ApproveAndExecuteRequest,
     ExecutionAuthorizationRequest,
     InteractionAction,
     InteractionSubmission,
     PlanApprovalRequest,
+    PlanSnapshot,
     PlanStatus,
+    PlanTodoSet,
     PlanningEventType,
+    TodoUpdateRequest,
 )
 from app.planning import revisions
+from app.planning.plan_markdown import plan_filename, render_plan_markdown
 from app.planning.runtime import PlanningConflict, PlanningNotFound, PlanningPolicyError
 from app.planning.sql_store import SqlPlanningStore
 
@@ -317,6 +324,122 @@ async def switch_to_agent(
         _translate(exc)
 
 
+async def _launch_execution(
+    *,
+    plan: PlanSnapshot,
+    approved_revision: int,
+    session: DbSession,
+    user: User,
+    request: Request,
+    runtime: AgentRuntime,
+    mcp: McpService | None,
+) -> dict[str, object]:
+    """创建 AgentTask + TaskExecution 并启动 runtime，返回 run 视图。
+
+    前置：plan 已处于 EXECUTING（authorize_execution 或 approve_and_authorize 已推进）。
+    启动失败时把计划回退到 FAILED 并重新抛出。
+    """
+    plan_id = plan.plan_id
+    db_task_id = uuid.UUID(hex=uuid.uuid4().hex)
+    task_id = db_task_id.hex
+    execution_id = uuid.uuid4()
+    run_request_id = get_request_id()
+    conversation_id = uuid.UUID(plan.conversation_id)
+    snapshot = plan.model_dump(mode="json")
+    session.add(
+        AgentTask(
+            id=db_task_id,
+            user_id=user.id,
+            session_id=conversation_id,
+            request_id=run_request_id,
+            task_type="agent",
+            status="created",
+            input_payload={
+                "surface": "interactive_planning_handoff",
+                "plan_id": plan_id,
+                "approved_revision": approved_revision,
+                "snapshot": snapshot,
+            },
+        )
+    )
+    session.add(
+        TaskExecution(
+            id=execution_id,
+            task_id=db_task_id,
+            status="pending",
+            execution_input={"plan_id": plan_id, "approved_revision": approved_revision},
+        )
+    )
+    await session.commit()
+    persistence = AgentRunPersistence(
+        get_session_factory(),
+        db_task_id,
+        execution_id,
+        lambda: runtime.get(task_id),
+    )
+    task_text = (
+        f"Execute the user-approved plan: {plan.goal}\n\n"
+        f"Confirmed decisions: {[item.model_dump(mode='json') for item in plan.decisions]}\n"
+        f"Constraints: {plan.constraints}\n"
+        f"Steps: {[item.model_dump(mode='json') for item in plan.steps]}\n"
+        f"Execution checklist ids: {[item.id for item in plan.steps]}\n"
+        "Progress protocol: before starting a step call update_todos with that id and "
+        "status=in_progress; after finishing it call update_todos with status=completed. "
+        "Reuse the ids above verbatim and do not invent new ones for planned steps."
+    )
+    agent_request = AgentRequest(
+        message=task_text,
+        prompt_name="assistant",
+        skill_mode=None,
+    )
+    mcp_user_id = await mcp.user_id_from_request(request) if mcp is not None else None
+    await QuotaService(session).authorize(user.id)
+    await session.commit()
+    workspace_scope = scope_dirname(request.headers.get("x-workspace-key"))
+    tool_context = await load_execution_context(
+        str(user.id),
+        runtime_mode="agent",
+        run_id=task_id,
+        conversation_id=str(plan.conversation_id) if getattr(plan, "conversation_id", None) else None,
+        workspace_scope=workspace_scope,
+        plan_id=plan_id,
+    )
+    token = CURRENT_EXECUTION.set(tool_context)
+    try:
+        return await runtime.start(
+            agent_request,
+            run_request_id,
+            workspace_scope=workspace_scope,
+            mcp_user_id=mcp_user_id,
+            mcp_service=mcp,
+            task_id=task_id,
+            event_observer=quota_event_observer(persistence, str(user.id), task_id),
+            owner_id=str(user.id),
+        )
+    except Exception:
+        task_row = await session.get(AgentTask, db_task_id)
+        execution_row = await session.get(TaskExecution, execution_id)
+        if task_row is not None:
+            task_row.status = TaskStatus.FAILED.value
+            task_row.error_code = "AGENT_START_FAILED"
+        if execution_row is not None:
+            execution_row.status = "failed"
+            execution_row.error_code = "AGENT_START_FAILED"
+            execution_row.finished_at = datetime.now(UTC)
+        await SqlPlanningStore(session)._transition(
+            plan_id,
+            user,
+            plan.revision,
+            PlanStatus.FAILED,
+            PlanningEventType.RUN_FAILED,
+            expected=PlanStatus.EXECUTING,
+        )
+        await session.commit()
+        raise
+    finally:
+        CURRENT_EXECUTION.reset(token)
+
+
 @router.post("/plans/{plan_id}/authorize-execution", response_model=PlanRuntimeResponse, summary="单独授权执行")
 async def authorize_execution(
     plan_id: str,
@@ -337,101 +460,124 @@ async def authorize_execution(
             expected_revision=body.expected_revision,
             authorization_id=body.authorization_id,
         )
-        db_task_id = uuid.UUID(hex=uuid.uuid4().hex)
-        task_id = db_task_id.hex
-        execution_id = uuid.uuid4()
-        run_request_id = get_request_id()
-        conversation_id = uuid.UUID(plan.conversation_id)
-        snapshot = plan.model_dump(mode="json")
-        session.add(
-            AgentTask(
-                id=db_task_id,
-                user_id=user.id,
-                session_id=conversation_id,
-                request_id=run_request_id,
-                task_type="agent",
-                status="created",
-                input_payload={
-                    "surface": "interactive_planning_handoff",
-                    "plan_id": plan.plan_id,
-                    "approved_revision": body.approved_revision,
-                    "snapshot": snapshot,
-                },
-            )
+        run = await _launch_execution(
+            plan=plan,
+            approved_revision=body.approved_revision,
+            session=session,
+            user=user,
+            request=request,
+            runtime=runtime,
+            mcp=mcp,
         )
-        session.add(
-            TaskExecution(
-                id=execution_id,
-                task_id=db_task_id,
-                status="pending",
-                execution_input={"plan_id": plan.plan_id, "approved_revision": body.approved_revision},
-            )
-        )
-        await session.commit()
-        persistence = AgentRunPersistence(
-            get_session_factory(),
-            db_task_id,
-            execution_id,
-            lambda: runtime.get(task_id),
-        )
-        task_text = (
-            f"Execute the user-approved plan: {plan.goal}\n\n"
-            f"Confirmed decisions: {[item.model_dump(mode='json') for item in plan.decisions]}\n"
-            f"Constraints: {plan.constraints}\n"
-            f"Steps: {[item.model_dump(mode='json') for item in plan.steps]}"
-        )
-        agent_request = AgentRequest(
-            message=task_text,
-            prompt_name="assistant",
-            grants=[],
-            skill_mode=None,
-        )
-        mcp_user_id = await mcp.user_id_from_request(request) if mcp is not None else None
-        await QuotaService(session).authorize(user.id)
-        await session.commit()
-        workspace_scope = scope_dirname(request.headers.get("x-workspace-key"))
-        tool_context = await load_execution_context(
-            str(user.id),
-            runtime_mode="agent",
-            run_id=task_id,
-            conversation_id=str(plan.conversation_id) if getattr(plan, "conversation_id", None) else None,
-            workspace_scope=workspace_scope,
-        )
-        token = CURRENT_EXECUTION.set(tool_context)
-        try:
-            run = await runtime.start(
-                agent_request,
-                run_request_id,
-                workspace_scope=workspace_scope,
-                mcp_user_id=mcp_user_id,
-                mcp_service=mcp,
-                task_id=task_id,
-                event_observer=quota_event_observer(persistence, str(user.id), task_id),
-                owner_id=str(user.id),
-            )
-        except Exception:
-            task_row = await session.get(AgentTask, db_task_id)
-            execution_row = await session.get(TaskExecution, execution_id)
-            if task_row is not None:
-                task_row.status = TaskStatus.FAILED.value
-                task_row.error_code = "AGENT_START_FAILED"
-            if execution_row is not None:
-                execution_row.status = "failed"
-                execution_row.error_code = "AGENT_START_FAILED"
-                execution_row.finished_at = datetime.now(UTC)
-            await SqlPlanningStore(session)._transition(
-                plan_id,
-                user,
-                plan.revision,
-                PlanStatus.FAILED,
-                PlanningEventType.RUN_FAILED,
-                expected=PlanStatus.EXECUTING,
-            )
-            await session.commit()
-            raise
-        finally:
-            CURRENT_EXECUTION.reset(token)
         return PlanRuntimeResponse(plan=plan, approved_revision=body.approved_revision, run=run)
+    except (PlanningNotFound, PlanningConflict, PlanningPolicyError) as exc:
+        _translate(exc)
+
+
+@router.post(
+    "/plans/{plan_id}/approve-and-execute",
+    response_model=PlanRuntimeResponse,
+    summary="单次门：确认计划并授权执行",
+)
+async def approve_and_execute(
+    plan_id: str,
+    body: ApproveAndExecuteRequest,
+    session: DbSession,
+    user: AuthenticatedUser,
+    request: Request,
+    runtime: AgentRuntime = Depends(get_agent_runtime),
+    mcp: McpService | None = Depends(optional_mcp),
+) -> PlanRuntimeResponse:
+    """一次调用完成「确认计划 → 切换 Agent → 授权执行」。
+
+    与三步审批等价：内部仍保留 approve / switch / authorize 的版本链与事件审计，
+    执行前仍做权限重校验（load_execution_context + QuotaService.authorize），
+    M6 安全门「mode switch 不隐含执行、执行前重校验授权」语义不变。
+    """
+    try:
+        plan, approved_revision = await SqlPlanningStore(session).approve_and_authorize(
+            plan_id,
+            user,
+            expected_revision=body.expected_revision,
+            authorization_id=body.authorization_id,
+        )
+        run = await _launch_execution(
+            plan=plan,
+            approved_revision=approved_revision,
+            session=session,
+            user=user,
+            request=request,
+            runtime=runtime,
+            mcp=mcp,
+        )
+        return PlanRuntimeResponse(plan=plan, approved_revision=approved_revision, run=run)
+    except (PlanningNotFound, PlanningConflict, PlanningPolicyError) as exc:
+        _translate(exc)
+
+
+@router.get(
+    "/plans/{plan_id}/todos",
+    response_model=PlanTodoSetResponse,
+    summary="读取执行期清单",
+)
+async def read_plan_todos(
+    plan_id: str,
+    session: DbSession,
+    user: AuthenticatedUser,
+) -> PlanTodoSetResponse:
+    try:
+        checklist = await SqlPlanningStore(session).get_todos(plan_id, user)
+    except (PlanningNotFound, PlanningConflict, PlanningPolicyError) as exc:
+        _translate(exc)
+    if checklist is None:
+        # 尚未授权执行：返回空清单，避免前端把「还没开始执行」当成错误。
+        plan = await SqlPlanningStore(session).get_plan(plan_id, user)
+        return PlanTodoSetResponse(
+            **PlanTodoSet(
+                plan_id=plan_id,
+                source_plan_revision=plan.revision,
+                todos=[],
+                updated_at=datetime.now(UTC),
+            ).model_dump()
+        )
+    return PlanTodoSetResponse(**checklist.model_dump())
+
+
+@router.post(
+    "/plans/{plan_id}/todos",
+    response_model=PlanTodoSetResponse,
+    summary="更新执行期清单",
+)
+async def update_plan_todos(
+    plan_id: str,
+    body: TodoUpdateRequest,
+    session: DbSession,
+    user: AuthenticatedUser,
+) -> PlanTodoSetResponse:
+    try:
+        checklist = await SqlPlanningStore(session).update_todos(plan_id, user, body)
+        await session.commit()
+        return PlanTodoSetResponse(**checklist.model_dump())
+    except (PlanningNotFound, PlanningConflict, PlanningPolicyError) as exc:
+        _translate(exc)
+
+
+@router.get(
+    "/plans/{plan_id}/plan-markdown",
+    response_model=PlanMarkdownResponse,
+    summary="导出计划的 .plan.md 产物",
+)
+async def export_plan_markdown(
+    plan_id: str,
+    session: DbSession,
+    user: AuthenticatedUser,
+) -> PlanMarkdownResponse:
+    try:
+        store = SqlPlanningStore(session)
+        plan = await store.get_plan(plan_id, user)
+        todos = await store.get_todos(plan_id, user)
+        content = render_plan_markdown(plan, todos)
+        return PlanMarkdownResponse(filename=plan_filename(plan), content=content)
     except (PlanningNotFound, PlanningConflict, PlanningPolicyError) as exc:
         _translate(exc)
 

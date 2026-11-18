@@ -35,6 +35,57 @@ def test_lifespan_skips_database_when_not_required() -> None:
     assert get_redis_or_none() is None
 
 
+_MISSING = object()
+
+
+async def test_warn_pending_migrations(caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    """schema 落后/从未初始化时打印醒目警告，已对齐时静默。"""
+    from alembic.script import ScriptDirectory
+
+    from app.core.config import ROOT
+    from app.core.database import lifecycle
+
+    head = ScriptDirectory(str(ROOT / "alembic")).get_current_head()
+    caplog.set_level(logging.WARNING, logger="muzi_llm")
+
+    def set_version(version):
+        class Session:
+            async def scalar(self, _stmt):
+                if version is _MISSING:
+                    raise RuntimeError("alembic_version missing")
+                return version
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(lifecycle, "get_session_factory", lambda: (lambda: Session()))
+
+    settings = make_settings()
+
+    # 落后 → 警告，且包含当前与目标版本。
+    set_version("stale-rev")
+    caplog.clear()
+    await lifecycle._warn_pending_migrations(settings)
+    assert "落后于代码迁移" in caplog.text
+    assert "stale-rev" in caplog.text
+    assert head in caplog.text
+
+    # 从未初始化（表缺失）→ 提示未初始化。
+    set_version(_MISSING)
+    caplog.clear()
+    await lifecycle._warn_pending_migrations(settings)
+    assert "从未初始化" in caplog.text
+
+    # 已对齐 → 静默。
+    set_version(head)
+    caplog.clear()
+    await lifecycle._warn_pending_migrations(settings)
+    assert "落后于代码迁移" not in caplog.text
+
+
 def test_required_startup_failure_does_not_leak_password() -> None:
     postgres_password = "postgres-secret-value"
     redis_password = "redis-secret-value"

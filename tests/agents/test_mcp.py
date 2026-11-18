@@ -134,6 +134,15 @@ async def test_handshake_allowlist_env_and_reverse() -> None:
 
         assert "mcp__fake__echo" not in agent_chat_tool_names(registry, session._settings)
         stdio_access.grant("user-a", {"mcp__fake__echo"})
+        # ask 与 agent 用同一套授权：给了 include_mcp 和用户上下文就能拿到。
+        # 没有权限快照（静态目录口径）时不推断授权，仍不出现。
+        assert "mcp__fake__echo" in ask_tool_names(
+            registry, session._settings, "user-a", include_mcp=True
+        )
+        assert "mcp__fake__echo" not in ask_tool_names(
+            registry, session._settings, "user-b", include_mcp=True
+        )
+        assert "mcp__fake__echo" not in ask_tool_names(registry, session._settings, "user-a")
         assert "mcp__fake__echo" not in stdio_access.names_for("user-b")
         service = ToolService(registry, session._settings)
         user_token = CURRENT_MCP_USER.set("user-a")

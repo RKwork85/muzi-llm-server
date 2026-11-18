@@ -24,8 +24,12 @@ def purge(sandbox: Path | None) -> None:
         shutil.rmtree(sandbox, ignore_errors=True)
 
 
-def safe_env() -> dict[str, str]:
-    """只保留子进程运行所需的最小环境变量，隔离宿主凭据。"""
+def safe_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """只保留子进程运行所需的最小环境变量，隔离宿主凭据。
+
+    ``extra`` 由调用方注入（工作区路径、离线开关等）。宿主凭据永远不外传：
+    这里只从白名单取键，``extra`` 也只能补这些键以外的显式值。
+    """
     kept: dict[str, str] = {}
     for key in _KEPT_ENV_KEYS:
         value = os.environ.get(key)
@@ -34,6 +38,9 @@ def safe_env() -> dict[str, str]:
     kept["PYTHONIOENCODING"] = "utf-8"
     kept["PYTHONDONTWRITEBYTECODE"] = "1"
     kept["PYTHONNOUSERSITE"] = "1"
+    for key, value in (extra or {}).items():
+        if isinstance(key, str) and isinstance(value, str) and key and value:
+            kept[key] = value
     return kept
 
 

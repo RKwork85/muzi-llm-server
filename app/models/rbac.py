@@ -262,7 +262,11 @@ class UsageQuota(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 
 class QuotaAdjustment(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
-    """额度调整流水。数值单位固定为 10 万 Token。"""
+    """额度调整流水。管理端调整固定 10 万/单位；充值到账按 token 精确入账。
+
+    - 管理端：units 是 10 万的倍数个数，unit_size 固定 100_000。
+    - 充值：units=1、unit_size=tokens，reference 记录支付订单号（幂等去重）。
+    """
 
     __tablename__ = "quota_adjustments"
     __table_args__ = (
@@ -272,7 +276,13 @@ class QuotaAdjustment(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         ),
         CheckConstraint("units >= 0 AND unit_size > 0 AND after_limit >= 0", name="ck_quota_adjustments_amounts"),
         Index("ix_quota_adjustments_user_created", "user_id", "created_at"),
-        {"comment": "管理端额度调整。units 是 10 万的倍数个数，after_limit 是调整后的上限。"},
+        Index(
+            "uq_quota_adjustments_reference",
+            "reference",
+            unique=True,
+            postgresql_where=text("reference IS NOT NULL"),
+        ),
+        {"comment": "额度调整。管理端 units 是 10 万的倍数个数；充值 reference 唯一保证幂等。"},
     )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
@@ -293,6 +303,7 @@ class QuotaAdjustment(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     after_limit: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     before_used: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default=text("0"))
     reason: Mapped[str] = mapped_column(String(200), nullable=False)
+    reference: Mapped[str | None] = mapped_column(String(160))
 
 
 class UsageRecord(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):

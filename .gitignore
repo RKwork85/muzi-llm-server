@@ -36,3 +36,4 @@ build/
 .cursor/
 vendor/superpowers/
 skills_data/
+sandbox_wheel_cache/

@@ -32,9 +32,13 @@ from app.planning.contracts import (
     PlanStep,
     PlanSnapshot,
     PlanStatus,
+    PlanTodo,
+    PlanTodoSet,
     PlanningEvent,
     PlanningEventType,
     TargetType,
+    TodoStatus,
+    TodoUpdateRequest,
     can_transition_plan,
 )
 from app.planning import revisions
@@ -168,6 +172,7 @@ class _PlanRecord:
     submissions: dict[str, dict[str, Any]] = field(default_factory=dict)
     actions: dict[str, dict[str, Any]] = field(default_factory=dict)
     events: list[PlanningEvent] = field(default_factory=list)
+    todos: PlanTodoSet | None = None
 
 
 def _payload_step_data(raw: Any) -> PlanStep:
@@ -223,6 +228,104 @@ def compute_revision_changes(plan: PlanSnapshot, action: InteractionAction) -> t
         raise PlanningPolicyError(f"action not implemented in this milestone: {action.action_type.value}")
 
     return changes, affected
+
+
+# 允许更新执行期清单的计划状态。PAUSED 也放行，避免暂停期间的进度写入被拒。
+_TODO_WRITABLE_STATUSES = frozenset({PlanStatus.EXECUTING, PlanStatus.PAUSED})
+_MAX_TODOS = 200
+
+
+def todos_from_steps(plan: PlanSnapshot) -> list[PlanTodo]:
+    """从已批准计划的步骤派生初始清单。id 直接复用 PlanStep.id。"""
+    return [
+        PlanTodo(id=step.id, content=step.title, depends_on=list(step.depends_on))
+        for step in plan.steps
+    ]
+
+
+def merge_todo_items(current: list[PlanTodo], request: TodoUpdateRequest) -> list[PlanTodo]:
+    """按 merge 语义合并清单（内存版与持久化版共用）。
+
+    merge=True：按 id 增量更新，未知 id 视为新增，未出现的已有项保持不变。
+    merge=False：整体替换；已有但缺失的项转为 cancelled 追加在末尾，保留审计。
+    """
+    merged = _merge_todo_items(current, request)
+    if len(merged) > _MAX_TODOS:
+        raise PlanningPolicyError(f"checklist cannot exceed {_MAX_TODOS} items")
+    return merged
+
+
+def _merge_todo_items(current: list[PlanTodo], request: TodoUpdateRequest) -> list[PlanTodo]:
+    incoming = list(request.todos)
+    if request.merge:
+        merged = list(current)
+        index = {todo.id: position for position, todo in enumerate(merged)}
+        for todo in incoming:
+            position = index.get(todo.id)
+            if position is None:
+                index[todo.id] = len(merged)
+                merged.append(todo)
+            else:
+                merged[position] = todo
+        return merged
+
+    incoming_ids = {todo.id for todo in incoming}
+    retired = [
+        todo if todo.status is TodoStatus.CANCELLED else todo.model_copy(update={"status": TodoStatus.CANCELLED})
+        for todo in current
+        if todo.id not in incoming_ids
+    ]
+    return [*incoming, *retired]
+
+
+def ensure_todos_fresh(todos: PlanTodoSet, plan: PlanSnapshot) -> None:
+    """计划被改动后拒绝写入陈旧清单。
+
+    只有「计划步骤已经不再是清单子集」才算陈旧。暂停/恢复这类只改状态、
+    不改内容的版本推进不应让执行期进度失效。
+    """
+    if todos.source_plan_revision == plan.revision:
+        return
+    known = {todo.id for todo in todos.todos}
+    if any(step.id not in known for step in plan.steps):
+        raise PlanningConflict("plan changed after the checklist was created")
+
+
+def first_startable_todo(todos: list[PlanTodo]) -> PlanTodo | None:
+    """返回第一个「依赖已满足且仍待办」的清单项，供执行开始自动点亮。
+
+    只有当清单里没有任何 in_progress 项时才返回，避免并行步骤被重复点亮；
+    依赖链（depends_on）全部 completed 才视为可开始。兜底语义：不干扰
+    模型显式 `update_todos` 设定的状态，只在「无进行中项」时最小推进一次。
+    """
+    if any(todo.status is TodoStatus.IN_PROGRESS for todo in todos):
+        return None
+    completed = {todo.id for todo in todos if todo.status is TodoStatus.COMPLETED}
+    for todo in todos:
+        if todo.status is TodoStatus.PENDING and set(todo.depends_on) <= completed:
+            return todo
+    return None
+
+
+def mark_todo_in_progress(todos: list[PlanTodo], todo_id: str) -> list[PlanTodo]:
+    """把指定清单项推进到 in_progress，其余项原样保留。"""
+    return [
+        todo if todo.id != todo_id else todo.model_copy(update={"status": TodoStatus.IN_PROGRESS})
+        for todo in todos
+    ]
+
+
+def complete_remaining_todos(todos: list[PlanTodo]) -> list[PlanTodo]:
+    """终态兜底：把仍处于 pending / in_progress 的项推进到 completed。
+
+    completed 与 cancelled 项保持原样（cancelled 是审计终态，不翻转为完成）。
+    """
+    return [
+        todo
+        if todo.status in {TodoStatus.COMPLETED, TodoStatus.CANCELLED}
+        else todo.model_copy(update={"status": TodoStatus.COMPLETED})
+        for todo in todos
+    ]
 
 
 class PlanningOrchestrator:
@@ -608,6 +711,98 @@ class PlanningOrchestrator:
         record.current = updated
         record.revisions.append(updated)
         self._event(record, PlanningEventType.RUN_STARTED, {"revision": updated.revision})
+        self.initialize_todos(plan_id, owner_id=owner_id)
+        return updated
+
+    def approve_and_authorize(
+        self,
+        plan_id: str,
+        *,
+        owner_id: str,
+        expected_revision: int,
+        authorization_id: str,
+    ) -> tuple[PlanSnapshot, int]:
+        """单次门（内存版，与 SQL 版语义一致）。
+
+        顺序走 approve → switch_mode → authorize_execution，保留完整版本链与事件审计。
+        返回 (执行中快照, 被批准的版本号)。
+        """
+        approved = self.approve(plan_id, owner_id=owner_id, expected_revision=expected_revision)
+        ready = self.switch_mode(
+            plan_id, owner_id=owner_id, expected_revision=approved.revision, target_mode="agent"
+        )
+        executing = self.authorize_execution(
+            plan_id,
+            owner_id=owner_id,
+            approved_revision=approved.revision,
+            expected_revision=ready.revision,
+            authorization_id=authorization_id,
+        )
+        return executing, approved.revision
+
+    def get_todos(self, plan_id: str, *, owner_id: str) -> PlanTodoSet | None:
+        return self._owned(plan_id, owner_id).todos
+
+    def initialize_todos(self, plan_id: str, *, owner_id: str) -> PlanTodoSet:
+        """从执行中的计划步骤生成初始清单。幂等：已存在则原样返回。"""
+        record = self._owned(plan_id, owner_id)
+        if record.todos is not None:
+            return record.todos
+        plan = record.current
+        if plan.status not in _TODO_WRITABLE_STATUSES:
+            raise PlanningConflict("checklist requires an executing plan")
+        todos = PlanTodoSet(
+            plan_id=plan_id,
+            source_plan_revision=plan.revision,
+            todos=todos_from_steps(plan),
+            updated_at=datetime.now(UTC),
+        )
+        record.todos = todos
+        self._event(
+            record,
+            PlanningEventType.TODO_UPDATED,
+            {
+                "merge": False,
+                "source_plan_revision": todos.source_plan_revision,
+                "todos": [todo.model_dump(mode="json") for todo in todos.todos],
+            },
+        )
+        return todos
+
+    def apply_todo_update(
+        self,
+        plan_id: str,
+        request: TodoUpdateRequest,
+        *,
+        owner_id: str,
+    ) -> PlanTodoSet:
+        """更新执行期清单。清单变更不修改计划 revision。"""
+        record = self._owned(plan_id, owner_id)
+        plan = record.current
+        if plan.status not in _TODO_WRITABLE_STATUSES:
+            raise PlanningConflict("checklist can only change while the plan is executing")
+        if request.expected_plan_revision is not None and plan.revision != request.expected_plan_revision:
+            raise PlanningConflict(f"revision conflict; latest revision is {plan.revision}")
+        existing = record.todos
+        if existing is None:
+            existing = self.initialize_todos(plan_id, owner_id=owner_id)
+        ensure_todos_fresh(existing, plan)
+        updated = PlanTodoSet(
+            plan_id=plan_id,
+            source_plan_revision=plan.revision,
+            todos=merge_todo_items(existing.todos, request),
+            updated_at=datetime.now(UTC),
+        )
+        record.todos = updated
+        self._event(
+            record,
+            PlanningEventType.TODO_UPDATED,
+            {
+                "merge": request.merge,
+                "source_plan_revision": updated.source_plan_revision,
+                "todos": [todo.model_dump(mode="json") for todo in updated.todos],
+            },
+        )
         return updated
 
     def events_after(self, plan_id: str, *, owner_id: str, sequence: int = 0) -> list[PlanningEvent]:
@@ -851,16 +1046,44 @@ class PlanningDecisionEngine:
             DecisionAction.REQUEST_APPROVAL.value,
         ]
         system_prompt = (
-            "You are an expert planning assistant for a chat app. You help users turn a vague "
-            "need into a clear, actionable plan through natural, focused conversation. When you "
-            "need information from the user, ask it through the app's registered UI interaction "
-            "components (listed below) — not as a wall of questions in plain chat text.\n\n"
+            "You are the assistant behind this app's Plan mode. Plan mode is a normal, "
+            "high-quality conversation: the user talks to you, you answer, and you think "
+            "through the problem together. A written plan is a tool you may use when it helps — "
+            "it is NOT a required deliverable. Many turns and many whole conversations end with "
+            "ordinary answers, and that is correct behavior.\n\n"
+            "When you need information from the user, collect it through the app's registered UI "
+            "interaction components (listed below) instead of a wall of questions in plain text.\n\n"
             "Return exactly one JSON object conforming to this schema (the server validates it "
             "strictly):\n"
             f"{json.dumps(proposal_schema, ensure_ascii=False, separators=(',', ':'))}\n\n"
-            "Choose action from respond, ask_user, update_plan, request_approval. Never choose "
-            "ready_for_handoff (approval, mode switch, and execution authorization are separate "
-            "user actions).\n\n"
+            "ACTIONS — pick the one this turn actually needs:\n"
+            "  · respond (DEFAULT) — answer, explain, compare, recommend, discuss, or chat "
+            "normally in \"response\". This is right for the vast majority of turns: questions, "
+            "follow-ups, clarifications, opinions, small talk, and any answer that needs nothing "
+            "from the user. Never attach steps, a goal, or a review card just to look productive.\n"
+            "  · ask_user — you genuinely need a decision or fact from the user before you can "
+            "answer well or continue, and a card collects it more comfortably than free text. "
+            "Put ONE focused question in the interaction card; use \"response\" for the short "
+            "sentence that introduces it.\n"
+            "  · update_plan — the user asked you to write or revise a plan. Fill "
+            "goal/steps/assumptions and explain the draft in \"response\".\n"
+            "  · request_approval — the user asked to finalize/review a plan you already "
+            "drafted, or confirmed a draft is ready. The server turns it into the review card.\n"
+            "Never choose ready_for_handoff (approval, mode switch, and execution authorization "
+            "are separate user actions).\n\n"
+            "WHEN NOT TO PRODUCE A PLAN:\n"
+            "  · Do not end every turn — or every conversation — with update_plan or "
+            "request_approval. A normal answer, an explanation, a recommendation, or a single "
+            "clarifying question is a complete, valid turn.\n"
+            "  · Draft a plan only when the user asks for one (\"给我个方案\", \"写个计划\", "
+            "\"怎么排期\", \"列个步骤\", how would you build/arrange X), or when they ask to "
+            "change an existing draft. If it is unclear whether they want a plan, ask in plain "
+            "text instead of producing one.\n"
+            "  · When the user asks a factual question, wants your opinion, wants an explanation "
+            "of code or a design, or is just chatting, answer it directly — do not convert it "
+            "into requirements gathering.\n"
+            "  · If the user says 你决定 / 随便 / 你推荐, decide, explain why, and continue. "
+            "Do not keep asking.\n\n"
             "REGISTERED UI INTERACTION COMPONENTS — when you ask the user for information "
             "(action=\"ask_user\"), put the question(s) into the interaction card using ONE of "
             "these registered component types. The client renders only these; any other "
@@ -877,78 +1100,72 @@ class PlanningDecisionEngine:
             "fields one step at a time, so keep the field list short.\n"
             "Write prompt, option labels, descriptions, and form field labels in the user's "
             "language.\n\n"
-            "STEP 0 — Read the message like a person, not a form:\n"
-            "If the message is a pure greeting (like \"你好\"), small talk, thanks, or a plain "
-            "question with no deliverable and no emotional distress, reply with action=\"respond\": "
-            "a short, warm, natural reply in the user's language that gently invites them to say "
-            "what they want to plan. Do NOT use ask_user, do NOT emit a decision card, do NOT "
-            "propose steps/decisions/assumptions, do NOT request approval. Leave goal, assumptions, "
-            "proposed_decisions, steps, and interaction empty.\n\n"
-            "If the message expresses emotional distress or a dilemma (\"我很难过\", \"我很焦虑\", "
-            "\"我很矛盾\", \"我不知道该怎么办\"), do NOT just console them in plain text. Use "
-            "action=\"ask_user\" with a single_select interaction offering exactly 4 options so the "
-            "user can pick without typing. Suggested options (write them in the user's language, "
-            "you may adapt the wording but keep 4):\n"
-            "  1) 想找个人说说发生了什么\n"
-            "  2) 帮我梳理一下现在纠结的点\n"
-            "  3) 只需要一点安慰和陪伴\n"
-            "  4) 暂时不想细说，先陪陪我\n"
-            "Keep the response warm, short, and non-pressuring; the user may skip. Do NOT propose "
-            "steps or request approval yet.\n\n"
-            "Only when the message expresses a concrete goal do you proceed to planning below.\n\n"
-            "How to plan each turn:\n"
-            "1. Before asking anything, classify every unknown fact into ONE of three buckets:\n"
-            "   - HARD CONSTRAINT: something that changes the plan's structure, feasibility, scope, "
-            "cost, or safety if it is different. Examples: for travel, 出发地/交通方式/预算/同行人/天数; "
-            "for a system design, 技术栈/规模/权限模型/合规要求; for an event, 日期/人数/预算/场地. "
-            "An unresolved hard constraint must be ASKED — never silently assume it.\n"
-            "   - SOFT PREFERENCE: a taste that shapes details but not the overall structure (e.g. "
-            "which scenic spots or which cuisine). Ask once with a multi_select, or assume and disclose.\n"
-            "   - TRIVIA: naming, colors, minor defaults that do not change the outcome. Always assume.\n"
-            "Choose the interaction type that fits (see REGISTERED UI INTERACTION COMPONENTS "
-            "above). Prefer ONE focused question per turn: a single_select, multi_select, "
-            "confirmation, or text_input that resolves the single most important open hard "
-            "constraint. Only use a form when 2-5 hard constraints are strongly coupled and must "
-            "be answered together (e.g. 出发地 + 交通方式 + 预算 when they jointly determine the "
-            "route); otherwise ask them one at a time across turns. Never dump 5+ unrelated "
-            "questions into one card — a crowded card overwhelms the user. Ask only what is "
-            "needed to proceed this turn. Write visible text in the user's language.\n"
-            "2. The FIRST time the user expresses a clear goal, write it into the \"goal\" field "
-            "even when the action is ask_user or respond, so the server records the real target "
-            "instead of the user's opening words.\n"
-            "3. NEVER ask trivia (naming, colors, minor defaults) — always assume those. NEVER "
-            "silently assume a HARD CONSTRAINT (rule 1): if a hard constraint is still unknown and "
-            "it would change the plan, ask it — alone or grouped into a form. Only if you must "
-            "proceed without it, put it in assumptions AND flag it explicitly in your response so "
-            "the user sees it before approving.\n"
-            "4. Decisions you settle yourself go into proposed_decisions with source \"assumed\" "
-            "(or \"system\" for fixed facts). proposed_decisions[].source accepts ONLY \"assumed\" "
-            "or \"system\" — never \"user\". The server records the user's answered questions with "
-            "source \"user\" on its own; never mark an assumed decision as user-confirmed.\n"
-            "5. Choose request_approval ONLY when every material HARD CONSTRAINT is resolved "
-            "(answered by the user, or explicitly listed in assumptions and flagged in your "
-            "response). If any hard constraint is still unknown and un-flagged, keep asking "
-            "instead. A request_approval proposal needs a concrete goal, 4-8 implementation-ready "
-            "steps (id/title/description/depends_on), and a short response that summarizes the "
-            "plan AND explicitly flags which parts are still assumptions the user should review.\n"
-            "6. For ask_user, include a human-readable decision_key in the interaction constraints "
-            "(e.g. \"tech_stack\", \"hosting\") so the answer is stored under a meaningful name. "
-            "For a form, give each field a stable, semantic key (e.g. \"departure\", \"transport\", "
-            "\"budget\", \"party\") and set decision_key to a meaningful group name.\n"
-            "7. For ask_user return one interaction (type, prompt, optional description, options "
-            "for selection types, form for a form, optional constraints). Do NOT include "
-            "protocol_version, interaction_id, plan_id, plan_revision, status, or plan_review — "
-            "the server supplies lifecycle fields.\n"
-            "8. A request_approval proposal must omit interaction (the server creates the review "
-            "card). For update_plan, explain the draft changes in response. Planning is read-only; "
-            "never request or claim tool execution.\n"
-            "9. Write the JSON keys in this exact order: protocol_version, response, action, goal, "
+            "CARD COPY — write the card like a restrained product surface, not like a friend "
+            "chatting:\n"
+            "  · prompt: ask the decision itself, one neutral sentence, short (roughly <= 30 "
+            "Chinese characters, similar in other languages). Never characterize, judge, or "
+            "diagnose the user's feelings, personality, or situation (avoid wording like "
+            "\"你整个人是懵的\", \"心气问题\", \"最真实的处境\"); ask about the choice, not "
+            "about the person.\n"
+            "  · description: optional, at most ONE short sentence on why this decision matters. "
+            "No metaphors, no persuasion, no commentary about what you will do next.\n"
+            "  · option labels: short, parallel noun phrases of similar length (about 2-10 "
+            "characters), mutually exclusive and concrete. Avoid vague filler options such as "
+            "\"其他\" unless the space is genuinely open.\n"
+            "  · option descriptions: one short clause (about <= 20 characters) stating a "
+            "concrete condition, difference, or consequence. No slang, exaggeration, emotional "
+            "coloring, or second-person commentary on the user.\n"
+            "  · Keep a calm, professional register throughout — plain, respectful, specific.\n\n"
+            "WHEN TO ASK — one card, only when it earns its place:\n"
+            "1. Classify each unknown before asking anything:\n"
+            "   - HARD CONSTRAINT: something that changes the answer or the plan's structure, "
+            "feasibility, scope, cost, or safety if it differs. Examples: for travel, 出发地/交通方式/"
+            "预算/同行人/天数; for a system design, 技术栈/规模/权限模型/合规要求; for an event, "
+            "日期/人数/预算/场地. If it would change the answer, ask it — never silently assume it.\n"
+            "   - SOFT PREFERENCE: a taste that shapes details but not the structure (which scenic "
+            "spots, which cuisine). Ask at most once, or assume and disclose.\n"
+            "   - TRIVIA: naming, colors, minor defaults. Always assume.\n"
+            "2. Prefer ONE focused card per turn: a single_select, multi_select, confirmation, or "
+            "text_input that resolves the single most important open question. Only use a form "
+            "when 2-5 hard constraints are strongly coupled and must be answered together (e.g. "
+            "出发地 + 交通方式 + 预算 when they jointly determine the route). Never dump 5+ "
+            "unrelated questions into one card. Ask only what is needed this turn.\n"
+            "3. If a reasonable default exists and the choice is cheap to change, proceed with it "
+            "and say so — do not interrogate the user for completeness.\n\n"
+            "GREETINGS, SMALL TALK, AND DISTRESS:\n"
+            "  · A greeting, thanks, or small talk: respond normally and warmly. No card, no "
+            "goal, no steps.\n"
+            "  · Emotional distress (\"我很难过\", \"我很焦虑\", \"我很矛盾\", \"我不知道该怎么办\"): "
+            "reply like a person first — brief, warm, not analytical. You may optionally offer "
+            "ONE single_select card if a choice genuinely helps (about 4 options such as 想说说发生"
+            "了什么 / 帮我梳理纠结的点 / 只想被陪一会儿 / 先不想细说). Never push planning here.\n\n"
+            "WHEN YOU DRAFT A PLAN (update_plan / request_approval):\n"
+            "  · goal is concise and concrete; 4-8 implementation-ready steps "
+            "(id/title/description/depends_on); assumptions only for things you actually assumed.\n"
+            "  · proposed_decisions[].source accepts ONLY \"assumed\" (or \"system\" for fixed "
+            "facts) — never \"user\". The server records the user's own answers with source "
+            "\"user\" by itself.\n"
+            "  · Also state low-risk assumptions in assumptions (plain text) so the review card "
+            "can list them separately from confirmed decisions.\n"
+            "  · A request_approval proposal must omit interaction (the server creates the review "
+            "card) and its response should summarize the plan and flag any remaining assumptions.\n"
+            "  · Planning is read-only; never request or claim tool execution.\n\n"
+            "OUTPUT FORMAT:\n"
+            "  · For ask_user return one interaction (type, prompt, optional description, options "
+            "for selection types, form for a form, optional constraints). Put a human-readable "
+            "decision_key in the interaction constraints (e.g. \"tech_stack\", \"hosting\") so the "
+            "answer is stored under a meaningful name. For a form, give each field a stable "
+            "semantic key (e.g. \"departure\", \"transport\", \"budget\") and set decision_key to a "
+            "meaningful group name. Do NOT include protocol_version, interaction_id, plan_id, "
+            "plan_revision, status, or plan_review — the server supplies lifecycle fields.\n"
+            "  · Write the JSON keys in this exact order: protocol_version, response, action, goal, "
             "assumptions, proposed_decisions, steps, interaction. Keep response near the TOP "
             "(right after protocol_version) so it streams to the user immediately; never put "
             "response last.\n"
-            "10. State low-risk assumptions in assumptions (plain text) too, so the review card "
-            "lists them separately from confirmed decisions. Use confirmed decisions and history; "
-            "do not repeat answered or skipped questions."
+            "  · \"response\" is the substantive answer in the user's language — the actual content "
+            "the user reads — not a meta paragraph about what you are doing.\n"
+            "  · Use confirmed decisions and history; never repeat questions already answered or "
+            "skipped."
         )
         return ProviderChatRequest(
             model=self._model,

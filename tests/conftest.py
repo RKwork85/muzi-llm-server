@@ -32,6 +32,9 @@ def make_settings(**overrides: object) -> Settings:
         "tool_result_max_chars": 1000,
         "llm_provider": "deepseek",
         "app_name": "DeepSeek FastAPI Phase 1",
+        # 显式关闭：某些用例会经 load_dotenv 把本机 .env 读进进程环境变量，
+        # 不写死这一项，后续用例会突然要求登录（401），与用例本身无关。
+        "database_startup_required": False,
     }
     values.update(overrides)
     return Settings(_env_file=None, **values)

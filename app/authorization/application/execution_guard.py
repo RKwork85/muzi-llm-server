@@ -16,34 +16,17 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.tools.workspace_scope import CURRENT_WORKSPACE_SCOPE, is_user_scope
 
+from app.tools.capability import (
+    Capability,
+    MODE_SCOPED_ACTIONS,
+    Scope,
+    WORKSPACE_OWNERSHIP_ACTIONS,
+    capability_for,
+    entry_permission,
+    mode_permission,
+)
+
 logger = logging.getLogger("muzi_llm")
-
-# 工具 access → (resource, action)。这些「工具执行类」access 统一按
-# `mode.resource.action` 权限码授权，例如 ask.workspace.write。
-ACCESS_TOOL_PERMISSION: dict[str, tuple[str, str]] = {
-    "read_files": ("workspace", "read"),
-    "write_workspace": ("workspace", "write"),
-    "write_remote": ("workspace", "write"),
-    "delete_workspace": ("workspace", "delete"),
-    "sandbox_exec": ("command", "execute"),
-    "mutate_remote": ("workspace", "write"),
-}
-
-SENSITIVE_ACCESS = frozenset({"write_workspace", "write_remote", "delete_workspace", "sandbox_exec", "mutate_remote"})
-READ_ACCESS = frozenset({"read_files"})
-
-_TOOL_MODES = frozenset({"ask", "plan", "agent"})
-
-
-def mode_permission_code(mode: str, access: str) -> str | None:
-    """把 access 映射成 `mode.resource.action` 权限码；非工具执行类 access 返回 None。"""
-    pair = ACCESS_TOOL_PERMISSION.get(access)
-    if pair is None:
-        return None
-    resource, action = pair
-    normalized = mode if mode in _TOOL_MODES else "ask"
-    return f"{normalized}.{resource}.{action}"
-
 
 _REASON_CODE = {
     "identity_missing": "IDENTITY_REQUIRED",
@@ -61,6 +44,7 @@ class ExecutionContext:
     run_id: str | None = None
     conversation_id: str | None = None
     workspace_scope: str | None = None
+    plan_id: str | None = None
     effective_permissions: frozenset[str] = frozenset()
     owned_workspace_scopes: frozenset[str] = frozenset()
     authorization_source: str = "rbac"
@@ -84,54 +68,53 @@ class ToolDecision:
 
 
 class ExecutionGuard:
-    """不读取工具参数，也不把缺失身份当成放行。"""
+    """执行期复核。工具的能力声明是唯一依据，不再按工具名做特例。"""
 
-    def decide(self, *, tool_name: str, toolset: str, access: str) -> ToolDecision:
+    def decide(
+        self,
+        *,
+        tool_name: str,
+        toolset: str,
+        access: str,
+        capability: Capability | None = None,
+    ) -> ToolDecision:
         del tool_name
         context = CURRENT_EXECUTION.get()
+        cap = capability if capability is not None else capability_for(access, toolset)
+        mode = context.runtime_mode if context is not None else "ask"
 
-        if toolset == "mcp":
+        if not cap.action:
+            # 没有操作权限要求的工具：只要求能进入当前模式。
             if context is None:
                 return _passthrough()
-            if not context.user_id or "mcp.execute" not in context.effective_permissions:
-                return _deny("mcp.execute", "permission_denied" if context.user_id else "identity_missing")
-            return _allow("mcp.execute", audit=False)
+            entry = entry_permission(mode)
+            if not context.user_id:
+                return _deny(entry, "identity_missing")
+            if entry not in context.effective_permissions:
+                return _deny(entry, "permission_denied")
+            return _allow(entry, audit=False)
 
-        if toolset == "skills":
-            if context is None:
-                return _passthrough()
-            if not context.user_id or "skill.execute" not in context.effective_permissions:
-                return _deny("skill.execute", "permission_denied" if context.user_id else "identity_missing")
-            # execute_skill_script（access=sandbox_exec）实际运行脚本，属于敏感执行，须留审计；
-            # discover/load/read 只是读取技能说明与资源（access=read_local），不审计。
-            return _allow("skill.execute", audit=access in SENSITIVE_ACCESS)
-
-        if access in SENSITIVE_ACCESS:
-            permission = mode_permission_code(context.runtime_mode if context else "ask", access)
-            if context is None or not context.user_id:
+        permission = mode_permission(cap.action, mode)
+        if context is None or not context.user_id:
+            if cap.action in MODE_SCOPED_ACTIONS:
+                # 工作区/命令/交付类动作必须有可信身份，缺失时不放行。
                 return _deny(permission, "identity_missing")
-            if permission not in context.effective_permissions:
-                return _deny(permission, "permission_denied")
-            if context.runtime_mode == "agent" and not _workspace_owned(context):
-                # agent 模式的写/删/执行工具仍需工作区归属校验；
-                # ask 模式的工作区按用户 scope 隔离，无需 ResourceGrant 记录。
-                return _deny(permission, "workspace_unverified")
-            return _allow(permission, audit=True)
-
-        if access in READ_ACCESS:
-            permission = mode_permission_code(context.runtime_mode if context else "ask", access)
-            if context is None:
-                return _passthrough()
-            if permission not in context.effective_permissions:
-                return _deny(permission, "permission_denied")
-            return _allow(permission, audit=False)
-
-        if context is None:
+            # MCP/Skill 由连接器与技能层各自授权，这里不替代它们。
             return _passthrough()
-        mode_permission = "agent.execute" if context.runtime_mode == "agent" else "chat.access"
-        if mode_permission not in context.effective_permissions:
-            return _deny(mode_permission, "permission_denied")
-        return _allow(mode_permission, audit=False)
+        if permission not in context.effective_permissions:
+            return _deny(permission, "permission_denied")
+        if (
+            cap.scope is Scope.WORKSPACE
+            and cap.action in WORKSPACE_OWNERSHIP_ACTIONS
+            and mode == "agent"
+            and not _workspace_owned(context)
+        ):
+            # agent 模式的写/删/执行/交付仍要求工作区归属；
+            # ask 模式按用户 scope 隔离，无需 ResourceGrant 记录。
+            return _deny(permission, "workspace_unverified")
+        if cap.scope is Scope.MCP_CONNECTOR and not mcp_runtime_allowed():
+            return _deny(permission, "permission_denied")
+        return _allow(permission, audit=cap.audit)
 
 
 def mcp_runtime_allowed() -> bool:
@@ -143,10 +126,12 @@ def mcp_runtime_allowed() -> bool:
 
 
 async def authorize_registered_tool(spec: object) -> ToolDecision:
+    capability = getattr(spec, "capability", None)
     decision = ExecutionGuard().decide(
         tool_name=str(getattr(spec, "name", "")),
         toolset=str(getattr(spec, "toolset", "")),
         access=str(getattr(spec, "access", "")),
+        capability=capability if isinstance(capability, Capability) else None,
     )
     if decision.audit:
         await record_tool_audit(decision, str(getattr(spec, "name", "")))
@@ -160,6 +145,7 @@ async def load_execution_context(
     run_id: str | None = None,
     conversation_id: str | None = None,
     workspace_scope: str | None = None,
+    plan_id: str | None = None,
 ) -> ExecutionContext:
     """从授权服务读取权限。失败时返回空权限。
 
@@ -195,6 +181,7 @@ async def load_execution_context(
         run_id=run_id,
         conversation_id=conversation_id,
         workspace_scope=workspace_scope if is_user_scope(workspace_scope) else None,
+        plan_id=plan_id,
         effective_permissions=frozenset(permissions),
         owned_workspace_scopes=owned,
         authorization_source=source,
@@ -285,6 +272,15 @@ async def _ensure_workspace_grant(session: object, user_id: str, workspace_scope
             await session.rollback()  # type: ignore[attr-defined]
         except Exception:
             pass
+
+
+async def bind_workspace_grant(session: object, user_id: str, workspace_scope: str | None) -> None:
+    """首次出示某个合法工作区 scope 时登记归属（幂等）。
+
+    只读入口（例如能力投影）也需要它：否则用户会因为「还没跑过一次任务」而看到
+    agent 的写类工具与插件被标成 `workspace_unverified`，与真实请求的判定不一致。
+    """
+    await _ensure_workspace_grant(session, user_id, workspace_scope)
 
 
 async def _owned_workspaces(session: object, user_id: str) -> frozenset[str]:

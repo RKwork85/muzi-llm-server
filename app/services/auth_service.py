@@ -29,7 +29,7 @@ from app.models.mixins import utcnow
 from app.models.rbac import Role, UserRole
 from app.models.tables import RefreshToken, User, UserCredential
 
-_USERNAME = re.compile(r"^[a-z][a-z0-9_]{2,31}$")
+_USERNAME = re.compile(r"^[^\W\d_]\w{1,31}$")
 _PHONE = re.compile(r"^1[3-9]\d{9}$")
 _SMS_CODE = re.compile(r"^\d{4,8}$")
 _TOKEN_TTL = timedelta(days=30)
@@ -54,9 +54,17 @@ def normalize_email(value: str) -> str:
 
 
 def normalize_username(value: str) -> str:
+    """归一化用户名：去空格、转小写，并校验字符集。
+
+    支持中文等 Unicode 字母：首字符须为字母（含汉字），其余可含字母、
+    汉字、数字和下划线，长度 2 到 32 个字符。小写归一是为了让唯一性
+    判断对 ASCII 大小写不敏感；汉字与大小写无关，不受影响。
+    """
     username = value.strip().lower()
     if _USERNAME.fullmatch(username) is None:
-        raise InvalidRequestError("用户名需为 3 到 32 位，以小写字母开头，只能包含小写字母、数字和下划线")
+        raise InvalidRequestError(
+            "用户名需为 2 到 32 个字符，以字母或汉字开头，只能包含字母、汉字、数字和下划线"
+        )
     return username
 
 
@@ -217,6 +225,27 @@ class AuthService:
     async def _username_taken(self, username: str) -> bool:
         found = await self.session.scalar(select(User.id).where(User.username == username))
         return found is not None
+
+    async def change_username(self, user: User, new_username: str) -> str:
+        """用户自助修改用户名。
+
+        规则与注册完全一致（normalize_username），并保证全局唯一。
+        用户名只是展示与标识字段，不参与登录，所以修改后无需重新登录。
+        返回归一化后的新用户名。
+        """
+        username = normalize_username(new_username)
+        if username == user.username:
+            # 幂等：改成同一个值直接成功，不占用唯一性检查的往返。
+            return username
+        if await self._username_taken(username):
+            raise AccountExistsError("用户名已被使用，请换一个")
+        user.username = username
+        try:
+            await self.session.flush()
+        except IntegrityError:
+            # 并发下另一请求抢先占用，唯一约束兜底。
+            raise AccountExistsError("用户名已被使用，请换一个") from None
+        return username
 
     async def reset_password(self, user_id: object, new_password: str) -> None:
         """管理员重置用户密码：只写入新密码哈希，并吊销该用户全部登录凭证。

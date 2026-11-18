@@ -87,11 +87,12 @@ def run_command(args: CommandArgs) -> str:
         argv=[args.command, *args.args],
         timeout=settings.tools_sandbox_timeout_seconds,
         sandbox_prefix="muzi_cmd_",
+        network=getattr(settings, "sandbox_network_enabled", True),
     )
     try:
         result = get_provider(settings).run(spec)
-    except SandboxTimeoutError:
-        return _error("command_timeout", "命令超时")
+    except SandboxTimeoutError as exc:
+        return _error("command_timeout", "命令超时", partial=exc.partial_output)
     except SandboxExecutionError:
         return _error("command_failed", "命令执行失败")
     return json.dumps(
@@ -115,8 +116,9 @@ def _allowlist(settings: object) -> set[str]:
     return names
 
 
-def _error(code: str, message: str) -> str:
-    return json.dumps(
-        {"error": {"code": code, "message": message}},
-        ensure_ascii=False,
-    )
+def _error(code: str, message: str, *, partial: str = "") -> str:
+    payload: dict[str, object] = {"error": {"code": code, "message": message}}
+    if partial.strip():
+        payload["output"] = partial
+        payload["partial"] = True
+    return json.dumps(payload, ensure_ascii=False)

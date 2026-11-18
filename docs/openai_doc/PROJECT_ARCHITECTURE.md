@@ -124,7 +124,7 @@ HTTP 层只接收请求和返回响应。`AgentLoop`、`ToolExecutor`、`Executi
 | Tool Registry | `ToolRegistry` / `ToolSpec` | 保存工具名、参数模型、handler、toolset 和限额 | 不执行 handler |
 | Tool Executor | 有两个 | 见下一小节 | 不向模型承诺调用哪个工具 |
 | Execution Policy | `ExecutionPolicy` 与 `merge_execution_policy` | 步数、时限、上下文字数、允许的工具名；请求只能收紧 | 不执行工具 |
-| Toolset | `resolve_tool_names` | 把 `basic` 等名字变成工具名元组 | 不是工具实现 |
+| Toolset | `agent_tool_names` | 把 `toolsets` 与用户权限投影成工具名元组（唯一入口是 `visible_tools`） | 不是工具实现，也不接收客户端 grants |
 | Tool | `app/tools/` 里的 handler | 校验参数并返回 JSON 字符串 | 不直接写 HTTP 响应 |
 | Artifact | `Artifact`，由 `absorb_tool_output` 收集 | 把工具结果里的图源码带到任务响应 | 不落盘，不渲染 SVG |
 | Event | `EventPublisher` / `EventEnvelope` | 内存队列里的进度通知，供 SSE 读取 | 不承载网页正文、文件正文或密钥 |
@@ -150,7 +150,7 @@ HTTP 层只接收请求和返回响应。`AgentLoop`、`ToolExecutor`、`Executi
 flowchart LR
   agentsEndpoint["agents.create_run"] --> AgentRuntime
   AgentRuntime --> PromptService
-  AgentRuntime --> resolveToolNames["resolve_tool_names"]
+  AgentRuntime --> resolveToolNames["agent_tool_names"]
   AgentRuntime --> mergePolicy["merge_execution_policy"]
   AgentRuntime --> TaskManager
   AgentRuntime --> AgentLoop
@@ -174,9 +174,9 @@ flowchart LR
 
 ### 6.1 共同步骤
 
-1. FastAPI 用 `AgentRequest` 解析 JSON。`message`、`prompt_name` 必填。`toolsets` 可省略，最多 4 个、不可重复。多余字段会被拒绝。
+1. FastAPI 用 `AgentRequest` 解析 JSON。`message`、`prompt_name` 必填。`toolsets` 可省略，最多 6 个、不可重复。多余字段会被拒绝（旧字段 `grants` 已删除，传了就是 422）。
 2. `create_run` 把请求交给 `AgentRuntime.start`。
-3. `resolve_tool_names` 把 toolset 变成工具名。省略 `toolsets` 时只返回 `basic_tool_names`：`calculator` 和 `get_current_time`。
+3. `agent_tool_names` 按「用户权限 × 模式 × 资源作用域」投影出工具名。省略 `toolsets` 时取 Agent 默认基线；显式传 `toolsets` 只是在已可见工具里按工具集收窄，不会越过权限。
 4. `merge_execution_policy` 用服务端上限与请求里的 `policy`、`allowed_tools` 取更严的一侧。未知 toolset 变成 `TOOLSET_UNKNOWN`（422）。未开启的 research 或 workspace 变成 `TOOLSET_UNAVAILABLE`（403）。
 5. `PromptService.render(prompt_name)` 读取系统提示词。请求不能自带 system 消息。若 toolset 含 `research` 或 `workspace`，Runtime 再追加一段固定的不可信内容说明。`diagram` 不会追加这段。
 6. `TaskManager.create` 生成任务 id，状态为 `created`。HTTP 立即返回 `AgentTaskResponse` 的当前视图，此时通常还没有最终答案。
@@ -186,7 +186,7 @@ flowchart LR
 
 谁执行：工具 handler 在 Python 进程内执行。Mermaid 源码由 `render_flowchart` 拼出来，不请求 DeepSeek 画图接口。
 
-谁控制权限：`resolve_tool_names` 和 `ExecutionPolicy.allowed_tools`。`ToolExecutor.execute` 再次检查工具名是否在名单内、风险级别是否为 `low`。
+谁控制权限：`agent_tool_names`（能力投影，工具可见即代表已授权）和 `ExecutionPolicy.allowed_tools`。`ToolExecutor.execute` 只做一次防快照失效的复核：名单里的工具不会因为「权限」被拒，失败原因是 `PERMISSION_REVOKED` 或 `WORKSPACE_UNVERIFIED`。
 
 ### 6.2 只开启 basic
 
@@ -226,7 +226,7 @@ sequenceDiagram
   participant Tasks as TaskManager
   Client->>AgentsEndpoint: POST /api/v1/agents/runs
   AgentsEndpoint->>Runtime: start(AgentRequest)
-  Runtime->>Runtime: resolve_tool_names + merge_execution_policy
+  Runtime->>Runtime: agent_tool_names + merge_execution_policy
   Runtime->>Tasks: create
   AgentsEndpoint-->>Client: task_id，通常仍是 created
   Runtime->>Loop: run
@@ -405,7 +405,7 @@ T4 和 T5 只存在于 `docs/phase3/T4_T5_DESIGN.md`。
 
 这些是扩展位置，不是已有功能：
 
-- 新工具应注册进 `build_agent_registry`，并在 `resolve_tool_names` 里赋予 toolset 和启用条件。不要放进 `build_default_registry`。
+- 新工具应注册进 `build_agent_registry`，并在 `Capability(action, scope, audit)` 里声明它需要的原子操作权限；工具集与启用条件写在 `visible_tools` 的判断里。不要放进 `build_default_registry`，也不要按工具名另开一张授权表。
 - 业务查询或 MCP 工具若要实现，仍应经过 `ToolRegistry` 和 `ToolExecutor`，不要在 API 路由里直接调用外部系统。
 - 持久化若要做，替换或包住 `TaskManager` 的内存字典。当前没有任何数据库会话。OSS AccessKey 不在本服务里；上传只在配置了 `OSS_UPLOAD_BASE_URL` 时把文件字节交给该地址。
 - 新的 LLM 供应商应实现 `LLMProvider`，由 `ProviderManager` 装配。`AgentLoop` 依赖这个协议，不依赖 FastAPI。

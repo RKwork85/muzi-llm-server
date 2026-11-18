@@ -36,6 +36,10 @@ class SandboxSpec:
     memory_mb: int | None = None
     network: bool | None = None
     dependencies: tuple[str, ...] = ()
+    # 技能清单声明的依赖：跳过白名单，但仍受硬禁令/体积/时长限制。
+    dependencies_trusted: bool = False
+    # 额外注入子进程的环境变量（工作区路径等）。后端会与最小环境合并。
+    env: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -46,11 +50,31 @@ class SandboxResult:
 
 
 class SandboxTimeoutError(Exception):
-    """执行超时。"""
+    """执行超时。
+
+    ``partial_output`` 保留超时前已经产生的输出。整段脚本被硬杀时，这是模型
+    唯一能用来判断「卡在哪一步」的证据，不能丢。
+    """
+
+    def __init__(self, partial_output: str = "") -> None:
+        super().__init__("sandbox timeout")
+        self.partial_output = partial_output
 
 
 class SandboxExecutionError(Exception):
     """执行失败（无法启动进程或 OSError）。"""
+
+
+class SandboxDependencyRejected(Exception):
+    """依赖策略拒绝或安装失败；``code`` 直接作为对外错误码。
+
+    两个后端共用同一个异常，``run_python`` 等 handler 才能用一套错误码回给模型。
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 class SandboxProvider(Protocol):
@@ -69,4 +93,4 @@ def get_provider(settings) -> SandboxProvider:
         return AgentBoxSandboxProvider(settings)
     from app.tools.sandbox.subprocess_backend import SubprocessSandboxProvider
 
-    return SubprocessSandboxProvider()
+    return SubprocessSandboxProvider(settings)

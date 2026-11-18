@@ -22,6 +22,9 @@ class Connector:
     url: str
     allow_write: bool = False
     issuer: str = ""
+    # 预注册 OAuth 客户端（可选）。服务不支持 DCR 时，用这里配的 client_id/secret。
+    client_id: str = ""
+    client_secret: str = ""
 
 
 def load_catalog(
@@ -44,6 +47,8 @@ def load_catalog(
         issuer = _expand(str(spec.get("issuer") or ""), env)
         if issuer and not _allowed_url(issuer, allow_insecure):
             continue
+        client_id = _expand(str(spec.get("client_id") or ""), env)
+        client_secret = _expand(str(spec.get("client_secret") or ""), env)
         items.append(
             Connector(
                 name=name,
@@ -52,6 +57,8 @@ def load_catalog(
                 url=url,
                 allow_write=bool(spec.get("allow_write")),
                 issuer=issuer,
+                client_id=client_id,
+                client_secret=client_secret,
             )
         )
     return tuple(items)

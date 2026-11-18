@@ -232,6 +232,26 @@ def test_cipher_hides_plaintext_and_catalog_rejects_http() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pre_registered_client_bypasses_dcr() -> None:
+    """目录里预注册了 client_id 的服务，不依赖 DCR 也能发起 OAuth。"""
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=_fake_app()), base_url="http://mcp.test") as client:
+        service = _service(client, _catalog("http://mcp.test/mcp"), {"token-a": "user-a"})
+        connector = Connector(
+            "demo", "示例", "streamable_http", "http://mcp.test/mcp",
+            False, client_id="pre-reg-id", client_secret="pre-secret",
+        )
+        # metadata 里 registration_endpoint 为空 = 服务不支持 DCR。
+        record = await service._client_registration("user-a", connector, {"registration_endpoint": ""})
+        assert record.client_id == "pre-reg-id"
+        assert record.client_secret_encrypted
+        assert "pre-secret" not in record.client_secret_encrypted
+        # 复用已保存的客户端，不重复加密。
+        again = await service._client_registration("user-a", connector, {"registration_endpoint": ""})
+        assert again.client_id == "pre-reg-id"
+        await service.aclose()
+
+
+@pytest.mark.asyncio
 async def test_oauth_refresh_selection_and_user_isolation() -> None:
     fake = _fake_app()
     transport = httpx.ASGITransport(app=fake)
@@ -252,7 +272,11 @@ async def test_oauth_refresh_selection_and_user_isolation() -> None:
         specs_a = await service.tool_specs("user-a")
         specs_b = await service.tool_specs("user-b")
         assert [item.name for item in specs_a] == ["mcp__demo__echo"]
-        assert specs_b == []
+        # 连接后默认只勾只读工具：写类（delete_page）永远要用户自己选。
+        # 两个用户各自持有自己的选择，互不影响。
+        assert [item.name for item in specs_b] == ["mcp__demo__echo"]
+        assert service.store.connections[("user-a", "demo")].selected_tools == ["echo"]
+        assert service.store.connections[("user-b", "demo")].selected_tools == ["echo"]
         result = await specs_a[0].handler(specs_a[0].args_model(message="你好"))
         assert "你好" in result
         assert "untrusted" in result

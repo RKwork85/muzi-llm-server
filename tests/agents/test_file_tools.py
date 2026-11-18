@@ -8,7 +8,8 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
-from app.agents.toolsets import resolve_tool_names
+from app.agents.policy import basic_tool_names
+from app.agents.toolsets import agent_tool_names
 from app.core.config import ROOT
 from app.main import create_app
 from app.tools.file_sandbox import MAX_DIRECTORY_DEPTH, MAX_FILE_BYTES, FileDenied, confined, resolve_inside
@@ -50,8 +51,15 @@ def test_workspace_tools_stay_off_by_default(tmp_path) -> None:
         "get_current_time",
     }
     registry = build_agent_registry()
-    assert resolve_tool_names(registry, make_settings(), None) == ("calculator", "get_current_time")
-    names = resolve_tool_names(registry, make_settings(tools_workspace_root=str(tmp_path)), ["workspace"])
+    assert basic_tool_names(registry) == ("calculator", "get_current_time")
+    from app.authorization.domain.catalog import ROLE_BY_CODE
+
+    names = agent_tool_names(
+        registry,
+        make_settings(tools_workspace_root=str(tmp_path)),
+        ["workspace"],
+        permissions=ROLE_BY_CODE["member"].permissions,
+    )
     assert names == ("list_directory", "read_text_file", "search_text")
     assert not inspect.iscoroutinefunction(list_directory)
     assert not inspect.iscoroutinefunction(read_text_file)

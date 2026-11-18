@@ -137,6 +137,19 @@ class PlanStatus(StrEnum):
     SUPERSEDED = "superseded"
 
 
+class TodoStatus(StrEnum):
+    """执行期清单项的生命周期。四态与协议层保持一致，不复用 InteractionStatus。
+
+    todo 是独立聚合：状态变化不 bump PlanSnapshot.revision，避免执行期进度
+    让所有携带 expected_revision 的请求失效。
+    """
+
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
 class PlanningEventType(StrEnum):
     CHAT_RUN_STARTED = "chat.run.started"
     CHAT_DELTA = "chat.delta"
@@ -156,6 +169,7 @@ class PlanningEventType(StrEnum):
     INTERACTION_REQUIRED = "interaction.required"
     INTERACTION_SUBMITTED = "interaction.submitted"
     INTERACTION_SKIPPED = "interaction.skipped"
+    TODO_UPDATED = "todo.updated"
     MODE_CHANGED = "conversation.mode_changed"
     HANDOFF_CREATED = "handoff.created"
     RUN_STARTED = "run.started"
@@ -412,6 +426,90 @@ class PlanStep(StrictContract):
     depends_on: list[str] = Field(default_factory=list, max_length=50)
 
 
+class PlanTodo(StrictContract):
+    """执行期清单项。
+
+    id 优先复用 `PlanStep.id`（由服务端维护稳定 identity）；执行期临时新增的项
+    使用 `todo_<hex>`。不含 revision：todo 是独立聚合，变更不修改计划版本。
+    """
+
+    id: str = Field(min_length=1, max_length=128)
+    content: str = Field(min_length=1, max_length=2000)
+    status: TodoStatus = TodoStatus.PENDING
+    depends_on: list[str] = Field(default_factory=list, max_length=50)
+
+    @field_validator("id")
+    @classmethod
+    def valid_id(cls, value: str) -> str:
+        if not _IDENTIFIER.fullmatch(value):
+            raise ValueError("todo id contains unsupported characters")
+        return value
+
+    @field_validator("depends_on")
+    @classmethod
+    def valid_dependencies(cls, value: list[str]) -> list[str]:
+        if any(not _IDENTIFIER.fullmatch(item) for item in value):
+            raise ValueError("todo dependency contains unsupported characters")
+        if len(set(value)) != len(value):
+            raise ValueError("todo dependencies must be unique")
+        return value
+
+
+class PlanTodoSet(StrictContract):
+    """一份计划的执行期清单。
+
+    `todos` 的顺序即 UI 展示顺序。`source_plan_revision` 表示清单派生自哪个
+    计划版本，用于在计划被改动后识别陈旧清单。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    plan_id: str = Field(min_length=1, max_length=128)
+    source_plan_revision: int = Field(ge=0)
+    todos: list[PlanTodo] = Field(default_factory=list, max_length=200)
+    updated_at: datetime
+
+    @field_validator("plan_id")
+    @classmethod
+    def valid_plan_id(cls, value: str) -> str:
+        if not _IDENTIFIER.fullmatch(value):
+            raise ValueError("plan id contains unsupported characters")
+        return value
+
+    @field_validator("updated_at")
+    @classmethod
+    def require_timezone(cls, value: datetime) -> datetime:
+        if value.utcoffset() is None:
+            raise ValueError("updated_at must include a timezone")
+        return value
+
+    @model_validator(mode="after")
+    def ids_are_unique(self) -> PlanTodoSet:
+        ids = [todo.id for todo in self.todos]
+        if len(ids) != len(set(ids)):
+            raise ValueError("todo ids must be unique")
+        return self
+
+
+class TodoUpdateRequest(StrictContract):
+    """执行期清单更新。
+
+    merge=True：按 id 增量合并，未知 id 视为新增，未出现的已有项保持不变。
+    merge=False：整体替换，已有但缺失的项转为 cancelled（保留审计），不物理删除。
+    """
+
+    todos: list[PlanTodo] = Field(default_factory=list, max_length=200)
+    merge: bool = True
+    expected_plan_revision: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def ids_are_unique(self) -> TodoUpdateRequest:
+        ids = [todo.id for todo in self.todos]
+        if len(ids) != len(set(ids)):
+            raise ValueError("todo ids must be unique")
+        return self
+
+
 class PlanDecision(StrictContract):
     key: str = Field(min_length=1, max_length=128)
     value: Any
@@ -483,6 +581,17 @@ class ModeSwitchRequest(StrictContract):
 class ExecutionAuthorizationRequest(StrictContract):
     approved_plan_id: str = Field(min_length=1, max_length=128)
     approved_revision: int = Field(ge=0)
+    expected_revision: int = Field(ge=0)
+    authorization_id: str = Field(min_length=8, max_length=128)
+
+
+class ApproveAndExecuteRequest(StrictContract):
+    """单次门：一次调用完成「确认计划 + 切换 Agent + 授权执行」。
+
+    `expected_revision` 指向当前 awaiting_approval 版本；`authorization_id`
+    是执行授权审计标识（执行前仍会重新校验权限，M6 安全门不变）。
+    """
+
     expected_revision: int = Field(ge=0)
     authorization_id: str = Field(min_length=8, max_length=128)
 

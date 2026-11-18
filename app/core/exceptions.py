@@ -242,10 +242,22 @@ class ShareNotFoundError(AppError):
     default_message = "分享链接不存在或已失效"
 
 
+class DocArticleNotFoundError(AppError):
+    code = "DOC_ARTICLE_NOT_FOUND"
+    status_code = 404
+    default_message = "文档不存在或无权访问"
+
+
 class ArkFileNotFoundError(AppError):
     code = "ARK_FILE_NOT_FOUND"
     status_code = 404
     default_message = "文件不存在"
+
+
+class RechargeOrderNotFoundError(AppError):
+    code = "RECHARGE_ORDER_NOT_FOUND"
+    status_code = 404
+    default_message = "充值订单不存在或已过期"
 
 
 class QuotaExceededError(AppError):
@@ -290,6 +302,19 @@ class McpUnavailableError(AppError):
     default_message = "外部连接暂不可用"
 
 
+class ConnectorAuthRequiredError(AppError):
+    """连接器层面的授权缺失/失效。
+
+    与 `LoginRequiredError`（401，平台会话）严格区分：这里用户已经登录，
+    需要重新做的是**这个第三方连接器**的授权。混用会让前端把「连接器要重新授权」
+    显示成「请先登录」，用户去重登也解决不了。
+    """
+
+    code = "MCP_AUTH_REQUIRED"
+    status_code = 409
+    default_message = "该连接需要重新授权"
+
+
 class DatabaseUnavailableError(AppError):
     code = "DATABASE_UNAVAILABLE"
     status_code = 503
@@ -300,6 +325,30 @@ class AgentTaskNotFoundError(AppError):
     code = "AGENT_TASK_NOT_FOUND"
     status_code = 404
     default_message = "未找到指定任务"
+
+
+class ContentTaskNotFoundError(AppError):
+    code = "CONTENT_TASK_NOT_FOUND"
+    status_code = 404
+    default_message = "未找到指定创作任务"
+
+
+class ContentTaskStateError(AppError):
+    code = "CONTENT_TASK_STATE_INVALID"
+    status_code = 409
+    default_message = "任务当前状态不支持该操作"
+
+
+class ComfyJobNotFoundError(AppError):
+    code = "COMFY_JOB_NOT_FOUND"
+    status_code = 404
+    default_message = "图像生成任务不存在"
+
+
+class ComfyJobConflictError(AppError):
+    code = "COMFY_JOB_CONFLICT"
+    status_code = 409
+    default_message = "任务无法取消（不存在或已开始执行）"
 
 
 class ChatRunNotFoundError(AppError):

@@ -14,6 +14,7 @@ from pydantic import ValidationError
 from app.core.config import Settings
 from app.core.context import get_request_id
 from app.core.exceptions import (
+    AppError,
     InvalidModelResponseError,
     InvalidToolArgumentsError,
     ToolExecutionError,
@@ -110,6 +111,10 @@ class ToolService:
             raise ToolExecutionError() from None
         except ValueError:
             raise InvalidToolArgumentsError() from None
+        except AppError:
+            # 连接器授权过期（MCP_AUTH_REQUIRED）这类错误必须原样上抛：
+            # 压成通用的「工具执行失败」会让用户不知道要回去重新授权。
+            raise
         except ZeroDivisionError:
             raise ToolExecutionError() from None
         except Exception:

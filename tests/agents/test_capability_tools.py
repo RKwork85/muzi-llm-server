@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 
 import httpx
@@ -21,13 +22,20 @@ from app.tools.code_runner import PythonArgs, run_python
 from app.tools.sandbox_command import CommandArgs, run_command
 from app.tools.weather import WeatherArgs, query_weather
 from app.tools.web_tools import CURRENT_SETTINGS
+from app.tools.workspace_scope import scope_dirname
 from tests.conftest import make_settings
 
 
-def test_capability_matrix_keeps_destructive_tools_behind_grants(tmp_path) -> None:
+def test_capability_matrix_projects_tools_from_permissions(tmp_path) -> None:
+    """名单是权限投影：工具出现即代表它已获授权，不再需要单独的 grants。"""
+    from app.authorization.domain.catalog import ROLE_BY_CODE
+
     registry = build_agent_registry()
     settings = make_settings(tools_network_enabled=True, tools_workspace_root=str(tmp_path))
-    ask = set(ask_tool_names(registry, settings))
+    member = ROLE_BY_CODE["member"].permissions
+    developer = ROLE_BY_CODE["developer"].permissions
+
+    ask = set(ask_tool_names(registry, settings, permissions=member))
     assert {
         "web_search",
         "web_fetch",
@@ -41,16 +49,17 @@ def test_capability_matrix_keeps_destructive_tools_behind_grants(tmp_path) -> No
     } <= ask
     assert "delete_file" not in ask
     assert "run_command" not in ask
-    assert "run_python" in ask
+    assert "run_python" not in ask  # member 没有 ask.command.execute
     assert supports_orchestration("ask") is False
-    plan = set(plan_tool_names(registry, settings))
+
+    plan = set(plan_tool_names(registry, settings, permissions=member))
     assert {"web_search", "read_text_file", "calculator"} <= plan
     assert "write_text_file" not in plan
     assert "write_docx" not in plan
     assert "deliver_file" not in plan
     assert supports_orchestration("plan") is False
 
-    agent = set(agent_tool_names(registry, settings, None, None))
+    agent = set(agent_tool_names(registry, settings, None, permissions=member))
     assert "weather_query" in agent
     assert "read_text_file" in agent
     assert "write_text_file" not in agent
@@ -59,28 +68,22 @@ def test_capability_matrix_keeps_destructive_tools_behind_grants(tmp_path) -> No
     assert "run_command" not in agent
     assert supports_orchestration("agent") is True
 
+    # developer 具备 agent 写/执行权限时，同一个 toolset 直接带出写工具。
+    scope = scope_dirname("c" * 43)
     opened = set(
         agent_tool_names(
             registry,
             settings,
-            None,
-            ["write_file", "delete_file", "run_command"],
+            ["workspace"],
+            permissions=developer,
+            workspace_scope=scope,
+            owned_scopes={scope},
         )
     )
-    assert "write_text_file" not in opened
-    assert "write_docx" not in opened
-    assert "delete_file" not in opened
-    assert "run_command" not in opened
-    permitted = set(
-        agent_tool_names(
-            registry,
-            settings,
-            None,
-            ["write_file", "delete_file", "run_command"],
-            permissions={"agent.workspace.write", "agent.workspace.delete", "agent.command.execute"},
-        )
-    )
-    assert {"write_text_file", "write_docx", "delete_file", "run_command"} <= permitted
+    assert {"write_text_file", "write_docx", "delete_file", "run_command"} <= opened
+
+    # 没有权限时不会出现；不再有「传了 grant 就能开」的第二条路径。
+    assert "write_docx" not in set(agent_tool_names(registry, settings, ["workspace"], permissions=member))
 
 
 def test_ask_mode_masks_skill_tools(tmp_path) -> None:
@@ -102,19 +105,27 @@ def test_ask_mode_masks_skill_tools(tmp_path) -> None:
 
 
 def test_explicit_workspace_toolset_does_not_grant_write_or_delete(tmp_path) -> None:
+    from app.authorization.domain.catalog import ROLE_BY_CODE
+
     registry = build_agent_registry()
     settings = make_settings(tools_workspace_root=str(tmp_path))
-    names = set(agent_tool_names(registry, settings, ["workspace"], None))
+    names = set(
+        agent_tool_names(
+            registry,
+            settings,
+            ["workspace"],
+            permissions=ROLE_BY_CODE["member"].permissions,
+        )
+    )
     assert names == {"list_directory", "read_text_file", "search_text"}
 
 
 def test_code_toolset_unlocks_run_python_but_run_command_needs_grant(tmp_path) -> None:
-    """Phase 4：前端按用户权限动态传 toolset。
+    """工具集只能收窄：真正的可见性由 capbility.action 对应的权限码决定。
 
-    - developer（有 agent.command.execute）传 ['skills','code']：run_python 进名单，
-      模型能 load_skill 后现场写代码处理用户文件；run_command 仍需显式 grant。
-    - member（只有 skill.execute）传 ['skills']：只有技能工具，run_python 不可见，
-      不会出现「传了 code 却被执行层拒」的空转。
+    - developer（有 agent.command.execute）传 ['skills','code']：run_python 与技能脚本进名单。
+    - member（只有 skill.execute）传 ['skills']：技能说明可读，但技能脚本要求
+      command.execute，所以不会出现，更不会出现「传了 code 却被执行层拒」的空转。
     """
     registry = build_agent_registry()
     settings = make_settings(
@@ -122,13 +133,15 @@ def test_code_toolset_unlocks_run_python_but_run_command_needs_grant(tmp_path) -
         skills_root=str(tmp_path / "skills"),
     )
 
+    scope = scope_dirname("d" * 43)
     developer = set(
         agent_tool_names(
             registry,
             settings,
             toolsets=["skills", "code"],
-            grants=None,
             permissions={"agent.execute", "skill.execute", "agent.command.execute"},
+            workspace_scope=scope,
+            owned_scopes={scope},
         )
     )
     assert {"run_python", "discover_skills", "load_skill", "read_skill_resource", "execute_skill_script"} <= developer
@@ -139,11 +152,11 @@ def test_code_toolset_unlocks_run_python_but_run_command_needs_grant(tmp_path) -
             registry,
             settings,
             toolsets=["skills"],
-            grants=None,
             permissions={"agent.execute", "skill.execute"},
         )
     )
-    assert {"discover_skills", "load_skill", "read_skill_resource", "execute_skill_script"} <= member
+    assert {"discover_skills", "load_skill", "read_skill_resource"} <= member
+    assert "execute_skill_script" not in member
     assert "run_python" not in member
     assert "run_command" not in member
 
@@ -183,6 +196,68 @@ def test_write_docx_is_a_real_word_package_and_text_writer_refuses_it(tmp_path) 
         assert denied["error"]["code"] == "file_unavailable"
     finally:
         CURRENT_SETTINGS.reset(token)
+
+
+# 1x1 PNG：只用来验证图片块能进包，不依赖 PIL。
+_PNG_1PX = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGOUCzjBwMDAxAAGAA4IAToauT++AAAAAElFTkSuQmCC"
+)
+
+
+def test_write_docx_supports_table_image_and_landscape(tmp_path) -> None:
+    import zipfile
+
+    (tmp_path / "logo.png").write_bytes(_PNG_1PX)
+    token = CURRENT_SETTINGS.set(make_settings(tools_workspace_root=str(tmp_path)))
+    try:
+        written = json.loads(
+            write_docx(
+                WriteDocxArgs(
+                    path="out/report.docx",
+                    title="季报",
+                    orientation="landscape",
+                    blocks=[
+                        DocBlock(kind="heading", text="概览", level=1),
+                        DocBlock(
+                            kind="table",
+                            headers=["指标", "本期", "同比"],
+                            rows=[["营收", "4.28", "+15.0%"], ["毛利", "41.2%", "+2.6pp"]],
+                            caption="表 1 财务对比",
+                        ),
+                        DocBlock(kind="image", path="logo.png", width_mm=40),
+                        DocBlock(kind="page_break"),
+                        DocBlock(kind="paragraph", text="第二页"),
+                    ],
+                )
+            )
+        )
+        assert written["created"] is True
+        package = zipfile.ZipFile(tmp_path / "out" / "report.docx")
+        xml = package.read("word/document.xml").decode("utf-8")
+        assert 'w:w="16838"' in xml and 'w:h="11906"' in xml  # 横向 A4
+        assert "<w:tbl>" in xml
+        assert 'w:fill="1F3864"' in xml
+        assert "<w:drawing>" in xml
+        assert "表 1 财务对比" in xml
+        assert any(name.startswith("word/media/") for name in package.namelist())
+
+        missing = json.loads(
+            write_docx(WriteDocxArgs(path="a.docx", blocks=[DocBlock(kind="image", path="nope.png")]))
+        )
+        assert missing["error"]["code"] == "image_missing"
+        escape = json.loads(
+            write_docx(WriteDocxArgs(path="b.docx", blocks=[DocBlock(kind="image", path="../x.png")]))
+        )
+        assert escape["error"]["code"] == "file_unavailable"
+    finally:
+        CURRENT_SETTINGS.reset(token)
+
+
+def test_doc_block_rejects_ragged_table() -> None:
+    with pytest.raises(ValidationError):
+        DocBlock(kind="table", headers=["a", "b"], rows=[["1"]])
+    with pytest.raises(ValidationError):
+        DocBlock(kind="heading", text="   ")
 
 
 def test_write_and_delete_stay_inside_workspace(tmp_path) -> None:
@@ -363,3 +438,27 @@ def test_sandbox_command_runs_allowlisted_name_in_ephemeral_dir(tmp_path) -> Non
     assert payload["output"].strip()
     assert str(tmp_path) not in payload["output"]
     assert "muzi_cmd_" not in payload["output"]
+
+
+def test_update_todos_is_projected_only_for_plan_runs(tmp_path) -> None:
+    """清单工具只在「计划交接而来的运行」出现，普通 Agent 对话看不到。"""
+    from app.agents.toolsets import agent_chat_tool_names
+    from app.authorization.application.execution_guard import CURRENT_EXECUTION, ExecutionContext
+    from app.authorization.domain.catalog import ROLE_BY_CODE
+
+    registry = build_agent_registry()
+    settings = make_settings(tools_workspace_root=str(tmp_path))
+    permissions = frozenset(ROLE_BY_CODE["developer"].permissions)
+
+    without_plan = set(agent_chat_tool_names(registry, settings, permissions=permissions))
+    assert "update_todos" not in without_plan
+    assert "update_todos" not in set(plan_tool_names(registry, settings, permissions=permissions))
+    assert "update_todos" not in set(ask_tool_names(registry, settings, permissions=permissions))
+
+    context = ExecutionContext(user_id="u_plan", runtime_mode="agent", plan_id="plan_abc", effective_permissions=permissions)
+    token = CURRENT_EXECUTION.set(context)
+    try:
+        with_plan = set(agent_chat_tool_names(registry, settings, permissions=permissions))
+    finally:
+        CURRENT_EXECUTION.reset(token)
+    assert "update_todos" in with_plan

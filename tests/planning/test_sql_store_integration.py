@@ -387,3 +387,363 @@ async def test_handoff_created_event_is_persisted_and_replayable(planning_db):
             assert any(item.type.value == "handoff.created" for item in conversation_events)
     finally:
         await _delete_fixture_rows(factory, user_id, conversation_id)
+
+
+async def test_authorize_execution_initializes_checklist_once_and_updates_are_independent(planning_db):
+    """授权执行时初始化清单一次；todo 更新不修改计划 revision，事件可重放。"""
+    from sqlalchemy import select
+
+    from app.models.tables import User
+    from app.planning.contracts import PlanTodo, PlanStatus, TodoStatus, TodoUpdateRequest
+
+    factory = planning_db
+    user_id, conversation_id = await _new_owner_and_conversation(factory)
+    try:
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            plan = await store.create_plan(owner, str(conversation_id), "Design permissions")
+            steps = [
+                {"id": "step_1", "title": "Define roles"},
+                {"id": "step_2", "title": "Map grants"},
+            ]
+            drafting, _ = await store.apply_proposal(
+                plan.plan_id,
+                owner,
+                plan,
+                DecisionProposal(protocol_version="1.0", action="update_plan", goal=plan.goal, steps=steps),
+            )
+            for_review, _ = await store.apply_proposal(
+                plan.plan_id,
+                owner,
+                drafting,
+                DecisionProposal(protocol_version="1.0", action="request_approval", goal=plan.goal, steps=steps),
+            )
+            approved = await store.approve(plan.plan_id, owner, for_review.revision)
+            ready = await store.switch_mode(plan.plan_id, owner, approved.revision, "agent")
+            executing = await store.authorize_execution(
+                plan.plan_id,
+                owner,
+                approved_revision=approved.revision,
+                expected_revision=ready.revision,
+                authorization_id="auth_todo_integration",
+            )
+            await session.commit()
+
+        # 新会话读取：清单已落库，初始化只发生一次。
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            checklist = await store.get_todos(plan.plan_id, owner)
+            assert checklist is not None
+            assert [item.id for item in checklist.todos] == ["step_1", "step_2"]
+            assert all(item.status is TodoStatus.PENDING for item in checklist.todos)
+            assert checklist.source_plan_revision == executing.revision
+
+            events, _ = await store.events_after(plan.plan_id, owner, 0)
+            assert [item.type.value for item in events].count("todo.updated") == 1
+
+            updated = await store.update_todos(
+                plan.plan_id,
+                owner,
+                TodoUpdateRequest(
+                    todos=[PlanTodo(id="step_1", content="Define roles", status=TodoStatus.COMPLETED)]
+                ),
+            )
+            await session.commit()
+
+        # 清单更新不改计划版本；计划状态仍是 executing。
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            restored = await store.get_todos(plan.plan_id, owner)
+            assert restored is not None
+            assert restored.todos[0].status is TodoStatus.COMPLETED
+            assert restored.todos[1].status is TodoStatus.PENDING
+            assert updated.source_plan_revision == executing.revision
+            current = await store.get_plan(plan.plan_id, owner)
+            assert current.revision == executing.revision
+            assert current.status is PlanStatus.EXECUTING
+
+            events, _ = await store.events_after(plan.plan_id, owner, 0)
+            todo_events = [item for item in events if item.type.value == "todo.updated"]
+            assert len(todo_events) == 2
+            assert todo_events[-1].payload["merge"] is True
+            assert todo_events[-1].payload["todos"][0]["status"] == "completed"
+            assert todo_events[-1].payload["source_plan_revision"] == executing.revision
+    finally:
+        await _delete_fixture_rows(factory, user_id, conversation_id)
+
+
+async def test_todo_update_rejects_stale_expected_revision(planning_db):
+    """并发写入：携带旧 revision 的清单更新必须失败，而不是覆盖别人。"""
+    from sqlalchemy import select
+
+    from app.models.tables import User
+    from app.planning.contracts import PlanTodo, TodoUpdateRequest
+
+    factory = planning_db
+    user_id, conversation_id = await _new_owner_and_conversation(factory)
+    try:
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            plan = await store.create_plan(owner, str(conversation_id), "Design permissions")
+            steps = [{"id": "step_1", "title": "Define roles"}]
+            drafting, _ = await store.apply_proposal(
+                plan.plan_id,
+                owner,
+                plan,
+                DecisionProposal(protocol_version="1.0", action="update_plan", goal=plan.goal, steps=steps),
+            )
+            for_review, _ = await store.apply_proposal(
+                plan.plan_id,
+                owner,
+                drafting,
+                DecisionProposal(protocol_version="1.0", action="request_approval", goal=plan.goal, steps=steps),
+            )
+            approved = await store.approve(plan.plan_id, owner, for_review.revision)
+            ready = await store.switch_mode(plan.plan_id, owner, approved.revision, "agent")
+            executing = await store.authorize_execution(
+                plan.plan_id,
+                owner,
+                approved_revision=approved.revision,
+                expected_revision=ready.revision,
+                authorization_id="auth_todo_stale",
+            )
+            await session.commit()
+
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            try:
+                await store.update_todos(
+                    plan.plan_id,
+                    owner,
+                    TodoUpdateRequest(
+                        todos=[PlanTodo(id="step_1", content="Define roles")],
+                        expected_plan_revision=executing.revision - 1,
+                    ),
+                )
+                raise AssertionError("stale revision must be rejected")
+            except PlanningConflict:
+                pass
+            await session.rollback()
+    finally:
+        await _delete_fixture_rows(factory, user_id, conversation_id)
+
+
+async def _executing_plan_with_steps(factory, steps):
+    """构造一个已执行、已初始化清单的计划，返回 (plan_id, executing)。"""
+    from sqlalchemy import select
+
+    from app.models.tables import User
+
+    user_id, conversation_id = await _new_owner_and_conversation(factory)
+    async with factory() as session:
+        owner = await session.scalar(select(User).where(User.id == user_id))
+        assert owner is not None
+        store = SqlPlanningStore(session)
+        plan = await store.create_plan(owner, str(conversation_id), "Design permissions")
+        drafting, _ = await store.apply_proposal(
+            plan.plan_id,
+            owner,
+            plan,
+            DecisionProposal(protocol_version="1.0", action="update_plan", goal=plan.goal, steps=steps),
+        )
+        for_review, _ = await store.apply_proposal(
+            plan.plan_id,
+            owner,
+            drafting,
+            DecisionProposal(protocol_version="1.0", action="request_approval", goal=plan.goal, steps=steps),
+        )
+        approved = await store.approve(plan.plan_id, owner, for_review.revision)
+        ready = await store.switch_mode(plan.plan_id, owner, approved.revision, "agent")
+        executing = await store.authorize_execution(
+            plan.plan_id,
+            owner,
+            approved_revision=approved.revision,
+            expected_revision=ready.revision,
+            authorization_id="auth_auto_advance",
+        )
+        await session.commit()
+        return user_id, conversation_id, plan.plan_id, executing
+
+
+async def test_auto_advance_todo_lights_first_startable_and_is_idempotent(planning_db):
+    """自动推导：点亮第一个可开始步骤；重复调用不再推进。"""
+    from sqlalchemy import select
+
+    from app.models.tables import User
+    from app.planning.contracts import TodoStatus
+
+    factory = planning_db
+    user_id, conversation_id, plan_id, executing = await _executing_plan_with_steps(
+        factory,
+        [
+            {"id": "step_1", "title": "Define roles"},
+            {"id": "step_2", "title": "Map grants"},
+        ],
+    )
+    try:
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            await store.auto_advance_todo(plan_id, owner)
+            await session.commit()
+
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            checklist = await store.get_todos(plan_id, owner)
+            assert checklist is not None
+            assert checklist.todos[0].status is TodoStatus.IN_PROGRESS
+            assert checklist.todos[1].status is TodoStatus.PENDING
+            # 已有 in_progress，重复调用不推进、不再 emit。
+            await store.auto_advance_todo(plan_id, owner)
+            await session.commit()
+
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            events, _ = await store.events_after(plan_id, owner, 0)
+            todo_events = [item for item in events if item.type.value == "todo.updated"]
+            # 初始化一次 + 自动点亮一次 = 2；第二次调用被幂等拦截。
+            assert len(todo_events) == 2
+    finally:
+        await _delete_fixture_rows(factory, user_id, conversation_id)
+
+
+async def test_complete_todos_flips_remaining_on_finish(planning_db):
+    """终态兜底：把剩余 pending / in_progress 推进到 completed，cancelled 不变。"""
+    from sqlalchemy import select
+
+    from app.models.tables import User
+    from app.planning.contracts import PlanTodo, TodoStatus, TodoUpdateRequest
+
+    factory = planning_db
+    user_id, conversation_id, plan_id, executing = await _executing_plan_with_steps(
+        factory,
+        [
+            {"id": "step_1", "title": "Define roles"},
+            {"id": "step_2", "title": "Map grants"},
+        ],
+    )
+    try:
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            # 模拟一个 cancelled 项保留。
+            await store.update_todos(
+                plan_id,
+                owner,
+                TodoUpdateRequest(
+                    todos=[PlanTodo(id="step_2", content="Map grants", status=TodoStatus.CANCELLED)]
+                ),
+            )
+            await store.complete_todos(plan_id, owner)
+            await session.commit()
+
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            checklist = await store.get_todos(plan_id, owner)
+            assert checklist is not None
+            assert checklist.todos[0].status is TodoStatus.COMPLETED
+            assert checklist.todos[1].status is TodoStatus.CANCELLED
+    finally:
+        await _delete_fixture_rows(factory, user_id, conversation_id)
+
+
+async def test_approve_and_authorize_converges_in_single_call(planning_db):
+    """单次门：从 awaiting_approval 一次推进到 executing，且保留版本链与事件审计。"""
+    from sqlalchemy import select
+
+    from app.models.tables import User
+    from app.planning.contracts import PlanStatus, TodoStatus
+
+    factory = planning_db
+    user_id, conversation_id = await _new_owner_and_conversation(factory)
+    try:
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            plan = await store.create_plan(owner, str(conversation_id), "Design permissions")
+            steps = [{"id": "step_1", "title": "Define roles"}]
+            drafting, _ = await store.apply_proposal(
+                plan.plan_id,
+                owner,
+                plan,
+                DecisionProposal(protocol_version="1.0", action="update_plan", goal=plan.goal, steps=steps),
+            )
+            for_review, _ = await store.apply_proposal(
+                plan.plan_id,
+                owner,
+                drafting,
+                DecisionProposal(protocol_version="1.0", action="request_approval", goal=plan.goal, steps=steps),
+            )
+            executing, approved_revision = await store.approve_and_authorize(
+                plan.plan_id,
+                owner,
+                expected_revision=for_review.revision,
+                authorization_id="auth_single_gate",
+            )
+            await session.commit()
+            assert executing.status is PlanStatus.EXECUTING
+            assert approved_revision == for_review.revision + 1
+
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            events, _ = await store.events_after(plan.plan_id, owner, 0)
+            names = [item.type.value for item in events]
+            for expected in ["plan.approved", "handoff.created", "conversation.mode_changed", "run.started", "todo.updated"]:
+                assert expected in names, f"{expected} missing from event stream"
+            checklist = await store.get_todos(plan.plan_id, owner)
+            assert checklist is not None
+            assert [item.id for item in checklist.todos] == ["step_1"]
+            assert checklist.todos[0].status is TodoStatus.PENDING
+    finally:
+        await _delete_fixture_rows(factory, user_id, conversation_id)
+
+
+async def test_emit_run_progress_only_while_executing(planning_db):
+    """run.progress 只在计划执行中 emit，其他状态静默跳过。"""
+    from sqlalchemy import select
+
+    from app.models.tables import User
+
+    factory = planning_db
+    user_id, conversation_id, plan_id, executing = await _executing_plan_with_steps(
+        factory, [{"id": "step_1", "title": "Define roles"}]
+    )
+    try:
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            await store.emit_run_progress(plan_id, owner, {"step": 1})
+            await session.commit()
+
+        async with factory() as session:
+            owner = await session.scalar(select(User).where(User.id == user_id))
+            assert owner is not None
+            store = SqlPlanningStore(session)
+            events, _ = await store.events_after(plan_id, owner, 0)
+            progress = [item for item in events if item.type.value == "run.progress"]
+            assert len(progress) == 1
+            assert progress[0].payload["step"] == 1
+    finally:
+        await _delete_fixture_rows(factory, user_id, conversation_id)

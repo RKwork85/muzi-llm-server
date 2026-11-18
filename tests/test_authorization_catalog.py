@@ -51,7 +51,10 @@ def test_member_has_basic_permissions_not_admin() -> None:
     assert "skill.execute" in member
     assert "user.manage" not in member
     assert "role.manage" not in member
-    assert "mcp.execute" not in member
+    # 已授权连接器（Notion/企微/飞书）的调用与普通对话同级：授权是用户自己的动作，
+    # 权限位只决定"授权后能不能调"，所以 member 也有。
+    assert "mcp.execute" in member
+    assert "mcp.connect" not in member
     # 工具执行权限按模式拆分：member 在 ask 可读写、plan/agent 仅读，删除与执行代码不给
     assert "ask.workspace.read" in member
     assert "ask.workspace.write" in member

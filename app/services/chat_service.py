@@ -7,7 +7,7 @@ import json
 import logging
 import re
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import uuid4
@@ -45,6 +45,13 @@ from app.tools.registry import ToolRegistry, ToolSpec
 from app.tools.deliver_file import USER_DOWNLOAD_KIND
 from app.tools.file_sandbox import FileDenied
 from app.tools.file_tools import workspace_root
+from app.tools.capabilities import MCP_MODES
+from app.tools.plugins import (
+    PluginVisibility,
+    allowed_plugin_names,
+    connector_names_from_tools,
+    visible_plugins,
+)
 from app.tools.url_policy import UrlLedger
 from app.tools.web_tools import CURRENT_SETTINGS, CURRENT_URL_LEDGER, CURRENT_WEB_CLIENT, UNTRUSTED_PROMPT
 from app.tools.workspace_scope import CURRENT_WORKSPACE_SCOPE, is_user_scope
@@ -275,11 +282,46 @@ class ChatService:
         body: StreamChatRequest,
         remote_tools: list[ToolSpec] | None = None,
         mcp_user_id: str | None = None,
+        *,
+        permissions: Collection[str] | None = None,
+        workspace_scope: str | None = None,
+        owned_scopes: Collection[str] | None = None,
+        connectors: Collection[str] | None = None,
     ) -> PreparedChat:
-        """按对话模式挂上允许的工具。页面不能扩大工具集合。"""
+        """按对话模式挂上允许的工具。页面不能扩大工具集合。
+
+        `permissions` 必须是调用方已经加载好的授权快照：工具名单在挂载时就算完，
+        不能等到执行期再发现「这个工具其实没被授权」。调用方没有可信身份时传
+        `None`（静态目录/测试口径），执行期仍由 `ExecutionGuard` 拒绝敏感动作。
+        """
         mode = body.mode
-        remote = list(remote_tools or []) if mode == "agent" else []
-        names = self._mode_names(mode, mcp_user_id if mode == "agent" else None)
+        remote = list(remote_tools or []) if mode in MCP_MODES else []
+        # 远端连接器工具和内置工具同一套口径：挂载即授权。
+        # 没有 mcp.execute 就不挂 schema，而不是让模型看见一个调用必被拒的工具。
+        if remote and permissions is not None and "mcp.execute" not in frozenset(permissions):
+            remote = []
+        names = self._mode_names(
+            mode,
+            mcp_user_id if mode in MCP_MODES else None,
+            permissions=permissions,
+            workspace_scope=workspace_scope,
+            owned_scopes=owned_scopes,
+        )
+        # 插件面板的事实源是「用户授权了哪些连接器」。优先用调用方读到的授权事实
+        # （只读库，不受一次远端 discover 失败影响）；没有传入时退回按本次挂载的
+        # 远端工具反推，保证测试与静态目录口径一致。
+        authorized = (
+            frozenset(connectors)
+            if connectors is not None
+            else connector_names_from_tools(spec.name for spec in remote)
+        )
+        plugins = visible_plugins(
+            names,
+            permissions=permissions,
+            mode=mode,
+            connectors=authorized,
+        )
+        plugin_names = _authorized_plugin_names(body.skill_names, plugins)
         use_tools = bool(names or remote) and not _wants_json(body)
         tools = None
         if use_tools and self.ask_tools is not None and names:
@@ -295,10 +337,15 @@ class ChatService:
         prepared.max_tool_rounds = self._resolve_rounds(None)
         prepared.remote_tools = remote
         prepared.allowed_tools = names
-        prepared.mcp_user_id = mcp_user_id if mode == "agent" else None
+        prepared.mcp_user_id = mcp_user_id if mode in MCP_MODES else None
         prepared.principal_id = mcp_user_id
         system = prepared.provider_request.messages[0]
-        extra = _mode_prompt(mode, list(body.skill_names), self._plan_instructions())
+        extra = _mode_prompt(
+            mode,
+            plugin_names,
+            self._plan_instructions(),
+            can_write=bool({"write_docx", "write_text_file"}.intersection(names)),
+        )
         if self.skill_runtime is not None and "discover_skills" in names and body.skill_mode != "explicit":
             extra = f"{extra}\n\n{SKILL_USAGE_INSTRUCTION}" if extra else SKILL_USAGE_INSTRUCTION
         if use_tools and (remote or self._ask_needs_untrusted(names)):
@@ -309,7 +356,11 @@ class ChatService:
         prepared.runtime_mode = mode
         full = system["content"] if isinstance(system.get("content"), str) else ""
         tail = full[len(prepared.system_text) :] if full.startswith(prepared.system_text) else ""
-        note = skill_notes(list(body.skill_names), execute=mode == "agent")
+        note = skill_notes(
+            plugin_names,
+            execute=None if mode == "ask" else mode == "agent",
+            can_write=bool({"write_docx", "write_text_file"}.intersection(names)),
+        )
         if note and note in tail:
             prepared.skill_text = note
             prepared.developer_text = tail.replace(note, "", 1).strip()
@@ -318,7 +369,7 @@ class ChatService:
         if prepared.skill_text:
             prepared.skill_refs = [
                 {"skill_id": name, "skill_name": name, "skill_version": None}
-                for name in list(body.skill_names) + list(body.explicit_skill_ids)
+                for name in plugin_names + list(body.explicit_skill_ids)
             ]
         return prepared
 
@@ -838,21 +889,27 @@ class ChatService:
                             },
                         )
                         continue
+                    # 状态对所有工具都判定，不再只在有定价时才算：超时记成 completed
+                    # 会让统计和重试策略同时失真。
+                    status, error_code = _tool_status(str(tool_message["content"]))
                     resource_payload: dict[str, Any] = {
                         "request_id": prepared.request_id,
                         "kind": "tool",
                         "tool_name": call.name,
                         "tool_call_id": call.id,
-                        "status": "completed",
+                        "status": status,
                         "duration_ms": tool_elapsed_ms,
                         "retry_count": 0,
                     }
+                    if error_code:
+                        resource_payload["error_code"] = error_code
+                        resource_payload["error"] = error_code
                     spec = runner.registry.get(call.name)
                     if spec is not None and spec.pricing is not None:
                         from app.metering.tool_pricing import quote_tool_tokens
 
-                        success = _tool_succeeded(str(tool_message["content"]))
-                        resource_payload["status"] = "completed" if success else "failed"
+                        # 只有真正完成才计费；超时/失败不计固定 token。
+                        success = status == "completed"
                         # 不能复用 tokens：它是上面 ContextVar 的 (var, token) 列表，
                         # 被覆盖成 int 后 finally 里的 reversed(tokens) 会直接抛 TypeError。
                         priced_tokens = quote_tool_tokens(
@@ -894,10 +951,26 @@ class ChatService:
             for var, token in reversed(tokens):
                 var.reset(token)
 
-    def _mode_names(self, mode: str, user_id: str | None = None) -> tuple[str, ...]:
+    def _mode_names(
+        self,
+        mode: str,
+        user_id: str | None = None,
+        *,
+        permissions: Collection[str] | None = None,
+        workspace_scope: str | None = None,
+        owned_scopes: Collection[str] | None = None,
+    ) -> tuple[str, ...]:
         if self.ask_tools is None:
             return ()
-        return chat_mode_tool_names(self.ask_tools.registry, self.settings, mode, user_id)
+        return chat_mode_tool_names(
+            self.ask_tools.registry,
+            self.settings,
+            mode,
+            user_id,
+            permissions=permissions,
+            workspace_scope=workspace_scope,
+            owned_scopes=owned_scopes,
+        )
 
     def _plan_instructions(self) -> str:
         """Plan 模式的行为说明来自 app/prompts/system/plan_mode.md。
@@ -1135,21 +1208,42 @@ def _download_payload(content: Any) -> dict[str, Any] | None:
 
 
 _DEFAULT_PLAN_PROMPT = (
-    "你处于 Plan 模式。只能使用只读工具了解情况，然后输出计划：目标和有顺序的步骤。"
+    "你处于 Plan 模式。像专业顾问一样正常对话：用户提问就回答，需要澄清时用交互卡片收集信息。"
+    "只在用户要一份计划时，才输出目标与有顺序的步骤。"
     "不要写文件，不要声称已经修改了外部应用。"
     "需要写入、发送文件或调用外部应用时，写明交给 Agent 执行。"
 )
 
 
-def _mode_prompt(mode: str, skill_names: list[str], plan_instructions: str = "") -> str:
+def _mode_prompt(
+    mode: str,
+    skill_names: list[str],
+    plan_instructions: str = "",
+    *,
+    can_write: bool = True,
+) -> str:
     if mode == "plan":
-        note = skill_notes(skill_names, execute=False)
+        note = skill_notes(skill_names, execute=False, can_write=can_write)
         # 优先使用 app/prompts/system/plan_mode.md 的完整说明
         text = (plan_instructions or "").strip() or _DEFAULT_PLAN_PROMPT
         return f"{text}\n\n{note}" if note else text
     if mode == "agent":
-        return skill_notes(skill_names, execute=True)
-    return ""
+        return skill_notes(skill_names, execute=True, can_write=can_write)
+    # ask：不加载 SKILL.md、不给技能脚本，但 `/` 选中的插件是内置能力说明，必须注入，
+    # 否则前端选完 pdf/word 后端静默丢弃，用户看到的是「选了没用」。
+    return skill_notes(skill_names, execute=None, can_write=can_write)
+
+
+def _authorized_plugin_names(names: list[str], visibility: PluginVisibility) -> list[str]:
+    """只保留当前用户在当前模式下真正可用的插件；被拒的名字直接报错。
+
+    插件会向模型承诺能力，所以不能像普通参数那样静默忽略：前端看到的面板与
+    服务端投影不一致时，应该让请求失败而不是让模型拿着假前提作答。
+    """
+    kept, rejected = allowed_plugin_names(names, visibility)
+    if rejected:
+        raise InvalidRequestError(f"插件当前不可用: {', '.join(sorted(set(rejected)))}")
+    return kept
 
 
 def _wants_json(body: StreamChatRequest) -> bool:
@@ -1258,13 +1352,51 @@ def _tool_public(name: str, arguments: str, content: str) -> tuple[str, str]:
     return _argument_detail(name, arguments), _result_preview(content)
 
 
-def _tool_succeeded(content: str) -> bool:
-    """外部工具成功判定：result 能解析为正常结构算成功。
+def _tool_status(content: str) -> tuple[str, str]:
+    """判定工具终态，返回 ``(status, error_code)``。
 
-    web_search / web_fetch 成功时 result 是 JSON 对象；失败时 ToolService 把错误码
-    作为 result 字符串返回，无法解析为对象。
+    三态语义：
+
+    - ``completed``：执行结束且没有业务错误。
+    - ``failed``：跑完了但返回错误（参数错误、业务拒绝、外部接口失败等）。
+    - ``timeout``：没跑完就被中止（沙盒/命令/技能超时）。
+
+    旧实现只判断「能不能解析成 JSON」，而错误结果本身也是合法 JSON，于是超时被
+    记成 ``completed``，数据库里看不出「10.05 秒被杀」和「正常跑完」的区别。
     """
-    return _tool_payload(content) is not None
+    payload = _tool_payload(content)
+    if payload is None:
+        # 非 JSON：ToolService 会把网络类错误码直接作为结果字符串返回。
+        code = content.strip()
+        if code and code.replace("_", "").isalnum() and code.isupper():
+            return _terminal(code)
+        return ("completed", "")
+    error = payload.get("error")
+    if isinstance(error, dict):
+        return _terminal(str(error.get("code") or ""))
+    if isinstance(error, str):
+        return _terminal(error)
+    return ("completed", "")
+
+
+def _terminal(code: str) -> tuple[str, str]:
+    if not code:
+        return ("failed", "")
+    if code in _TIMEOUT_CODES or "TIMEOUT" in code.upper():
+        return ("timeout", code)
+    return ("failed", code)
+
+
+_TIMEOUT_CODES = frozenset(
+    {
+        "code_timeout",
+        "command_timeout",
+        "skill_execution_timeout",
+        "tool_timeout",
+        "tool_deadline_exceeded",
+        "dependency_timeout",
+    }
+)
 
 
 def _diagram_source(content: str) -> str:

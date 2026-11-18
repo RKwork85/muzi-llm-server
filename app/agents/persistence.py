@@ -67,6 +67,19 @@ class AgentRunPersistence:
                     task.status = "running"
                     execution.status = "running"
                     execution.started_at = now
+                elif event.type == AgentEventType.STEP_STARTED:
+                    # 执行期自动进度推导：粗粒度 run.progress + 点亮第一个可开始步骤。
+                    plan_id = (task.input_payload or {}).get("plan_id")
+                    if isinstance(plan_id, str):
+                        owner = await session.get(User, task.user_id)
+                        if owner is not None:
+                            store = SqlPlanningStore(session)
+                            await store.emit_run_progress(
+                                plan_id,
+                                owner,
+                                {"step": event.data.get("step", 0)},
+                            )
+                            await store.auto_advance_todo(plan_id, owner)
                 elif event.type in {
                     AgentEventType.COMPLETED,
                     AgentEventType.FAILED,
@@ -92,6 +105,10 @@ class AgentRunPersistence:
                             AgentEventType.LIMIT_REACHED: (PlanStatus.FAILED, PlanningEventType.RUN_FAILED),
                         }[event.type]
                         store = SqlPlanningStore(session)
+                        if event.type == AgentEventType.COMPLETED:
+                            # 终态兜底：在状态转移（EXECUTING → COMPLETED）之前把剩余
+                            # pending / in_progress 步骤推进到 completed。
+                            await store.complete_todos(plan_id, owner)
                         plan_snapshot = await store.get_plan(plan_id, owner)
                         await store._transition(
                             plan_id,

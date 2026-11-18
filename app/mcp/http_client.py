@@ -39,6 +39,7 @@ class RemoteSession:
     sse_lines: Any = None
     sse_response: Any = None
     message_url: str | None = None
+    auth_headers: dict[str, str] = field(default_factory=dict)
 
 
 _HUBS: dict[int, "RemoteHub"] = {}
@@ -79,6 +80,7 @@ class RemoteHub:
         token: str,
         method: str,
         params: dict[str, Any],
+        auth_headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         key = (user_id, name)
         lock = self._locks.get(key)
@@ -88,7 +90,7 @@ class RemoteHub:
         async with lock:
             for attempt in (1, 2):
                 try:
-                    return await self._invoke(key, transport, url, token, method, params)
+                    return await self._invoke(key, transport, url, token, method, params, auth_headers or {})
                 except ProtocolError as exc:
                     if not exc.fatal:
                         raise
@@ -107,10 +109,19 @@ class RemoteHub:
         token: str,
         method: str,
         params: dict[str, Any],
+        auth_headers: dict[str, str],
     ) -> dict[str, Any]:
         session = self._sessions.get(key)
-        if session is None or session.token != token or session.url != url or session.transport != transport:
-            session = RemoteSession(transport=transport, url=url, token=token, client=self._client)
+        if (
+            session is None
+            or session.token != token
+            or session.url != url
+            or session.transport != transport
+            or session.auth_headers != auth_headers
+        ):
+            session = RemoteSession(
+                transport=transport, url=url, token=token, client=self._client, auth_headers=dict(auth_headers)
+            )
             self._sessions[key] = session
             if method != "initialize":
                 await self._handshake(session)
@@ -221,11 +232,9 @@ class RemoteHub:
 
     async def _sse(self, session: RemoteSession, payload: dict[str, Any], *, wait: bool) -> dict[str, Any]:
         if session.message_url is None:
-            request = session.client.build_request(
-                "GET",
-                session.url,
-                headers={"Authorization": f"Bearer {session.token}", "Accept": "text/event-stream"},
-            )
+            headers = {"Accept": "text/event-stream"}
+            headers.update(_auth_headers(session))
+            request = session.client.build_request("GET", session.url, headers=headers)
             response = await session.client.send(request, stream=True)
             if response.status_code == 401:
                 raise PermissionError("mcp unauthorized")
@@ -233,11 +242,9 @@ class RemoteHub:
             session.sse_lines = response.aiter_lines()
             endpoint = await _read_sse_endpoint(session)
             session.message_url = urljoin(session.url, endpoint)
-        post = await session.client.post(
-            session.message_url,
-            headers={"Authorization": f"Bearer {session.token}", "Content-Type": "application/json"},
-            json=payload,
-        )
+        post_headers = {"Content-Type": "application/json"}
+        post_headers.update(_auth_headers(session))
+        post = await session.client.post(session.message_url, headers=post_headers, json=payload)
         if post.status_code == 401:
             raise PermissionError("mcp unauthorized")
         if post.status_code == 404:
@@ -251,13 +258,23 @@ class RemoteHub:
         return await _read_sse_message(session)
 
 
+def _auth_headers(session: RemoteSession) -> dict[str, str]:
+    """该会话的认证头：可选的 Bearer 令牌 + 用户自定义认证头。"""
+    headers: dict[str, str] = {}
+    if session.token:
+        headers["Authorization"] = f"Bearer {session.token}"
+    for name, value in session.auth_headers.items():
+        headers.setdefault(name, value)
+    return headers
+
+
 def _headers(session: RemoteSession) -> dict[str, str]:
     headers = {
-        "Authorization": f"Bearer {session.token}",
         "Accept": "application/json, text/event-stream",
         "Content-Type": "application/json",
         "MCP-Protocol-Version": session.protocol,
     }
+    headers.update(_auth_headers(session))
     if session.session_id:
         headers["Mcp-Session-Id"] = session.session_id
     return headers

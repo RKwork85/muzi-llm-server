@@ -18,6 +18,7 @@ import uuid
 from pathlib import Path
 
 from app.tools.sandbox.provider import (
+    SandboxDependencyRejected,
     SandboxExecutionError,
     SandboxResult,
     SandboxSpec,
@@ -43,9 +44,9 @@ class AgentBoxSandboxProvider:
         try:
             self._write_files(host_dir, spec.files)
             completed = self._execute(host_dir, spec)
-            output = f"{completed.stdout}{completed.stderr}"
+            output = f"{completed['stdout']}{completed['stderr']}"
             return SandboxResult(
-                exit_code=completed.returncode,
+                exit_code=completed["exit_code"],
                 output=output[:_MAX_OUTPUT],
                 truncated=len(output) > _MAX_OUTPUT,
             )
@@ -80,21 +81,53 @@ class AgentBoxSandboxProvider:
         except FileDenied:
             return None
 
-    def _command(self, spec: SandboxSpec) -> list[str]:
+    def _dependency_plan(self, spec: SandboxSpec):
+        """解析依赖策略；无依赖时返回 None。"""
         if not spec.dependencies:
-            return spec.argv
-        pkgs = " ".join(spec.dependencies)
-        script = " ".join(shlex.quote(part) for part in spec.argv)
-        return [
-            "sh", "-c",
-            f"python -m pip install -q --disable-pip-version-check {pkgs} && exec {script}",
-        ]
+            return None
+        from app.tools.sandbox import dependencies as dep_policy
 
-    def _execute(self, host_dir: Path, spec: SandboxSpec) -> subprocess.CompletedProcess[str]:
+        try:
+            return dep_policy.plan(
+                spec.dependencies,
+                self._settings,
+                trusted=spec.dependencies_trusted,
+            )
+        except dep_policy.DependencyRejected as exc:
+            raise SandboxDependencyRejected(exc.code, exc.message) from None
+
+    def _command(self, spec: SandboxSpec, plan) -> list[str]:
+        """有依赖时先装进 /app/.deps，再执行脚本。
+
+        走预热缓存时 pip 完全不联网（``--no-index --find-links /wheels``），
+        所以沙盒可以继续保持 ``--network none``。
+        """
+        if plan is None:
+            return spec.argv
+        pkgs = " ".join(shlex.quote(item) for item in plan.packages)
+        script = " ".join(shlex.quote(part) for part in spec.argv)
+        if plan.offline_from_cache:
+            install = (
+                "python -m pip install -q --no-input --disable-pip-version-check "
+                "--only-binary=:all: --no-index --find-links /wheels "
+                f"--target /app/.deps {pkgs}"
+            )
+            prefix = "export PYTHONPATH=/app/.deps"
+        else:
+            install = (
+                "python -m pip install -q --no-input --disable-pip-version-check "
+                f"--only-binary=:all: {pkgs}"
+            )
+            prefix = ":"
+        return ["sh", "-c", f"{prefix} && {install} && exec {script}"]
+
+    def _execute(self, host_dir: Path, spec: SandboxSpec) -> dict[str, object]:
         mem_mb = spec.memory_mb or self._mem_mb
         network = self._network if spec.network is None else spec.network
-        if spec.dependencies:
-            # pip install 需要访问 PyPI
+        plan = self._dependency_plan(spec)
+        if plan is not None and not plan.offline_from_cache:
+            # 只有回退到联网装包时才需要 bridge；
+            # 预热缓存路径是纯本地解压，断网也能装。
             network = True
         container = f"muzi_box_{uuid.uuid4().hex[:12]}"
         argv = [
@@ -108,25 +141,47 @@ class AgentBoxSandboxProvider:
             "-v", f"{host_dir}:/app",
             "-w", "/app",
         ]
+        if plan is not None and plan.offline_from_cache and plan.cache_dir is not None:
+            argv.extend(["-v", f"{plan.cache_dir}:/wheels:ro"])
         workspace = self._workspace_dir()
         if workspace is not None:
             argv.extend(["-v", f"{workspace}:/workspace:ro"])
+        for key, value in (spec.env or {}).items():
+            argv.extend(["-e", f"{key}={value}"])
         argv.append(self._image)
-        argv.extend(self._command(spec))
+        argv.extend(self._command(spec, plan))
+        out_path = host_dir / "_stdout.log"
+        err_path = host_dir / "_stderr.log"
         try:
-            return subprocess.run(
-                argv,
-                shell=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=spec.timeout + _DOCKER_GRACE_SECONDS,
-                stdin=subprocess.DEVNULL,
-                check=False,
-            )
-        except subprocess.TimeoutExpired:
-            subprocess.run(["docker", "rm", "-f", container], capture_output=True)
-            raise SandboxTimeoutError() from None
+            with out_path.open("wb") as out, err_path.open("wb") as err:
+                process = subprocess.Popen(
+                    argv,
+                    shell=False,
+                    stdout=out,
+                    stderr=err,
+                    stdin=subprocess.DEVNULL,
+                )
+                try:
+                    code = process.wait(timeout=spec.timeout + _DOCKER_GRACE_SECONDS)
+                except subprocess.TimeoutExpired:
+                    subprocess.run(["docker", "rm", "-f", container], capture_output=True)
+                    process.kill()
+                    raise SandboxTimeoutError(_read_logs(out_path, err_path)) from None
         except OSError:
             raise SandboxExecutionError() from None
+        return {
+            "exit_code": code,
+            "stdout": out_path.read_text(encoding="utf-8", errors="replace") if out_path.exists() else "",
+            "stderr": err_path.read_text(encoding="utf-8", errors="replace") if err_path.exists() else "",
+        }
+
+
+def _read_logs(out_path: Path, err_path: Path) -> str:
+    parts: list[str] = []
+    for path in (out_path, err_path):
+        try:
+            if path.exists():
+                parts.append(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            continue
+    return "".join(parts)[-_MAX_OUTPUT:]

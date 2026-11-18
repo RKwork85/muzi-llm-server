@@ -1,45 +1,82 @@
-"""把请求里的 toolset 名称解析成本次允许的工具。"""
+"""把模式与工具集解析成本次允许的工具名单。
+
+名单只来自 `visible_tools`：工具是否出现，由工具自己的能力声明、用户有效权限、
+模式白名单和资源作用域共同决定。请求里的 `toolsets` 只能收窄，不能扩大。
+"""
 
 from __future__ import annotations
 
 from collections.abc import Collection
-from pathlib import Path
 
-from app.agents.policy import PolicyError, basic_tool_names
-from app.authorization.application.execution_guard import mode_permission_code
-from app.core.config import ROOT, Settings
-from app.data.store import store_is_ready
-from app.tools.capabilities import AGENT_GRANT_BY_TOOL, ASK_TOOLS, PLAN_TOOLS, SKILL_TOOL_NAMES
-from app.tools.mcp_client import mcp_is_available
-from app.tools.registry import KNOWN_TOOLSETS, ToolRegistry, ToolSpec
-from app.tools.stdio_access import stdio_access
-
-_ALWAYS = frozenset({"basic", "utility", "diagram"})
+from app.authorization.application.execution_guard import CURRENT_EXECUTION
+from app.authorization.application.visibility import toolset_available, visible_tools
+from app.agents.policy import PolicyError
+from app.core.config import Settings
+from app.tools.capabilities import BASELINE_EXCLUDED_TOOLSETS, MODE_TOOL_NAMES
+from app.tools.registry import KNOWN_TOOLSETS, ToolRegistry
 
 
-def ask_tool_names(registry: ToolRegistry, settings: Settings) -> tuple[str, ...]:
-    """Ask 允许的系统工具。不包含 MCP、删除、命令和多步骤编排。"""
-    return _named_tools(registry, settings, ASK_TOOLS)
+def ask_tool_names(
+    registry: ToolRegistry,
+    settings: Settings,
+    user_id: str | None = None,
+    *,
+    permissions: Collection[str] | None = None,
+    include_mcp: bool = False,
+) -> tuple[str, ...]:
+    """Ask 允许的系统工具。不包含删除、命令和多步骤编排。
+
+    `include_mcp=True` 时把已授权连接器的工具一并纳入：Ask 是用户直接找 Notion/飞书
+    办事的入口，插件面板里挂出来的能力必须真的能调用。
+    """
+    return visible_tools(
+        registry,
+        settings,
+        mode="ask",
+        permissions=permissions,
+        mcp_user_id=user_id,
+        offered=MODE_TOOL_NAMES["ask"],
+        include_mcp=include_mcp,
+    ).allowed
 
 
-def plan_tool_names(registry: ToolRegistry, settings: Settings) -> tuple[str, ...]:
+def plan_tool_names(
+    registry: ToolRegistry,
+    settings: Settings,
+    *,
+    permissions: Collection[str] | None = None,
+) -> tuple[str, ...]:
     """Plan 只保留只读系统工具，不能写文件或调用外部应用。"""
-    return _named_tools(registry, settings, PLAN_TOOLS)
+    return visible_tools(
+        registry,
+        settings,
+        mode="plan",
+        permissions=permissions,
+        offered=MODE_TOOL_NAMES["plan"],
+    ).allowed
 
 
 def agent_chat_tool_names(
     registry: ToolRegistry,
     settings: Settings,
     user_id: str | None = None,
+    *,
+    permissions: Collection[str] | None = None,
+    workspace_scope: str | None = None,
+    owned_scopes: Collection[str] | None = None,
 ) -> tuple[str, ...]:
-    """对话里的 Agent 系统工具。stdio MCP 只加入该用户已有的授权。"""
-    names = list(ask_tool_names(registry, settings))
-    if user_id and _toolset_available("mcp", settings):
-        for name in sorted(stdio_access.names_for(user_id)):
-            spec = registry.get(name)
-            if spec is not None and spec.toolset == "mcp" and spec.risk_level == "low":
-                names.append(name)
-    return tuple(sorted(set(names)))
+    """对话里的 Agent 工具。与 AgentRuntime 使用同一套能力投影。"""
+    return visible_tools(
+        registry,
+        settings,
+        mode="agent",
+        permissions=permissions,
+        workspace_scope=workspace_scope,
+        owned_scopes=owned_scopes,
+        mcp_user_id=user_id,
+        offered=MODE_TOOL_NAMES["agent"],
+        include_mcp=True,
+    ).allowed
 
 
 def chat_mode_tool_names(
@@ -47,132 +84,98 @@ def chat_mode_tool_names(
     settings: Settings,
     mode: str,
     user_id: str | None = None,
+    *,
+    permissions: Collection[str] | None = None,
+    workspace_scope: str | None = None,
+    owned_scopes: Collection[str] | None = None,
 ) -> tuple[str, ...]:
+    """对话通道按模式取工具。权限快照由调用方传入，缺省时读执行上下文。"""
     if mode == "plan":
-        return plan_tool_names(registry, settings)
+        return plan_tool_names(registry, settings, permissions=permissions)
     if mode == "agent":
-        return agent_chat_tool_names(registry, settings, user_id)
-    # ask：屏蔽 Skill 工具（发现/加载/读取资源），只保留普通问答能力。
-    return tuple(name for name in ask_tool_names(registry, settings) if name not in SKILL_TOOL_NAMES)
-
-
-def _named_tools(registry: ToolRegistry, settings: Settings, allowed: frozenset[str]) -> tuple[str, ...]:
-    names = [
-        spec.name
-        for spec in registry.all_tools()
-        if spec.name in allowed and spec.risk_level == "low" and _toolset_available(spec.toolset, settings)
-    ]
-    return tuple(sorted(names))
+        return agent_chat_tool_names(
+            registry,
+            settings,
+            user_id,
+            permissions=permissions,
+            workspace_scope=workspace_scope,
+            owned_scopes=owned_scopes,
+        )
+    return ask_tool_names(
+        registry,
+        settings,
+        user_id,
+        permissions=permissions,
+        include_mcp=True,
+    )
 
 
 def agent_tool_names(
     registry: ToolRegistry,
     settings: Settings,
     toolsets: list[str] | None,
-    grants: list[str] | None,
     user_id: str | None = None,
     permissions: Collection[str] | None = None,
+    workspace_scope: str | None = None,
+    owned_scopes: Collection[str] | None = None,
 ) -> tuple[str, ...]:
-    """grants 只表达请求意图。危险工具还要服务端权限，不能单凭请求放行。"""
-    grant_set = set(grants or [])
-    permission_set = None if permissions is None else set(permissions)
+    """AgentRuntime 的工具名单。
+
+    - toolsets 为 None：使用 Agent 默认基线（模式白名单，去掉图表工具）。
+    - toolsets 有值：在该工具集内取用户所有可用工具；未授权的工具不会出现。
+
+    旧请求字段 `grants` 已移除：工具一旦通过能力校验就代表它被授权，
+    不需要客户端再单独声明一次「我要写文件」。
+    """
     if toolsets is None:
+        visibility = visible_tools(
+            registry,
+            settings,
+            mode="agent",
+            permissions=permissions,
+            workspace_scope=workspace_scope,
+            owned_scopes=owned_scopes,
+            offered=MODE_TOOL_NAMES["agent"],
+        )
         names = [
-            spec.name
-            for spec in registry.all_tools()
-            if spec.name in ASK_TOOLS
-            and spec.name not in AGENT_GRANT_BY_TOOL
-            and spec.toolset != "diagram"
-            and spec.risk_level == "low"
-            and _toolset_available(spec.toolset, settings)
+            name
+            for name in visibility.allowed
+            if _toolset_of(registry, name) not in BASELINE_EXCLUDED_TOOLSETS
         ]
-        selected = None
-    else:
-        names = list(resolve_tool_names(registry, settings, toolsets, user_id))
-        selected = set(toolsets)
-    for tool, grant in AGENT_GRANT_BY_TOOL.items():
-        if grant not in grant_set:
-            continue
-        spec = registry.get(tool)
-        if spec is None or spec.risk_level != "low":
-            continue
-        required = mode_permission_code("agent", spec.access)
-        if required is None or permission_set is None or required not in permission_set:
-            continue
-        if selected is not None and spec.toolset not in selected:
-            continue
-        if not _toolset_available(spec.toolset, settings):
-            continue
-        names.append(tool)
-    names = [name for name in names if _user_can_call(registry, name, user_id)]
-    return tuple(sorted(set(names)))
+        return tuple(sorted(set(names)))
 
-
-def resolve_tool_names(
-    registry: ToolRegistry,
-    settings: Settings,
-    toolsets: list[str] | None,
-    user_id: str | None = None,
-) -> tuple[str, ...]:
-    if toolsets is None:
-        return basic_tool_names(registry)
     if not toolsets:
         raise PolicyError("AGENT_POLICY_INVALID", "toolsets 不能为空")
     for name in toolsets:
         if name not in KNOWN_TOOLSETS:
             raise PolicyError("TOOLSET_UNKNOWN", "未知的工具集")
-        if not _toolset_available(name, settings):
+        if not toolset_available(name, settings):
             raise PolicyError("TOOLSET_UNAVAILABLE", "工具集当前不可用")
     selected = set(toolsets)
+    visibility = visible_tools(
+        registry,
+        settings,
+        mode="agent",
+        permissions=permissions,
+        workspace_scope=workspace_scope,
+        owned_scopes=owned_scopes,
+        mcp_user_id=user_id,
+        include_mcp="mcp" in selected,
+    )
     names = [
-        spec.name
-        for spec in registry.all_tools()
-        if spec.risk_level == "low"
-        and spec.name not in AGENT_GRANT_BY_TOOL
-        and spec.toolset in selected
-        and _user_can_call(registry, spec.name, user_id)
+        name
+        for name in visibility.allowed
+        if _toolset_of(registry, name) in selected
     ]
-    return tuple(sorted(names))
+    return tuple(sorted(set(names)))
 
 
-def _user_can_call(registry: ToolRegistry, name: str, user_id: str | None) -> bool:
-    spec: ToolSpec | None = registry.get(name)
-    if spec is None or spec.toolset != "mcp":
-        return True
-    return stdio_access.allows(user_id, name)
+def _toolset_of(registry: ToolRegistry, name: str) -> str:
+    spec = registry.get(name)
+    return spec.toolset if spec is not None else ""
 
 
-def _toolset_available(name: str, settings: Settings) -> bool:
-    if name in _ALWAYS:
-        return True
-    if name == "research":
-        return settings.tools_network_enabled and settings.has_api_key()
-    if name == "weather":
-        return settings.tools_network_enabled
-    if name == "workspace" or name == "code":
-        return _workspace_ready(settings)
-    if name == "delivery":
-        return _workspace_ready(settings) and bool(settings.oss_upload_base_url.strip())
-    if name == "data":
-        return store_is_ready(settings)
-    if name == "mcp":
-        return settings.mcp_enabled and mcp_is_available()
-    if name == "skills":
-        return bool(settings.skills_root.strip())
-    return False
-
-
-def _workspace_ready(settings: Settings) -> bool:
-    raw = settings.tools_workspace_root.strip()
-    if not raw:
-        return False
-    path = Path(raw)
-    if not path.is_absolute():
-        path = ROOT / path
-    try:
-        resolved = path.resolve()
-    except OSError:
-        return False
-    if resolved == ROOT:
-        return False
-    return resolved.is_dir()
+def current_permissions() -> frozenset[str]:
+    """当前执行上下文的权限快照；没有上下文时返回空集合（默认拒绝）。"""
+    context = CURRENT_EXECUTION.get()
+    return frozenset(context.effective_permissions) if context is not None else frozenset()

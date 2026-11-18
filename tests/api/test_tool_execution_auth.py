@@ -44,24 +44,26 @@ def test_tool_permissions_are_mode_scoped_and_default_granted() -> None:
     codes = {spec.code for spec in PERMISSION_CATALOG}
     # 旧的、无模式前缀的工具权限码已移除
     assert _LEGACY_TOOL_CODES.isdisjoint(codes)
-    # 新模式化的工具权限码都在目录里
+    # 新模式化的工具权限码都在目录里（含单独授权的交付能力）
     for mode in ("ask", "plan", "agent"):
-        for suffix in ("workspace.read", "workspace.write", "workspace.delete", "command.execute"):
+        for suffix in ("workspace.read", "workspace.write", "workspace.delete", "command.execute", "file.deliver"):
             assert f"{mode}.{suffix}" in codes
 
     member = ROLE_BY_CODE["member"].permissions
     developer = ROLE_BY_CODE["developer"].permissions
     guest = ROLE_BY_CODE["guest"].permissions
 
-    # member：ask 可读写、plan 只读、agent 只读
+    # member：ask 可读写+交付、plan 只读、agent 只读+交付
     assert "ask.workspace.read" in member and "ask.workspace.write" in member
+    assert "ask.file.deliver" in member
     assert "ask.workspace.delete" not in member and "ask.command.execute" not in member
     assert "plan.workspace.read" in member
     assert "agent.workspace.read" in member and "agent.workspace.write" not in member
+    assert "agent.file.deliver" in member and "agent.command.execute" not in member
 
     # developer：ask/agent 具备完整工具执行能力，plan 仍只读
     assert "agent.workspace.write" in developer and "agent.workspace.delete" in developer
-    assert "agent.command.execute" in developer
+    assert "agent.command.execute" in developer and "agent.file.deliver" in developer
     assert "plan.workspace.write" not in developer and "plan.workspace.delete" not in developer
 
     # guest 无任何工具执行权限
@@ -162,7 +164,7 @@ async def test_member_can_run_basic_tool_and_cannot_write_delete_or_command() ->
         assert called == []
 
 
-async def test_missing_identity_and_forged_grants_do_not_execute() -> None:
+async def test_missing_identity_and_client_declared_grants_do_not_execute(tmp_path) -> None:
     result, called = await _execute(
         "write_text_file",
         '{"path":"a.txt","content":"x","permission":"workspace.write","user_id":"admin"}',
@@ -172,13 +174,14 @@ async def test_missing_identity_and_forged_grants_do_not_execute() -> None:
     assert called == []
 
     registry = build_agent_registry()
-    settings = make_settings()
-    forged = agent_tool_names(registry, settings, None, ["write_file", "delete_file", "run_command"], permissions=_MEMBER)
+    settings = make_settings(tools_workspace_root=str(tmp_path))
+    # 请求里已经没有 grants 字段；名单只由权限决定。
+    forged = agent_tool_names(registry, settings, ["workspace"], permissions=_MEMBER)
     assert "write_text_file" not in forged
     assert "delete_file" not in forged
     assert "run_command" not in forged
-    ask = set(ask_tool_names(registry, settings))
-    plan = set(plan_tool_names(registry, settings))
+    ask = set(ask_tool_names(registry, settings, permissions=_MEMBER))
+    plan = set(plan_tool_names(registry, settings, permissions=_MEMBER))
     assert "delete_file" not in ask
     assert "run_command" not in ask
     assert "write_text_file" not in plan
@@ -225,6 +228,7 @@ async def test_ask_mode_tool_permissions_follow_mode_scoped_codes() -> None:
 
         deliver = guard.decide(tool_name="deliver_file", toolset="delivery", access="write_remote")
         assert deliver.allowed is True
+        assert deliver.permission == "ask.file.deliver"
 
         delete = guard.decide(tool_name="delete_file", toolset="workspace", access="delete_workspace")
         assert delete.allowed is False
@@ -237,21 +241,29 @@ async def test_ask_mode_tool_permissions_follow_mode_scoped_codes() -> None:
         CURRENT_EXECUTION.reset(token)
 
 
-async def test_skill_execution_audits_as_sensitive() -> None:
-    """execute_skill_script（access=sandbox_exec）在 skills 分支下也要留审计，读取类技能工具不审计。"""
+async def test_skill_script_requires_command_execute() -> None:
+    """execute_skill_script 等价于在沙盒跑代码，门槛与 run_python 一致。"""
     from app.authorization.application.execution_guard import ExecutionGuard
 
     token = CURRENT_EXECUTION.set(_context("agent", set(_MEMBER)))
     guard = ExecutionGuard()
     try:
         run = guard.decide(tool_name="execute_skill_script", toolset="skills", access="sandbox_exec")
-        assert run.allowed is True
-        assert run.permission == "skill.execute"
-        assert run.audit is True
+        assert run.allowed is False
+        assert run.permission == "agent.command.execute"
 
         read = guard.decide(tool_name="discover_skills", toolset="skills", access="read_local")
         assert read.allowed is True
+        assert read.permission == "skill.execute"
         assert read.audit is False
+    finally:
+        CURRENT_EXECUTION.reset(token)
+
+    token = CURRENT_EXECUTION.set(_context("agent", set(_MEMBER | {"agent.command.execute"})))
+    try:
+        run = guard.decide(tool_name="execute_skill_script", toolset="skills", access="sandbox_exec")
+        assert run.allowed is True
+        assert run.audit is True
     finally:
         CURRENT_EXECUTION.reset(token)
 
@@ -340,7 +352,7 @@ async def test_mcp_permission_and_revocation_both_apply() -> None:
     user = "mcp-user-a"
     stdio_access.set_catalog({"mcp__demo__echo"})
     stdio_access.grant(user, {"mcp__demo__echo"})
-    denied = CURRENT_EXECUTION.set(_context("agent", set(_MEMBER)))
+    denied = CURRENT_EXECUTION.set(_context("agent", set(_MEMBER) - {"mcp.execute"}))
     user_token = CURRENT_MCP_USER.set(user)
     try:
         blocked = await executor.execute(
@@ -410,8 +422,19 @@ async def test_ask_tool_service_rejects_unauthenticated_write_and_keeps_calculat
     assert "2" in messages[0]["content"]
 
 
-def test_agent_api_ignores_client_grants(client: TestClient, provider: FakeProvider, monkeypatch) -> None:
+def test_agent_api_rejects_removed_grants_field(client: TestClient, provider: FakeProvider, monkeypatch) -> None:
     _install_roles(monkeypatch, {"token-member-0000001": "member"})
+    rejected = client.post(
+        "/api/v1/agents/runs",
+        headers={"Authorization": "Bearer token-member-0000001", "X-Workspace-Key": "b" * 43},
+        json={
+            "message": "写入文件",
+            "prompt_name": "default",
+            "grants": ["write_file", "delete_file", "run_command"],
+        },
+    )
+    assert rejected.status_code == 422
+
     provider.push(
         make_result(
             content=None,
@@ -422,11 +445,7 @@ def test_agent_api_ignores_client_grants(client: TestClient, provider: FakeProvi
     created = client.post(
         "/api/v1/agents/runs",
         headers={"Authorization": "Bearer token-member-0000001", "X-Workspace-Key": "b" * 43},
-        json={
-            "message": "写入文件",
-            "prompt_name": "default",
-            "grants": ["write_file", "delete_file", "run_command"],
-        },
+        json={"message": "写入文件", "prompt_name": "default"},
     )
     assert created.status_code == 200
     task_id = created.json()["task_id"]
@@ -441,6 +460,58 @@ def test_agent_api_ignores_client_grants(client: TestClient, provider: FakeProvi
     rendered = json.dumps([call.messages for call in provider.calls], ensure_ascii=False)
     assert "write_text_file" not in offered
     assert "TOOL_NOT_ALLOWED" in rendered or "PERMISSION_DENIED" in rendered
+
+
+def test_visibility_never_offers_a_tool_the_guard_would_deny(tmp_path) -> None:
+    """核心不变量：名单里的工具，执行期一定不会被权限拒绝。"""
+    from app.authorization.application.execution_guard import ExecutionGuard
+    from app.authorization.application.visibility import visible_tools
+    from app.tools.capabilities import MODE_TOOL_NAMES
+
+    registry = build_agent_registry()
+    settings = make_settings(
+        tools_network_enabled=True,
+        tools_workspace_root=str(tmp_path),
+        skills_root=str(tmp_path / "skills"),
+        oss_upload_base_url="http://127.0.0.1:8890",
+    )
+    scope = scope_dirname("e" * 43)
+    guard = ExecutionGuard()
+    for role in ("member", "developer", "admin"):
+        permissions = ROLE_BY_CODE[role].permissions
+        for mode in ("ask", "plan", "agent"):
+            visibility = visible_tools(
+                registry,
+                settings,
+                mode=mode,
+                permissions=permissions,
+                workspace_scope=scope,
+                owned_scopes={scope},
+                offered=MODE_TOOL_NAMES[mode],
+            )
+            token = CURRENT_EXECUTION.set(
+                ExecutionContext(
+                    user_id=str(uuid.uuid4()),
+                    runtime_mode=mode,
+                    workspace_scope=scope,
+                    effective_permissions=frozenset(permissions),
+                    owned_workspace_scopes=frozenset({scope}),
+                    authorization_source="rbac",
+                )
+            )
+            try:
+                for name in visibility.allowed:
+                    spec = registry.get(name)
+                    assert spec is not None
+                    decision = guard.decide(
+                        tool_name=name,
+                        toolset=spec.toolset,
+                        access=spec.access,
+                        capability=spec.capability,
+                    )
+                    assert decision.allowed, f"{role}/{mode}/{name} 在名单里却被拒：{decision.reason}"
+            finally:
+                CURRENT_EXECUTION.reset(token)
 
 
 def test_chat_agent_mode_still_requires_execute(client: TestClient, provider: FakeProvider, monkeypatch) -> None:

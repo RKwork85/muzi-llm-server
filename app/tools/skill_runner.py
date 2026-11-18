@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from app.tools.sandbox import (
+    SandboxDependencyRejected,
     SandboxExecutionError,
     SandboxSpec,
     SandboxTimeoutError,
@@ -40,8 +41,8 @@ def run_skill_script(
     """在沙盒里执行技能入口脚本，返回 ``{exit_code, output, truncated}``。
 
     执行超时或失败时返回 ``{error: {code, message}}``，不会抛异常，调用方
-    无需感知沙盒后端细节。``dependencies`` 是逗号分隔的 pip 包名，由容器
-    后端在脚本执行前安装；本地进程后端忽略它。
+    无需感知沙盒后端细节。``dependencies`` 是逗号分隔的 pip 包名，两个后端都会
+    在脚本执行前装进沙盒私有的 ``.deps``。
     """
     pkgs = _parse_dependencies(dependencies)
     if pkgs is None:
@@ -49,18 +50,25 @@ def run_skill_script(
     files = _package_files(package)
     files["args.json"] = json.dumps(args, ensure_ascii=False).encode("utf-8")
     spec = SandboxSpec(
-        argv=["python", "-I", "-P", "-u", entrypoint_rel],
+        # 与 run_python 同理：-I 隐含 -E，会屏蔽 PYTHONPATH，导致技能声明的依赖装了也
+        # import 不到。有依赖时改用 -s，保留 PYTHONPATH。
+        argv=["python", *(("-s", "-P", "-u") if pkgs else ("-I", "-P", "-u")), entrypoint_rel],
         files=files,
         timeout=timeout,
         sandbox_prefix="muzi_skill_",
         memory_mb=memory_limit,
         network=True if network else None,
         dependencies=pkgs,
+        # 技能清单里声明的依赖是审核过的，不受模型自助依赖的白名单限制。
+        dependencies_trusted=True,
     )
     try:
         result = get_provider(CURRENT_SETTINGS.get()).run(spec)
     except SandboxTimeoutError:
         return {"error": {"code": "SKILL_EXECUTION_TIMEOUT", "message": "技能执行超时"}}
+    except SandboxDependencyRejected as exc:
+        # 技能声明的依赖被拒（硬禁令/体积/未预热）：把准确原因交给模型，而不是笼统失败。
+        return {"error": {"code": exc.code, "message": exc.message}}
     except SandboxExecutionError:
         return {"error": {"code": "SKILL_EXECUTION_FAILED", "message": "技能执行失败"}}
     return {

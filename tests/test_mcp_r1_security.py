@@ -22,7 +22,12 @@ def _legacy_agent_api(monkeypatch) -> None:
     allow_legacy_agent_api(monkeypatch)
 
 from app.agents.toolsets import agent_tool_names
-from app.core.exceptions import LoginRequiredError, McpUnavailableError, ToolExecutionError, ToolNotAllowedError
+from app.core.exceptions import (
+    ConnectorAuthRequiredError,
+    McpUnavailableError,
+    ToolExecutionError,
+    ToolNotAllowedError,
+)
 from app.main import create_app
 from app.mcp.oauth_guard import (
     OAuthFlowError,
@@ -122,7 +127,7 @@ async def test_malicious_metadata_does_not_receive_tokens() -> None:
         response = await client.get(url, follow_redirects=False)
         query = parse_qs(urlparse(response.headers["location"]).query)
         before = int(fake.state.world.get("token_hits") or 0)
-        with pytest.raises(LoginRequiredError):
+        with pytest.raises(ConnectorAuthRequiredError):
             await service.finish(query["code"][0], query["state"][0], query["iss"][0])
         assert int(fake.state.world.get("token_hits") or 0) == before
         await service.aclose()
@@ -154,7 +159,7 @@ async def test_redirect_and_refresh_stay_on_the_bound_endpoint() -> None:
         response = await client.get(url, follow_redirects=False)
         query = parse_qs(urlparse(response.headers["location"]).query)
         before = int(fake.state.world.get("token_hits") or 0)
-        with pytest.raises(LoginRequiredError):
+        with pytest.raises(ConnectorAuthRequiredError):
             await fresh.finish(query["code"][0], query["state"][0], query.get("iss", [""])[0])
         assert int(fake.state.world.get("token_hits") or 0) == before + 1
         await service.aclose()
@@ -266,8 +271,8 @@ def test_stdio_grants_do_not_cross_users() -> None:
         stdio_access.grant("user-b", set())
         assert stdio_access.names_for("user-a") == {"mcp__fake__echo"}
         assert stdio_access.names_for("user-b") == set()
-        assert agent_tool_names(registry, settings, ["mcp"], None, "user-b") == ()
-        assert "mcp__fake__echo" in agent_tool_names(registry, settings, ["mcp"], None, "user-a")
+        assert agent_tool_names(registry, settings, ["mcp"], "user-b") == ()
+        assert "mcp__fake__echo" in agent_tool_names(registry, settings, ["mcp"], "user-a")
         service = ToolService(registry, settings)
 
         async def call_as(user: str, name: str) -> str:

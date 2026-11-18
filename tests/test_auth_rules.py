@@ -20,6 +20,14 @@ def test_normalize_email_and_username() -> None:
     assert normalize_display_name(" 木子 ") == "木子"
 
 
+def test_normalize_username_supports_chinese() -> None:
+    """用户名允许中文：首字为汉字，可混排汉字、字母、数字与下划线。"""
+    assert normalize_username("  小明 ") == "小明"
+    assert normalize_username("木子") == "木子"
+    assert normalize_username("木子01") == "木子01"
+    assert normalize_username("木子_Muzi") == "木子_muzi"
+
+
 @pytest.mark.parametrize(
     ("email", "username", "password"),
     [
@@ -27,8 +35,14 @@ def test_normalize_email_and_username() -> None:
         ("@gmail.com", "muzi", "muzimuzi"),
         ("muzi@", "muzi", "muzimuzi"),
         ("muzi@gmail.com", "1muzi", "muzimuzi"),
-        ("muzi@gmail.com", "mu", "muzimuzi"),
-        ("muzi@gmail.com", "Muzi-1", "muzimuzi"),
+        # 长度下限 2：单字仍然非法
+        ("muzi@gmail.com", "a", "muzimuzi"),
+        ("muzi@gmail.com", "_muzi", "muzimuzi"),
+        ("muzi@gmail.com", "muzi-1", "muzimuzi"),
+        # 中文同样要遵守字符集与长度
+        ("muzi@gmail.com", "1小明", "muzimuzi"),
+        ("muzi@gmail.com", "小明！", "muzimuzi"),
+        ("muzi@gmail.com", "木" * 33, "muzimuzi"),
         ("muzi@gmail.com", "muzi", "short"),
     ],
 )

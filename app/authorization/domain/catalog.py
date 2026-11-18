@@ -60,11 +60,14 @@ class RoleSpec:
 # ---------------------------------------------------------------------------
 
 # 工具执行权限的 (resource, action, 名称)。按 TOOL_MODES 展开为 mode.resource.action。
+# action 必须与 app/tools/capability.py 的原子动作一致。
 _TOOL_ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("workspace", "read", "读取工作区"),
     ("workspace", "write", "写入工作区"),
     ("workspace", "delete", "删除工作区文件"),
     ("command", "execute", "执行命令"),
+    # 交付/外发会生成对外可访问的链接，与「写本地文件」风险不同，单独授权。
+    ("file", "deliver", "交付文件（生成外发链接）"),
 )
 
 
@@ -157,34 +160,64 @@ _BASE_MEMBER = _p(
     "skill.access",
     "skill.execute",
     "mcp.access",
+    # 调用已按人授权的远端连接器（Notion / 企业微信 / 飞书）。
+    # 连接器本身要用户自己完成 OAuth 或填凭据，`mcp.execute` 只决定「授权后能不能调」，
+    # 所以它和 `mcp.access` 同级：member 也该能用，不然 ask 里挂出来的插件永远是空的。
+    "mcp.execute",
     "model.access",
     "knowledge.access",
+    # `/` 插件面板是一个独立的功能入口：面板里的条目会向模型承诺能力，
+    # 所以由功能权限统一开关，再由各插件声明的工具依赖继续收窄。
+    "plugin.access",
     "task.read",
     "task.cancel",
 )
 
 # ---------------------------------------------------------------------------
-# 工具执行权限的默认角色许可（按模式）
+# 工具授权矩阵
 #
-# 普通对话（ask）是常规能力：member 即可读写工作区（生成文档/写文件），
-# 但删除与执行代码仍是高风险，只给 developer 及以上。
-# plan 保持只读：任何内置角色都不授予写/删/执行。
-# agent 模式更敏感：写/删/执行只给 developer 及以上，member 仅可读。
+# 唯一一张「角色 × 模式 → 原子动作」的表。上面的权限码由 _TOOL_ACTIONS 生成，
+# 角色默认许可由这张表生成，二者不会再各自漂移。
+#
+# 为什么权限码仍带模式前缀：member 在 ask 可以写，在 agent 不能。如果折叠成
+# 不带模式的 `workspace.write`，member 会因为拥有该权限而顺带获得 agent 写权限，
+# 属于权限放大。模式前缀是可授予单位，原子动作是工具侧的规范化键。
 # ---------------------------------------------------------------------------
-_TOOL_GRANT_MEMBER = _p(
-    "ask.workspace.read",
-    "ask.workspace.write",
-    "plan.workspace.read",
-    "agent.workspace.read",
-)
+_TOOL_MATRIX: dict[str, dict[str, frozenset[str]]] = {
+    MEMBER_ROLE_CODE: {
+        "ask": _p("workspace.read", "workspace.write", "file.deliver"),
+        "plan": _p("workspace.read"),
+        "agent": _p("workspace.read", "file.deliver"),
+    },
+    DEVELOPER_ROLE_CODE: {
+        "ask": _p(
+            "workspace.read",
+            "workspace.write",
+            "workspace.delete",
+            "command.execute",
+            "file.deliver",
+        ),
+        "plan": _p("workspace.read"),
+        "agent": _p(
+            "workspace.read",
+            "workspace.write",
+            "workspace.delete",
+            "command.execute",
+            "file.deliver",
+        ),
+    },
+}
+_TOOL_MATRIX[ADMIN_ROLE_CODE] = _TOOL_MATRIX[DEVELOPER_ROLE_CODE]
 
-_TOOL_GRANT_DEVELOPER = _TOOL_GRANT_MEMBER | _p(
-    "ask.workspace.delete",
-    "ask.command.execute",
-    "agent.workspace.write",
-    "agent.workspace.delete",
-    "agent.command.execute",
-)
+
+def _tool_grants(role_code: str) -> frozenset[str]:
+    modes = _TOOL_MATRIX.get(role_code, {})
+    return frozenset(f"{mode}.{action}" for mode, actions in modes.items() for action in actions)
+
+
+_TOOL_GRANT_MEMBER = _tool_grants(MEMBER_ROLE_CODE)
+_TOOL_GRANT_DEVELOPER = _tool_grants(DEVELOPER_ROLE_CODE)
+_TOOL_GRANT_ADMIN = _tool_grants(ADMIN_ROLE_CODE)
 
 BUILTIN_ROLES: tuple[RoleSpec, ...] = (
     RoleSpec(
@@ -198,14 +231,13 @@ BUILTIN_ROLES: tuple[RoleSpec, ...] = (
         name="平台管理员",
         description="运营管理员，管理用户、资源、审核和运营配置。",
         permissions=_BASE_MEMBER
-        | _TOOL_GRANT_DEVELOPER
+        | _TOOL_GRANT_ADMIN
         | _p(
             "agent.delete",
             "agent.share",
             "skill.install",
             "mcp.connect",
             "mcp.execute",
-            "plugin.access",
             "admin.access",
             "user.read",
             "user.create",
@@ -232,8 +264,6 @@ BUILTIN_ROLES: tuple[RoleSpec, ...] = (
             "agent.share",
             "skill.install",
             "mcp.connect",
-            "mcp.execute",
-            "plugin.access",
         ),
     ),
     RoleSpec(
@@ -314,8 +344,11 @@ PERMISSION_MIN_RANK: dict[str, int] = {
     "agent.share": 60,
     "skill.install": 60,
     "mcp.connect": 60,
-    "mcp.execute": 60,
-    "plugin.access": 60,
+    # 调用已授权连接器与普通对话同级：能否调用由用户自己的授权决定，
+    # 不是管理动作，所以 member 就能配置给自定义角色。
+    "mcp.execute": 40,
+    # `/` 插件面板与普通对话同级：member 也能使用，由插件自身的工具依赖继续收窄。
+    "plugin.access": 40,
     "ask.workspace.delete": 60,
     "ask.command.execute": 60,
     "agent.workspace.write": 60,

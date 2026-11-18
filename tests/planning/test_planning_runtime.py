@@ -449,3 +449,33 @@ async def test_planning_stream_keeps_the_last_usage() -> None:
     assert engine.prompt_tokens == 5
     assert engine.completion_tokens == 4
 
+
+@pytest.mark.asyncio
+async def test_decision_engine_prompt_does_not_force_a_plan() -> None:
+    """Plan 模式退化为正常对话：respond 是默认动作，计划不是每轮的必须产物。"""
+    from tests.fakes import FakeProvider, make_result
+
+    provider = FakeProvider()
+    provider.push(
+        make_result(
+            json.dumps(
+                {"protocol_version": "1.0", "action": "respond", "response": "算一下：三分钟够了。"}
+            )
+        )
+    )
+    plan = PlanningOrchestrator().create_plan(
+        owner_id="user-a", conversation_id="conv-a", goal="随便聊聊"
+    )
+    proposal = await PlanningDecisionEngine(provider, model="test-model").propose(
+        goal=plan.goal, user_message="泡面要几分钟？", plan=plan
+    )
+    # respond 不需要 goal / steps / 审阅卡，也不能带交互卡。
+    assert proposal.action == DecisionAction.RESPOND
+    assert proposal.steps == []
+    assert proposal.interaction is None
+
+    system_prompt = provider.calls[0].messages[0]["content"]
+    assert "respond (DEFAULT)" in system_prompt
+    assert "NOT a required deliverable" in system_prompt
+    assert "WHEN NOT TO PRODUCE A PLAN" in system_prompt
+

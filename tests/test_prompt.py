@@ -50,6 +50,36 @@ def test_plan_mode_prompt_is_injected_only_for_plan() -> None:
     assert _mode_prompt("ask", [], service._plan_instructions()) == ""
 
 
+def test_ask_mode_still_injects_slash_plugin_notes() -> None:
+    """ask 没有技能脚本，但 `/` 选中的插件说明必须注入，否则前端选了等于没选。"""
+    from app.services.chat_service import _mode_prompt
+
+    text = _mode_prompt("ask", ["pdf", "word"], "")
+    assert "PDF 文档处理" in text
+    assert "Word 文档处理" in text
+    # ask 走内置工具：不能出现「按这些做法完成任务」这种执行口吻
+    assert "按这些做法完成任务" not in text
+    # 也不能把 plan 的边界说明带进 ask
+    assert "Plan 模式" not in text
+
+
+def test_plan_mode_plugin_notes_are_reference_only() -> None:
+    from app.services.chat_service import ChatService, _mode_prompt
+
+    service = object.__new__(ChatService)
+    service.prompts = PromptService()
+    text = _mode_prompt("plan", ["pdf"], service._plan_instructions())
+    assert "PDF 文档处理" in text
+    assert "只作为计划参考" in text
+
+
+def test_agent_mode_plugin_notes_require_execution() -> None:
+    from app.services.chat_service import _mode_prompt
+
+    text = _mode_prompt("agent", ["pdf"], "")
+    assert "按这些做法完成任务" in text
+
+
 def test_plan_prompt_falls_back_when_file_missing(tmp_path: Path) -> None:
     from app.services.chat_service import ChatService, _mode_prompt
 

@@ -52,6 +52,7 @@ from app.schemas.chat import (
     ToolCallRequest,
 )
 from app.services.chat_service import ChatService, content_text
+from app.tools.capabilities import MCP_MODES
 from app.tools.workspace_scope import scope_dirname
 
 logger = logging.getLogger("muzi_llm")
@@ -514,19 +515,6 @@ async def stream_completion(
     operator = None
     if body.mode == "agent":
         operator = await require_agent_operator(credentials)
-    remote: list = []
-    user_id = await mcp.user_id_from_request(request) if mcp is not None else None
-    if body.mode == "agent" and mcp is not None and user_id is not None:
-        try:
-            remote = await mcp.tool_specs(user_id)
-        except Exception:
-            logger.info("remote mcp tools skipped")
-            remote = []
-        from app.mcp.grants import sync_stdio
-
-        await sync_stdio(user_id, request.app.state.settings.mcp_server_name)
-    prepared = service.prepare_stream(body, remote, user_id)
-    service.ensure_ready()
     owner = None
     session: AsyncSession | None = None
     if body.conversation_id:
@@ -558,15 +546,47 @@ async def stream_completion(
         await session.commit()
     elif _database_ready(request):
         owner = await _authorize_model_user(request, credentials)
+    # 授权快照必须在挂工具之前拿到：工具名单是「能做什么」的投影，不能等执行期再补。
     principal_id = str(operator.id) if operator is not None else (str(owner.id) if owner is not None else None)
+    workspace_scope = scope_dirname(request.headers.get("x-workspace-key"))
     execution = None
     if principal_id is not None:
         execution = await load_execution_context(
             principal_id,
             runtime_mode=body.mode,
             conversation_id=body.conversation_id,
-            workspace_scope=scope_dirname(request.headers.get("x-workspace-key")),
+            workspace_scope=workspace_scope,
         )
+    remote: list = []
+    user_id = await mcp.user_id_from_request(request) if mcp is not None else None
+    connectors: frozenset[str] = frozenset()
+    if body.mode in MCP_MODES and mcp is not None and user_id is not None:
+        try:
+            remote = await mcp.tool_specs(user_id)
+        except Exception:
+            logger.info("remote mcp tools skipped")
+            remote = []
+        # 面板能不能出现某个插件，以「用户授权了哪个连接器」为准，不以某次
+        # discover 是否成功为准；否则一次网络抖动就会让已授权的插件消失或报错。
+        connectors = await mcp.authorized_connectors(user_id)
+        from app.mcp.grants import sync_stdio
+
+        await sync_stdio(user_id, request.app.state.settings.mcp_server_name)
+    try:
+        prepared = service.prepare_stream(
+            body,
+            remote,
+            user_id,
+            permissions=None if execution is None else execution.effective_permissions,
+            workspace_scope=workspace_scope,
+            owned_scopes=None if execution is None else execution.owned_workspace_scopes,
+            connectors=connectors,
+        )
+        service.ensure_ready()
+    except Exception:
+        if session is not None:
+            await session.close()
+        raise
 
     async def _with_execution(frames):
         token = CURRENT_EXECUTION.set(execution) if execution is not None else None

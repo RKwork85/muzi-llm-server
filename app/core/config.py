@@ -78,17 +78,39 @@ class Settings(BaseSettings):
     tool_timeout_seconds: float = Field(default=2, gt=0, le=30)
     tool_result_max_chars: int = Field(default=4000, ge=96, le=20000)
     agent_max_active_tasks: int = Field(default=8, ge=1, le=32)
+    # 并发槽位满时排队等待准入的最长时间（秒），超时返回 AGENT_TASK_LIMIT 友好提示。
+    agent_admission_timeout_seconds: float = Field(default=60, gt=0, le=600)
     agent_task_ttl_seconds: float = Field(default=300, ge=1, le=3600)
     agent_sync_tool_concurrency: int = Field(default=2, ge=1, le=8)
     agent_cancel_cleanup_seconds: float = Field(default=2, gt=0, le=30)
     tools_network_enabled: bool = False
     tools_workspace_root: str = ""
     tools_sandbox_commands: str = ""
-    tools_sandbox_timeout_seconds: float = Field(default=10, gt=0, le=20)
+    tools_sandbox_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    tools_sandbox_timeout_max: float = Field(default=60, gt=0, le=120)
     sandbox_backend: Literal["local", "agentbox"] = "local"
     sandbox_docker_image: str = "python:3.12-slim"
     sandbox_mem_mb: int = Field(default=512, gt=0, le=8192)
-    sandbox_network_enabled: bool = False
+    # 两个后端共用这一个开关：local 走「黑洞代理 + 禁止索引」的协作式断网，
+    # agentbox 走 --network none（内核级）。默认开启——断网时连依赖都装不了，
+    # 而联网能力对取数/查资料是必需的；真正的强隔离由 agentbox 提供。
+    sandbox_network_enabled: bool = True
+    # 沙盒能否看到用户工作区（只读挂载 / 路径透出）。
+    sandbox_workspace_access: bool = True
+    # 依赖安装总闸门：关闭后运行时不再跑 pip（已装在执行环境里的包仍可 import）。
+    sandbox_dependencies_enabled: bool = True
+    sandbox_dependency_allowlist: str = (
+        # 文档/表格（轮子小、装完 < 20MB）
+        "python-docx,openpyxl,pypdf,python-pptx,xlsxwriter,markdown,beautifulsoup4,reportlab,"
+        # 图像/音频元数据（Pillow 装完约 15MB；pydub/mutagen 只是胶水层）
+        "pillow,pydub,mutagen,ffmpeg-python,qrcode"
+    )
+    sandbox_dependency_max_packages: int = Field(default=6, ge=1, le=12)
+    sandbox_dependency_max_mb: int = Field(default=48, ge=1, le=256)
+    sandbox_dependency_timeout_seconds: float = Field(default=45, gt=0, le=300)
+    # 只从预热缓存装（--no-index --find-links），请求路径上不联网、不编译。
+    sandbox_dependency_from_cache: bool = True
+    sandbox_dependency_cache_dir: str = "sandbox_wheel_cache"
     tools_network_concurrency: int = Field(default=4, ge=1, le=8)
     # 人民币 → token 的汇率基准（1 token = 该值元）。工具扣费本身只认 token，
     # 此汇率仅供充值/定价系统把人民币换算成 token 额度时使用，示例 0.000001 表示 100 万 token = 1 元。
@@ -138,6 +160,9 @@ class Settings(BaseSettings):
     mcp_allow_insecure: bool = False
     # 官方 MCP Registry 根地址。国内访问慢时可指向自建镜像或加速代理。
     mcp_registry_base_url: str = "https://registry.modelcontextprotocol.io"
+    # 允许开放「写类工具」的社区连接器白名单（qualified_name，逗号分隔）。
+    # 默认全关：社区连接器只暴露只读工具，写入需运营显式放行。
+    mcp_community_allow_write: str = ""
     # 数据库只服务本进程。地址来自环境变量，业务代码不写死主机名。
     postgres_host: str = "127.0.0.1"
     postgres_port: int = Field(default=5432, ge=1, le=65535)
@@ -148,6 +173,8 @@ class Settings(BaseSettings):
     redis_port: int = Field(default=6379, ge=1, le=65535)
     redis_db: int = Field(default=0, ge=0, le=15)
     redis_password: str = Field(default="", repr=False)
+    # Taskiq broker 独立 Redis db：db0 业务键、db1 muzi-comfy-service、db2 主服务任务队列。
+    taskiq_redis_db: int = Field(default=2, ge=0, le=15)
     database_startup_required: bool = False
     db_pool_size: int = Field(default=5, ge=1, le=20)
     db_max_overflow: int = Field(default=10, ge=0, le=40)
@@ -173,6 +200,12 @@ class Settings(BaseSettings):
     sms_mns_endpoint: str = "https://1943695596114318.mns.cn-hangzhou.aliyuncs.com"
     sms_mns_queue_name: str = ""
     sms_mns_message_type: str = "SmsReport"
+    # 内部服务间调用鉴权（独立支付服务调加额度接口）。留空则拒绝一切内部调用。
+    internal_api_token: str = Field(default="", repr=False)
+    # 独立支付服务地址（主服务代理下单时调用）。
+    pay_service_base_url: str = "http://127.0.0.1:8100"
+    # ComfyUI 网关服务地址（主服务代理文生图/图生视频/四视图任务时调用）。
+    comfy_service_base_url: str = "http://127.0.0.1:8101"
 
     @field_validator("deepseek_base_url")
     @classmethod
@@ -316,6 +349,10 @@ class Settings(BaseSettings):
 
     def mcp_allowlist(self) -> set[str]:
         return {item.strip() for item in self.mcp_tool_allowlist.split(",") if item.strip()}
+
+    def community_write_allowlist(self) -> set[str]:
+        """允许开放写工具的社区连接器（qualified_name 集合）。"""
+        return {item.strip() for item in self.mcp_community_allow_write.split(",") if item.strip()}
 
 
 @lru_cache

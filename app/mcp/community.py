@@ -135,8 +135,25 @@ def _extract(server: dict[str, Any]) -> dict[str, str] | None:
             "icon_url": _icon(server),
             "website_url": website_url[:255],
             "updated_at": _updated_at(server),
+            # 目录声明的自定义请求头（只取名字，不取/回传任何值）。有这类声明的服务
+            # 基本不走标准 OAuth，需要用户在平台里补一份凭据，前端据此提前说明。
+            "auth_headers": ",".join(_auth_header_names(remote))[:120],
         }
     return None
+
+
+def _auth_header_names(remote: dict[str, Any]) -> list[str]:
+    headers = remote.get("headers")
+    if not isinstance(headers, list):
+        return []
+    names: list[str] = []
+    for entry in headers:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if isinstance(name, str) and name.strip() and name.strip().lower() != "accept":
+            names.append(name.strip()[:40])
+    return names[:4]
 
 
 async def search_remote_servers(
@@ -448,6 +465,7 @@ async def search_community_hybrid(
                 if remote["icon_url"]:
                     item["icon_url"] = remote["icon_url"]
                 item["website_url"] = remote["website_url"] or item["website_url"]
+                item["auth_headers"] = remote.get("auth_headers", "")
             return item
 
         async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS, follow_redirects=False) as client:

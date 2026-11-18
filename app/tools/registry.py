@@ -11,12 +11,14 @@ from typing import Any
 from pydantic import BaseModel
 
 from app.tools.calculator import CalculatorArgs, calculator_handler
+from app.tools.capability import Capability, capability_for, KNOWN_ACTIONS
 from app.tools.clock import EmptyArgs, current_time_handler
 from app.tools.deliver_file import DeliverArgs, deliver_file
 from app.tools.docx_tool import WriteDocxArgs, write_docx
 from app.tools.file_changes import DeleteArgs, WriteArgs, delete_file, write_text_file
 from app.tools.file_tools import ListArgs, ReadArgs, SearchArgs as FileSearchArgs, list_directory, read_text_file, search_text
 from app.tools.code_runner import PythonArgs, run_python
+from app.tools.sandbox.describe import sandbox_tool_description
 from app.tools.sandbox_command import CommandArgs, run_command
 from app.tools.weather import WeatherArgs, weather_query
 from app.tools.local_tools import DateDiffArgs, FormatJsonArgs, TextStatsArgs, date_diff, format_json, text_stats
@@ -31,6 +33,7 @@ from app.tools.mermaid import (
 from app.tools.prompts import tool_prompt
 from app.tools.schemas import parameters_schema
 from app.tools.data_tools import register_data_tools
+from app.tools.planning_todos import UpdateTodosArgs, update_todos
 from app.tools.web_tools import FetchArgs, SearchArgs, web_fetch, web_search
 from app.skills.tools import (
     DiscoverSkillsArgs,
@@ -96,6 +99,20 @@ class ToolSpec:
     toolset: str = "basic"
     parameters: dict[str, Any] | None = None
     pricing: ToolPricing | None = None
+    # 运行期描述：沙盒工具的能力（能否读工作区）随后端变化，写死在 toml 会骗模型。
+    description_provider: Callable[[], str] | None = None
+    # 能力声明由 access/toolset 规范化得出（唯一事实源），注册后一定非空。
+    capability: Capability | None = None
+
+    def describe(self) -> str:
+        if self.description_provider is not None:
+            try:
+                text = self.description_provider()
+            except Exception:  # noqa: BLE001 - 描述生成失败必须退回静态文案
+                text = ""
+            if text and text.strip():
+                return text.strip()
+        return self.description
 
     def openai_schema(self) -> dict[str, Any]:
         if self.parameters is not None:
@@ -106,7 +123,7 @@ class ToolSpec:
             "type": "function",
             "function": {
                 "name": self.name,
-                "description": self.description,
+                "description": self.describe(),
                 "parameters": parameters,
             },
         }
@@ -135,7 +152,7 @@ class ToolRegistry:
             raise ValueError("联网标记与访问级别不一致")
         if spec.requires_network and not inspect.iscoroutinefunction(spec.handler):
             raise ValueError("联网工具必须是 async")
-        if spec.timeout_s is not None and not 0 < spec.timeout_s <= 30:
+        if spec.timeout_s is not None and not 0 < spec.timeout_s <= 120:
             raise ValueError("工具超时超出范围")
         if spec.max_result_chars is not None and not 96 <= spec.max_result_chars <= 20000:
             raise ValueError("工具结果长度超出范围")
@@ -145,6 +162,10 @@ class ToolRegistry:
             raise ValueError("工具名称不合法")
         if spec.name in self._tools:
             raise ValueError("工具名称重复")
+        if spec.capability is None:
+            spec.capability = capability_for(spec.access, spec.toolset)
+        if spec.capability.action and spec.capability.action not in KNOWN_ACTIONS:
+            raise ValueError("工具能力声明不合法")
         self._tools[spec.name] = spec
 
     def get(self, name: str) -> ToolSpec | None:
@@ -367,11 +388,14 @@ def build_agent_registry(search_calls: int = 5, fetch_calls: int = 5) -> ToolReg
             name="run_python",
             args_model=PythonArgs,
             handler=run_python,
+            description=sandbox_tool_description("run_python"),
+            description_provider=lambda: sandbox_tool_description("run_python"),
             access="sandbox_exec",
             idempotent=False,
             toolset="code",
             max_calls_per_run=3,
-            timeout_s=20,
+            # 沙盒自身最多 60 秒，这里留出依赖安装与启动余量。
+            timeout_s=90,
         )
     )
     registry.register(
@@ -436,4 +460,21 @@ def build_agent_registry(search_calls: int = 5, fetch_calls: int = 5) -> ToolReg
         )
     )
     register_data_tools(registry)
+    registry.register(
+        ToolSpec(
+            name="update_todos",
+            description=(
+                "更新本次执行的计划清单进度。每完成一个计划步骤，就用本工具把对应项标记为 "
+                "completed；开始某一步时标记为 in_progress。id 必须沿用执行清单里给出的 id，"
+                "不要自创。默认 merge=true（按 id 增量更新），只有需要整体重排时才传 merge=false。"
+            ),
+            args_model=UpdateTodosArgs,
+            handler=update_todos,
+            risk_level="low",
+            access="write_data",
+            toolset="data",
+            max_calls_per_run=32,
+            timeout_s=15,
+        )
+    )
     return registry

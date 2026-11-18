@@ -48,6 +48,16 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # 同一进程内重启 lifespan（测试 / 热重载）时，恢复实时事件的订阅能力。
+        from app.content.events import reset as reset_content_events
+        from app.services.recharge_events import reset as reset_recharge_events
+        from app.services.shutdown import install as install_shutdown_hook
+
+        reset_recharge_events()
+        reset_content_events()
+        # uvicorn 会先等所有在途连接结束才执行 lifespan shutdown，SSE 长连接永远
+        # 等不到头，所以必须在信号阶段就把它们打断（见 app/services/shutdown.py）。
+        install_shutdown_hook()
         manager = ProviderManager(runtime_settings, app.state.provider_override)
         await manager.startup()
         prompts = PromptService()
@@ -169,6 +179,13 @@ def create_app(
             app.state.sms_receipt_task = sms_task
             yield
         finally:
+            # 先打断所有 SSE 长连接：否则 uvicorn 的优雅关闭会一直等它们结束，
+            # 进程卡在「Waiting for connections to close」，端口不再响应新请求。
+            from app.content.events import close_all as close_content_events
+            from app.services.recharge_events import close_all as close_recharge_events
+
+            close_recharge_events()
+            close_content_events()
             sms_task = getattr(app.state, "sms_receipt_task", None)
             if sms_task is not None:
                 sms_task.cancel()

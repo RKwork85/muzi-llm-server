@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.planning.contracts import Interaction, PlanSnapshot, PlanningEvent
+from app.planning.contracts import Interaction, PlanSnapshot, PlanTodoSet, PlanningEvent
 
 
 class ApiContract(BaseModel):
@@ -54,3 +54,16 @@ class PlanRuntimeResponse(ApiContract):
 class PlanEventList(ApiContract):
     events: list[PlanningEvent] = Field(default_factory=list)
     next_sequence: int = Field(ge=0)
+
+
+class PlanTodoSetResponse(PlanTodoSet):
+    """GET/POST /plans/{plan_id}/todos 的 HTTP 响应（字段与契约一致）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class PlanMarkdownResponse(ApiContract):
+    """GET /plans/{plan_id}/plan-markdown 的导出产物。"""
+
+    filename: str
+    content: str

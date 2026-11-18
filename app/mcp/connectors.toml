@@ -3,6 +3,8 @@
 # ${VAR} 会在加载时展开成环境变量。企业微信/飞书走进程内自建 MCP 桥接，
 # 地址基于 MCP_PUBLIC_BASE_URL。凭据多租户：每个用户在前端填写自己的凭据，
 # 后端用 KeyRing 加密存库（bridge_credentials 表），不在此文件也不在 .env。
+# 可选 client_id / client_secret：服务不支持动态客户端注册（DCR）时预注册，
+# 值可引用 ${VAR} 环境变量，secret 只存密文（KeyRing）。
 
 [notion]
 display_name = "Notion"

@@ -16,7 +16,13 @@ import httpx
 from fastapi import Request
 
 from app.core.config import Settings
-from app.core.exceptions import ConnectorNotFoundError, InvalidRequestError, LoginRequiredError, McpUnavailableError
+from app.core.exceptions import (
+    ConnectorAuthRequiredError,
+    ConnectorNotFoundError,
+    InvalidRequestError,
+    LoginRequiredError,
+    McpUnavailableError,
+)
 from app.mcp.catalog import Connector, load_catalog
 from app.mcp.community import search_community_hybrid, slug_connector_name
 from app.mcp.crypto import TokenCipher
@@ -44,6 +50,24 @@ logger = logging.getLogger("muzi_llm")
 _WRITE = re.compile(r"(create|update|delete|insert|remove|write|append|patch|move|trash|destroy)", re.I)
 _REMOTE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 _LOCAL = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# 自定义认证头：只放行 RFC 7230 token 形状的头名，且不许覆盖传输层保留头。
+_HEADER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
+_RESERVED_HEADERS = frozenset(
+    {
+        "authorization",
+        "host",
+        "content-length",
+        "content-type",
+        "accept",
+        "mcp-protocol-version",
+        "mcp-session-id",
+        "connection",
+        "transfer-encoding",
+        "cookie",
+        "set-cookie",
+        "user-agent",
+    }
+)
 Store = MemoryStore | SqlStore
 
 
@@ -89,7 +113,8 @@ class McpService:
         try:
             return self.keys().encrypt(plain, user_id=user_id, connector_id=connector_id, credential_type=credential_type)
         except KeyConfigurationError:
-            raise LoginRequiredError() from None
+            # 服务端密钥没配好是部署问题，不是「用户没登录」。
+            raise McpUnavailableError("连接服务密钥未配置，暂无法保存凭据") from None
 
     def _reveal(self, sealed: str, *, user_id: str, connector_id: str, credential_type: str) -> str:
         if sealed.startswith("v2."):
@@ -118,7 +143,7 @@ class McpService:
             display_name=record.display_name,
             transport=record.transport,
             url=record.url,
-            allow_write=False,
+            allow_write=record.allow_write,
             issuer="",
         )
 
@@ -143,19 +168,25 @@ class McpService:
 
     async def list_for(self, user_id: str | None) -> list[dict[str, Any]]:
         connections = {item.connector_name: item for item in await self.store.list_connections(user_id)} if user_id else {}
-        items: list[Connector] = list(self.catalog)
+        items: list[tuple[Connector, bool]] = [(item, False) for item in self.catalog]
         for record in await self.store.list_community_connectors():
-            items.append(self._from_community(record))
+            # 社区目录项是全局的，但「我的连接器列表」只属于连接过它的用户：
+            # 否则别人装的东西会出现在我的面板里，点连接还会因为没授权而失败。
+            if record.name in connections:
+                items.append((self._from_community(record), True))
         rows: list[dict[str, Any]] = []
-        for item in items:
+        for item, community in items:
             connection = connections.get(item.name)
             rows.append(
                 {
                     "name": item.name,
                     "display_name": item.display_name,
+                    # 前端用它区分「平台内置连接器」与「社区安装」，避免再维护一份本地名单。
+                    "community": community,
                     "transport": item.transport,
                     "status": connection.status if connection else "disconnected",
                     "selected_tools": list(connection.selected_tools) if connection else [],
+                    "last_error": connection.last_error if connection and connection.last_error else "",
                     "allow_write": item.allow_write,
                 }
             )
@@ -208,18 +239,19 @@ class McpService:
 
     async def finish(self, code: str, state: str, iss: str = "") -> str:
         if not code or not state:
-            raise LoginRequiredError()
+            raise ConnectorAuthRequiredError("授权回跳缺少 code/state，请重新发起连接")
         saved = await self.store.pop_state(hashlib.sha256(state.encode("utf-8")).hexdigest())
         if saved is None:
-            raise LoginRequiredError()
+            # state 10 分钟过期或被用过：这是流程过期，不是平台会话失效。
+            raise ConnectorAuthRequiredError("授权已过期，请重新发起连接")
         connector = await self.resolve_connector(saved.connector_name)
         bound = self._open_verifier(saved.code_verifier_encrypted, saved.user_id, saved.connector_name)
         if not self._iss_matches(bound, iss):
             logger.info("mcp oauth rejected connector=%s reason=issuer_mismatch", connector.name)
-            raise LoginRequiredError()
+            raise ConnectorAuthRequiredError("授权校验失败，请重新发起连接")
         client = await self.store.get_client(connector.name)
         if client is None:
-            raise LoginRequiredError()
+            raise ConnectorAuthRequiredError("授权客户端不存在，请重新发起连接")
         endpoint = await self._screen(saved.user_id, connector.name, bound["token_endpoint"])
         form = {
             "grant_type": "authorization_code",
@@ -236,7 +268,13 @@ class McpService:
                 connector_id=connector.name,
                 credential_type="client_secret",
             )
-        token = await self._token(saved.user_id, connector.name, endpoint, form)
+        try:
+            token = await self._token(saved.user_id, connector.name, endpoint, form)
+        except Exception:
+            # 回跳已经拿到 code 但换票失败（端点 4xx/跳转/畸形响应）：用户要做的
+            # 仍然是「重新发起一次授权」，不该被翻译成平台登录问题。
+            logger.info("mcp oauth token exchange failed connector=%s", connector.name)
+            raise ConnectorAuthRequiredError("授权换取令牌失败，请重新发起连接") from None
         await self._save_token(
             saved.user_id,
             connector.name,
@@ -245,6 +283,7 @@ class McpService:
             binding={"issuer": bound["issuer"], "token_endpoint": endpoint},
         )
         await self._drop_client(saved.user_id, connector.name)
+        await self._apply_default_selection(saved.user_id, connector.name)
         return connector.name
 
     async def discover(self, user_id: str, name: str) -> list[dict[str, Any]]:
@@ -306,6 +345,97 @@ class McpService:
                 "token_endpoint": f"{base}/bridge/{name}/token",
             },
         )
+        await self._apply_default_selection(user_id, name)
+
+    async def _apply_default_selection(self, user_id: str, name: str, *, strict: bool = False) -> None:
+        """刚连上就勾好只读工具，避免「授权成功但还是什么都调不了」。
+
+        写入/删除类工具不在默认勾选里：OAuth 只代表同意授权，不代表同意让模型
+        改数据，那一步要用户自己在连接器面板里勾。默认失败不影响连接本身；
+        `strict=True` 时失败会抛出（令牌模式需要它来校验令牌是否真的可用）。
+        """
+        try:
+            connection = await self.store.get_connection(user_id, name)
+            if connection is None or connection.status != "connected" or connection.selected_tools:
+                return
+            listed = await self.discover(user_id, name)
+            readonly = [item["name"] for item in listed if item["offered"] and not item["writable"]]
+            if not readonly:
+                return
+            connection.selected_tools = readonly
+            await self.store.save_connection(connection)
+        except Exception:  # noqa: BLE001 - 默认勾选是便利功能，不能反过来毁掉连接
+            logger.info("mcp default selection skipped connector=%s", name)
+            if strict:
+                raise
+
+    async def connect_with_token(self, user_id: str, name: str, token: str) -> list[str]:
+        """用用户自带的访问令牌完成连接（兼容入口，等价于 Bearer 头）。"""
+        return await self.connect_with_credentials(user_id, name, token=token, headers={})
+
+    async def connect_with_credentials(
+        self,
+        user_id: str,
+        name: str,
+        *,
+        token: str = "",
+        headers: dict[str, str] | None = None,
+    ) -> list[str]:
+        """用用户自带的凭据（Bearer 令牌 / 自定义认证头）完成连接。
+
+        适用于没有标准 OAuth 元数据、只认 `Authorization: Bearer <token>` 或
+        `X-API-Key` 这类自定义头的远程 MCP（官方目录里占了很大一部分）。
+        凭据与 OAuth 访问令牌同样加密入库，过期后由用户重新粘贴：
+        平台不替用户去第三方后台换票。
+        """
+        header_map = {str(k).strip(): str(v) for k, v in (headers or {}).items() if k and v is not None}
+        value = token.strip()
+        if not value and not header_map:
+            raise InvalidRequestError("请提供访问令牌或认证头")
+        if value and len(value) < 8:
+            raise InvalidRequestError("访问令牌过短")
+        # 令牌会被拼进 Authorization 头：任何空白/控制字符都可能是头注入。
+        if value and any(ch.isspace() or not ch.isprintable() for ch in value):
+            raise InvalidRequestError("访问令牌包含非法字符")
+        # 认证头逐个校验：头名形状 + 保留头 + 头值无 CR/LF。
+        for header_name, header_value in header_map.items():
+            if not _HEADER_NAME.fullmatch(header_name):
+                raise InvalidRequestError(f"非法认证头名：{header_name}")
+            if header_name.lower() in _RESERVED_HEADERS:
+                raise InvalidRequestError(f"认证头 {header_name} 由平台保留，不能自定义")
+            if "\r" in header_value or "\n" in header_value or not header_value.strip():
+                raise InvalidRequestError(f"认证头 {header_name} 的值非法")
+        if any(item.name == name for item in self.catalog):
+            raise InvalidRequestError("该连接器使用平台内置授权方式，不能填写访问凭据")
+        connector = await self.resolve_connector(name)
+        sealed = self._seal(
+            json.dumps(
+                {"v": 1, "token": value, "issuer": "", "token_endpoint": "", "headers": header_map},
+                separators=(",", ":"),
+            ),
+            user_id=user_id,
+            connector_id=connector.name,
+            credential_type="access_token",
+        )
+        previous = await self.store.get_connection(user_id, name)
+        await self.store.save_connection(
+            ConnectionRecord(
+                user_id=user_id,
+                connector_name=name,
+                status="connected",
+                access_token_encrypted=sealed,
+                refresh_token_encrypted=None,
+                expires_at=None,
+                selected_tools=list(previous.selected_tools) if previous else [],
+            )
+        )
+        try:
+            await self._apply_default_selection(user_id, name, strict=True)
+        except Exception:
+            await self.store.delete_connection(user_id, name)
+            raise ConnectorAuthRequiredError("凭据无法访问该服务，请检查令牌与地址") from None
+        saved = await self.store.get_connection(user_id, name)
+        return list(saved.selected_tools) if saved is not None else []
 
     async def bridge_credentials_status(self, user_id: str, name: str) -> dict[str, Any]:
         """返回该连接器凭据是否已配置，以及用于权限开通的公开标识。绝不返回密钥。"""
@@ -342,10 +472,22 @@ class McpService:
             installable_only=installable_only,
         )
 
-    async def community_connectors(self) -> list[dict[str, Any]]:
-        """已安装的社区连接器目录。"""
+    async def community_connectors(self, user_id: str | None) -> list[dict[str, Any]]:
+        """当前用户「已安装」的社区连接器。
+
+        「已安装」的判定是**这个用户自己的连接记录**，不是平台目录里存在这一行：
+        目录项是全局的（一次安装全站可复用，OAuth client 也只注册一次），但
+        「装没装」属于用户。之前直接列全表，会把他人的安装显示成我的未连接卡片，
+        卸载时还会连带删掉别人的授权。
+        """
+        connections = (
+            {item.connector_name: item for item in await self.store.list_connections(user_id)} if user_id else {}
+        )
         rows: list[dict[str, Any]] = []
         for record in await self.store.list_community_connectors():
+            connection = connections.get(record.name)
+            if connection is None:
+                continue
             rows.append(
                 {
                     "name": record.name,
@@ -356,6 +498,11 @@ class McpService:
                     "url": record.url,
                     "icon_url": record.icon_url or "",
                     "website_url": record.website_url or "",
+                    "auth_headers": record.auth_headers or "",
+                    "allow_write": record.allow_write,
+                    "status": connection.status,
+                    "last_error": connection.last_error or "",
+                    "selected_tools": list(connection.selected_tools),
                 }
             )
         return rows
@@ -369,8 +516,14 @@ class McpService:
         description: str = "",
         icon_url: str = "",
         website_url: str = "",
+        auth_headers: str = "",
     ) -> dict[str, Any]:
-        """把社区远程连接器安装为平台目录项。URL 必须通过 SSRF 护栏校验。"""
+        """把社区远程连接器登记为平台目录项。URL 必须通过 SSRF 护栏校验。
+
+        返回的 ``status`` 区分「本次新建」与「已存在」：调用方需要在后续授权失败时
+        决定是否回滚。之前两种情况都返回 ``installed``，导致回滚条件永远不成立，
+        于是失败会留下「已安装但永远连不上」的死卡片。
+        """
         if transport not in {"streamable_http", "sse"}:
             raise InvalidRequestError("不支持的传输类型")
         try:
@@ -386,7 +539,17 @@ class McpService:
         name = base
         existing = await self.store.get_community_connector(name)
         if existing is not None and existing.qualified_name == qualified_name:
-            return {"name": existing.name, "qualified_name": qualified_name, "status": "installed"}
+            # 白名单变更后同步：安装入口是重新校验 allow_write 的时机。
+            should_write = qualified_name in self.settings.community_write_allowlist()
+            if existing.allow_write != should_write:
+                existing.allow_write = should_write
+                await self.store.save_community_connector(existing)
+            return {
+                "name": existing.name,
+                "qualified_name": qualified_name,
+                "status": "existing",
+                "allow_write": existing.allow_write,
+            }
         if existing is not None or any(item.name == name for item in self.catalog):
             name = self._dedupe_name(base, qualified_name)
         record = CommunityConnectorRecord(
@@ -398,14 +561,25 @@ class McpService:
             url=screened,
             icon_url=(icon_url.strip()[:255] or None),
             website_url=(website_url.strip()[:255] or None),
+            auth_headers=auth_headers.strip()[:255],
+            allow_write=qualified_name in self.settings.community_write_allowlist(),
         )
         await self.store.save_community_connector(record)
-        return {"name": name, "qualified_name": qualified_name, "status": "installed"}
+        return {"name": name, "qualified_name": qualified_name, "status": "created", "allow_write": record.allow_write}
 
-    async def uninstall_community(self, name: str) -> None:
+    async def uninstall_community(self, name: str, *, user_id: str | None = None) -> None:
+        """卸载。
+
+        `user_id` 给定时只断这个用户自己的连接（「卸载」对用户而言是断连），
+        目录项与其他用户的授权保留。没有 `user_id` 是内部回滚：整条目录项删掉。
+        """
         record = await self.store.get_community_connector(name)
         if record is None:
             raise ConnectorNotFoundError()
+        if user_id is not None:
+            await self.store.delete_connection(user_id, name)
+            if await self.store.connector_in_use(name):
+                return
         await self.store.delete_community_connector(name)
         await self.store.delete_connections_by_connector(name)
         await self.store.delete_client_by_connector(name)
@@ -413,6 +587,26 @@ class McpService:
     def _dedupe_name(self, base: str, qualified_name: str) -> str:
         digest = hashlib.sha1(qualified_name.encode("utf-8")).hexdigest()[:8]
         return f"{base[:23]}_{digest}"
+
+    async def authorized_connectors(self, user_id: str | None) -> frozenset[str]:
+        """该用户「授权了并且勾了工具」的连接器。
+
+        与 `tool_specs` 用同一个前置判断（status=connected 且 selected_tools 非空），
+        但只读库、不发网络请求，所以可以放在 `/me/capabilities` 这种高频接口里。
+        读不到就返回空集：插件面板宁可少显示，也不承诺一件没法确认的事。
+        """
+        if not user_id:
+            return frozenset()
+        try:
+            rows = await self.store.list_connections(user_id)
+        except Exception:  # noqa: BLE001 - 权限投影不能因为库抖动而放大能力
+            logger.info("mcp connector lookup skipped")
+            return frozenset()
+        return frozenset(
+            row.connector_name
+            for row in rows
+            if row.status == "connected" and row.selected_tools
+        )
 
     async def tool_specs(self, user_id: str) -> list[ToolSpec]:
         specs: list[ToolSpec] = []
@@ -457,6 +651,7 @@ class McpService:
         connection = await self._require_connection(user_id, connector.name)
         async with self.pool.lock(user_id, connector.name):
             token = await self._access_token(connection, connector)
+            auth_headers = self._auth_headers(connection, connector)
             http = self.pool.get(user_id, connector.name)
         try:
             return await shared_hub(http).call(
@@ -467,19 +662,31 @@ class McpService:
                 token,
                 method,
                 params,
+                auth_headers=auth_headers,
             )
         except PermissionError:
             await self._mark_reauth(connection)
-            raise LoginRequiredError() from None
+            raise ConnectorAuthRequiredError("该连接器的授权已失效，请重新授权") from None
+
+    def _auth_headers(self, connection: ConnectionRecord, connector: Connector) -> dict[str, str]:
+        """从连接凭据里解出用户自定义的认证头。无则返回空字典。"""
+        opened = self._open_access(connection.access_token_encrypted, connection.user_id, connector.name)
+        raw = opened.get("headers")
+        if not isinstance(raw, dict):
+            return {}
+        return {str(k): str(v) for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
 
     async def _access_token(self, connection: ConnectionRecord, connector: Connector) -> str:
         opened = self._open_access(connection.access_token_encrypted, connection.user_id, connector.name)
         expired = connection.expires_at is not None and connection.expires_at <= utcnow() + timedelta(seconds=30)
         if not expired and opened["token"]:
             return opened["token"]
+        # 纯自定义认证头连接：没有 bearer token 也不需要刷新，直接放行。
+        if opened.get("headers"):
+            return opened["token"]
         if not connection.refresh_token_encrypted:
-            await self._mark_reauth(connection)
-            raise LoginRequiredError()
+            await self._mark_reauth(connection, "该连接器的授权已过期，请重新授权")
+            raise ConnectorAuthRequiredError("该连接器的授权已过期，请重新授权")
         endpoint = opened["token_endpoint"]
         issuer = opened["issuer"]
         if not endpoint:
@@ -490,8 +697,8 @@ class McpService:
             endpoint = await self._screen(connection.user_id, connector.name, endpoint)
         client = await self.store.get_client(connector.name)
         if client is None:
-            await self._mark_reauth(connection)
-            raise LoginRequiredError()
+            await self._mark_reauth(connection, "该连接器的授权客户端已失效，请重新授权")
+            raise ConnectorAuthRequiredError("该连接器的授权客户端已失效，请重新授权")
         form = {
             "grant_type": "refresh_token",
             "refresh_token": self._reveal(
@@ -515,8 +722,8 @@ class McpService:
         except Exception:
             metrics.add("mcp_token_refresh_failures_total")
             logger.info("mcp refresh failed connector=%s", connector.name)
-            await self._mark_reauth(connection)
-            raise LoginRequiredError() from None
+            await self._mark_reauth(connection, "该连接器的授权已过期，请重新授权")
+            raise ConnectorAuthRequiredError("该连接器的授权已过期，请重新授权") from None
         await self._save_token(
             connection.user_id,
             connector.name,
@@ -537,7 +744,7 @@ class McpService:
     ) -> None:
         access = token.get("access_token")
         if not isinstance(access, str) or not access:
-            raise LoginRequiredError()
+            raise ConnectorAuthRequiredError("授权服务没有返回访问令牌，请重新授权")
         refresh = token.get("refresh_token")
         if not isinstance(refresh, str):
             refresh = None
@@ -576,30 +783,32 @@ class McpService:
             )
         )
 
-    async def _mark_reauth(self, connection: ConnectionRecord) -> None:
+    async def _mark_reauth(self, connection: ConnectionRecord, reason: str = "该连接器的授权已失效，请重新授权") -> None:
         connection.status = "needs_reauth"
+        connection.last_error = reason
         await self.store.save_connection(connection)
 
     async def _require_connection(self, user_id: str, name: str) -> ConnectionRecord:
         connection = await self.store.get_connection(user_id, name)
         if connection is None or connection.status != "connected":
-            raise LoginRequiredError()
+            raise ConnectorAuthRequiredError("该连接尚未完成授权，请先连接")
         return connection
 
     async def _metadata(self, user_id: str, connector: Connector) -> dict[str, str]:
         """校验并返回连接器的标准 OAuth 元数据。
 
-        服务端不支持标准 MCP OAuth（缺失 oauth-protected-resource / authorization-server，
-        或 issuer 不匹配）时抛 ``McpUnavailableError``，向用户说明「该服务不支持一键连接」，
-        而不是误导性的「请先登录」——用户其实已登录，只是该第三方端点不接受标准授权。
+        服务端不支持标准 MCP OAuth（缺失 oauth-protected-resource / authorization-server、
+        端点 404、issuer 不匹配）时统一抛 ``McpUnavailableError``，向用户说明「该服务不支持
+        平台一键连接」。这里绝不能把 HTTP 4xx 冒泡成 ``LoginRequiredError``：用户其实
+        已经登录，只是这个第三方端点不接受标准授权，报「请先登录」会把人带偏。
         """
         try:
             anchor = trusted_issuer(connector.url, connector.issuer)
             await self._screen(user_id, connector.name, connector.url)
-        except OAuthFlowError as exc:
-            logger.info("mcp oauth rejected connector=%s reason=%s", connector.name, exc.reason)
+            protected = await self._protected_metadata(user_id, connector)
+        except (OAuthFlowError, LoginRequiredError) as exc:
+            logger.info("mcp oauth rejected connector=%s reason=%s", connector.name, getattr(exc, "reason", "metadata"))
             raise McpUnavailableError("该服务不支持平台一键连接") from None
-        protected = await self._protected_metadata(user_id, connector)
         servers = protected.get("authorization_servers") if isinstance(protected, dict) else None
         announced = [item for item in servers if isinstance(item, str)] if isinstance(servers, list) else []
         if not any(issuers_equal(anchor, item) for item in announced):
@@ -608,17 +817,10 @@ class McpService:
         try:
             document_url = await self._screen(user_id, connector.name, metadata_url_for_issuer(anchor))
             document = await self._json(user_id, connector.name, document_url)
-        except OAuthFlowError as exc:
-            logger.info("mcp oauth rejected connector=%s reason=%s", connector.name, exc.reason)
-            raise McpUnavailableError("该服务不支持平台一键连接") from None
-        if not isinstance(document, dict) or not issuers_equal(anchor, str(document.get("issuer") or "")):
-            logger.info("mcp oauth rejected connector=%s reason=issuer_mismatch", connector.name)
-            raise McpUnavailableError("该服务不支持平台一键连接")
-        authorization = document.get("authorization_endpoint")
-        token_endpoint = document.get("token_endpoint")
-        if not isinstance(authorization, str) or not isinstance(token_endpoint, str):
-            raise McpUnavailableError("该服务不支持平台一键连接")
-        try:
+            authorization = document.get("authorization_endpoint")
+            token_endpoint = document.get("token_endpoint")
+            if not isinstance(authorization, str) or not isinstance(token_endpoint, str):
+                raise McpUnavailableError("该服务不支持平台一键连接")
             authorization = await self._screen(user_id, connector.name, authorization)
             token_endpoint = await self._screen(user_id, connector.name, token_endpoint)
             registration = document.get("registration_endpoint")
@@ -626,9 +828,12 @@ class McpService:
                 registration = await self._screen(user_id, connector.name, registration)
             else:
                 registration = ""
-        except OAuthFlowError as exc:
-            logger.info("mcp oauth rejected connector=%s reason=%s", connector.name, exc.reason)
+        except (OAuthFlowError, LoginRequiredError) as exc:
+            logger.info("mcp oauth rejected connector=%s reason=%s", connector.name, getattr(exc, "reason", "metadata"))
             raise McpUnavailableError("该服务不支持平台一键连接") from None
+        if not issuers_equal(anchor, str(document.get("issuer") or "")):
+            logger.info("mcp oauth rejected connector=%s reason=issuer_mismatch", connector.name)
+            raise McpUnavailableError("该服务不支持平台一键连接")
         return {
             "authorization_endpoint": authorization,
             "token_endpoint": token_endpoint,
@@ -641,20 +846,43 @@ class McpService:
         existing = await self.store.get_client(connector.name)
         if existing is not None:
             return existing
+        # 预注册客户端：目录里显式配了 client_id（可选 client_secret），
+        # 就绕开 DCR。官方目录里部分服务不开放动态注册，只能走这条路。
+        if connector.client_id:
+            record = ClientRecord(
+                connector_name=connector.name,
+                client_id=connector.client_id,
+                client_secret_encrypted=(
+                    self._seal(
+                        connector.client_secret,
+                        user_id="connector",
+                        connector_id=connector.name,
+                        credential_type="client_secret",
+                    )
+                    if connector.client_secret
+                    else None
+                ),
+            )
+            await self.store.save_client(record)
+            return record
         if not metadata["registration_endpoint"]:
             raise McpUnavailableError("该服务不支持平台一键连接")
-        response = await self._post(
-            user_id,
-            connector.name,
-            metadata["registration_endpoint"],
-            json={
-                "client_name": "muzi-llm",
-                "redirect_uris": [self._redirect_uri()],
-                "grant_types": ["authorization_code", "refresh_token"],
-                "response_types": ["code"],
-                "token_endpoint_auth_method": "none",
-            },
-        )
+        try:
+            response = await self._post(
+                user_id,
+                connector.name,
+                metadata["registration_endpoint"],
+                json={
+                    "client_name": "muzi-llm",
+                    "redirect_uris": [self._redirect_uri()],
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"],
+                    "token_endpoint_auth_method": "none",
+                },
+            )
+        except OAuthFlowError as exc:
+            logger.info("mcp oauth rejected connector=%s reason=%s", connector.name, exc.reason)
+            raise McpUnavailableError("该服务不支持平台一键连接") from None
         body = response.json()
         client_id = body.get("client_id") if isinstance(body, dict) else None
         if not isinstance(client_id, str) or not client_id:
@@ -676,7 +904,7 @@ class McpService:
         response = await self._post(user_id, name, endpoint, data=form)
         body = response.json()
         if not isinstance(body, dict):
-            raise LoginRequiredError()
+            raise ConnectorAuthRequiredError("授权服务返回了无法解析的响应，请重新授权")
         return body
 
     async def _protected_metadata(self, user_id: str, connector: Connector) -> dict[str, Any]:
@@ -685,12 +913,24 @@ class McpService:
             try:
                 screened = await self._screen(user_id, connector.name, pointed)
                 return await self._json(user_id, connector.name, screened)
-            except (LoginRequiredError, OAuthFlowError):
+            except OAuthFlowError:
                 pass
         parsed = urlparse(connector.url)
         origin = f"{parsed.scheme}://{parsed.netloc}"
-        fallback = await self._screen(user_id, connector.name, f"{origin}/.well-known/oauth-protected-resource")
-        return await self._json(user_id, connector.name, fallback)
+        path = parsed.path if parsed.path not in {"", "/"} else ""
+        # RFC 9728 允许把元数据挂在资源路径下。官方目录里两种写法都有，
+        # 只试 origin 会把一批本来能一键授权的服务误判成「不支持」。
+        candidates = [f"{origin}/.well-known/oauth-protected-resource{path}"]
+        if path:
+            candidates.append(f"{origin}/.well-known/oauth-protected-resource")
+        last: OAuthFlowError | None = None
+        for candidate in candidates:
+            try:
+                fallback = await self._screen(user_id, connector.name, candidate)
+                return await self._json(user_id, connector.name, fallback)
+            except OAuthFlowError as exc:
+                last = exc
+        raise last or OAuthFlowError("metadata_missing")
 
     async def _pointed_metadata(self, user_id: str, connector: Connector) -> str | None:
         http = self.pool.get(user_id, connector.name)
@@ -724,10 +964,12 @@ class McpService:
             )
         except OAuthFlowError as exc:
             logger.info("mcp oauth rejected connector=%s reason=%s", name, exc.reason)
-            raise LoginRequiredError() from None
+            raise OAuthFlowError(exc.reason) from None
         self._reject_redirect(name, response)
         if response.status_code >= 400:
-            raise LoginRequiredError()
+            # 元数据端点 404/401 只说明「这家服务没有标准 OAuth 文档」，
+            # 不是用户会话失效。用 OAuthFlowError 让上层翻译成准确文案。
+            raise OAuthFlowError(f"http_{response.status_code}")
         return response
 
     async def _post(self, user_id: str, name: str, url: str, **kwargs: object) -> httpx.Response:
@@ -735,10 +977,10 @@ class McpService:
             response = await self.pool.get(user_id, name).post(url, follow_redirects=False, **kwargs)
         except OAuthFlowError as exc:
             logger.info("mcp oauth rejected connector=%s reason=%s", name, exc.reason)
-            raise LoginRequiredError() from None
+            raise OAuthFlowError(exc.reason) from None
         self._reject_redirect(name, response)
         if response.status_code >= 400:
-            raise LoginRequiredError()
+            raise OAuthFlowError(f"http_{response.status_code}")
         return response
 
     async def _screen(self, user_id: str, name: str, url: str) -> str:
@@ -752,20 +994,20 @@ class McpService:
     def _reject_redirect(self, name: str, response: httpx.Response) -> None:
         if 300 <= response.status_code < 400:
             logger.info("mcp oauth rejected connector=%s reason=redirect", name)
-            raise LoginRequiredError()
+            raise OAuthFlowError("redirect")
 
     def _open_verifier(self, sealed: str, user_id: str, connector_id: str) -> dict[str, str]:
         try:
             data = json.loads(self._reveal(sealed, user_id=user_id, connector_id=connector_id, credential_type="pkce"))
         except (ValueError, json.JSONDecodeError, KeyConfigurationError):
-            raise LoginRequiredError() from None
+            raise ConnectorAuthRequiredError("授权上下文已失效，请重新发起连接") from None
         if not isinstance(data, dict) or data.get("v") != 1:
-            raise LoginRequiredError()
+            raise ConnectorAuthRequiredError("授权上下文已失效，请重新发起连接")
         verifier = data.get("verifier")
         issuer = data.get("issuer")
         endpoint = data.get("token_endpoint")
         if not isinstance(verifier, str) or not isinstance(issuer, str) or not isinstance(endpoint, str):
-            raise LoginRequiredError()
+            raise ConnectorAuthRequiredError("授权上下文已失效，请重新发起连接")
         return {
             "verifier": verifier,
             "issuer": issuer,
@@ -773,24 +1015,26 @@ class McpService:
             "iss_required": "1" if data.get("iss_required") else "",
         }
 
-    def _open_access(self, sealed: str, user_id: str, connector_id: str) -> dict[str, str]:
+    def _open_access(self, sealed: str, user_id: str, connector_id: str) -> dict[str, Any]:
         try:
             raw = self._reveal(sealed, user_id=user_id, connector_id=connector_id, credential_type="access_token")
         except (ValueError, KeyConfigurationError):
-            return {"token": "", "issuer": "", "token_endpoint": ""}
+            return {"token": "", "issuer": "", "token_endpoint": "", "headers": {}}
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            return {"token": raw, "issuer": "", "token_endpoint": ""}
+            return {"token": raw, "issuer": "", "token_endpoint": "", "headers": {}}
         if not isinstance(data, dict) or data.get("v") != 1:
-            return {"token": raw, "issuer": "", "token_endpoint": ""}
+            return {"token": raw, "issuer": "", "token_endpoint": "", "headers": {}}
         token = data.get("token")
         issuer = data.get("issuer")
         endpoint = data.get("token_endpoint")
+        headers = data.get("headers")
         return {
             "token": token if isinstance(token, str) else "",
             "issuer": issuer if isinstance(issuer, str) else "",
             "token_endpoint": endpoint if isinstance(endpoint, str) else "",
+            "headers": headers if isinstance(headers, dict) else {},
         }
 
     def _iss_matches(self, bound: dict[str, str], iss: str) -> bool:

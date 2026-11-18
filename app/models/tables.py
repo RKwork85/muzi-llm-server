@@ -58,7 +58,11 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
             name="ck_users_email_normalized",
         ),
         CheckConstraint(
-            "username ~ '^[a-z][a-z0-9_]{2,31}$'",
+            # 允许中文等 Unicode 字符：只约束「小写归一 + 长度 2-32 + 无空白/控制字符」，
+            # 具体字符集由服务层 normalize_username 校验，避免依赖数据库 locale 的正则范围。
+            "username = lower(username)"
+            " AND char_length(username) BETWEEN 2 AND 32"
+            " AND username !~ '[[:space:][:cntrl:]]'",
             name="ck_users_username_normalized",
         ),
         Index("ix_users_status", "status"),
@@ -432,6 +436,8 @@ class McpConnection(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     selected_tools: Mapped[Any] = mapped_column(
         JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
     )
+    # 最近一次连接/授权失败的可读原因；成功连接时清空。用于卡片长期展示「为什么连不上」。
+    last_error: Mapped[str | None] = mapped_column(String(255))
 
 
 class McpOAuthState(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
@@ -678,6 +684,10 @@ class CommunityConnector(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     url: Mapped[str] = mapped_column(String(2048), nullable=False)
     icon_url: Mapped[str | None] = mapped_column(String(255))
     website_url: Mapped[str | None] = mapped_column(String(255))
+    # 目录声明的自定义认证头名（逗号分隔，只存名字，不存值）。用于连接前提示用户该填什么。
+    auth_headers: Mapped[str] = mapped_column(String(255), nullable=False, default="", server_default=text("''"))
+    # 是否允许暴露写类工具。默认关；由部署侧白名单在安装时决定，不随用户请求翻转。
+    allow_write: Mapped[bool] = mapped_column(nullable=False, default=False, server_default=text("false"))
 
 
 class ChatShare(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
@@ -723,6 +733,32 @@ class SkillCustomization(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     skill_id: Mapped[str] = mapped_column(String(64), nullable=False)
     icon: Mapped[str | None] = mapped_column(Text)
     display_name: Mapped[str | None] = mapped_column(String(120))
+
+
+class DocArticle(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """用户自建的文档/博客文章。markdown 内容，按 user_id 隔离。"""
+
+    __tablename__ = "doc_articles"
+    __table_args__ = (
+        CheckConstraint("status IN ('draft', 'published')", name="ck_doc_articles_status"),
+        Index("ix_doc_articles_user_updated", "user_id", "updated_at"),
+        {"comment": "用户文档/博客文章，markdown 内容，按用户隔离。"},
+    )
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("users.id", name="fk_doc_articles_user_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    title: Mapped[str] = mapped_column(
+        String(200), nullable=False, default="", server_default=text("''")
+    )
+    content: Mapped[str] = mapped_column(
+        Text, nullable=False, default="", server_default=text("''")
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="draft", server_default=text("'draft'")
+    )
 
 
 def _register_listeners() -> None:

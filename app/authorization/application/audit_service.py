@@ -185,6 +185,45 @@ class QuotaService:
             await self.session.flush()
         return quota
 
+    async def ensure_paid_quota(self, user_id: uuid.UUID | str) -> UsageQuota:
+        """充值入账专用：确保额度行存在，但绝不补发角色默认额度。
+
+        管理端「删除用户额度信息」会把 usage_quotas 整行删掉。若充值入账走
+        `ensure_default_quota`，会顺带补发一份角色默认额度（member 为 10 万），
+        用户付费后额度变成「充值额 + 默认额度」，与实付金额对不上。
+        因此这里只在缺失时建一个 0 额度行，让充值额度成为唯一来源。
+
+        超级管理员仍按不限量建行，保持「不限量不因充值变限额」的既有语义。
+        """
+        from app.authorization.application.authorization_service import AuthorizationService
+        from app.authorization.domain.catalog import SUPER_ADMIN_ROLE_CODE
+
+        quota = await self.get_quota(user_id, DEFAULT_QUOTA_KEY)
+        if quota is not None:
+            return quota
+
+        roles = await AuthorizationService(self.session).get_user_roles(user_id)
+        unlimited = SUPER_ADMIN_ROLE_CODE in roles
+        quota = UsageQuota(
+            user_id=user_id,
+            quota_key=DEFAULT_QUOTA_KEY,
+            period="total",
+            limit_value=0,
+            limit_source="unlimited" if unlimited else "manual",
+            display_value=0,
+        )
+        try:
+            async with self.session.begin_nested():
+                self.session.add(quota)
+                await self.session.flush()
+        except IntegrityError:
+            # 并发充值同时建行（uq_usage_quotas_user_key_period）：复用已存在的那行。
+            existing = await self.get_quota(user_id, DEFAULT_QUOTA_KEY)
+            if existing is None:
+                raise
+            return existing
+        return quota
+
     async def sync_quota_to_role(self, user_id: uuid.UUID | str) -> UsageQuota | None:
         """角色变更后校准额度。
 
@@ -253,6 +292,22 @@ class QuotaService:
                 UsageQuota.period == period,
             )
         )
+
+    async def is_unlimited(self, user_id: uuid.UUID | str) -> bool:
+        """账号是否不限量。
+
+        额度行缺失时不能只凭「没有行」判定为限额：管理端删除额度数据后，
+        超级管理员同样没有额度行，此时下单拦截必须按角色识别为不限量，
+        否则会出现「管理员付了钱却永远不会加额度」。
+        """
+        from app.authorization.application.authorization_service import AuthorizationService
+        from app.authorization.domain.catalog import SUPER_ADMIN_ROLE_CODE
+
+        quota = await self.get_quota(user_id, DEFAULT_QUOTA_KEY)
+        if quota is not None:
+            return quota.limit_source == "unlimited"
+        roles = await AuthorizationService(self.session).get_user_roles(user_id)
+        return SUPER_ADMIN_ROLE_CODE in roles
 
     async def set_quota(
         self,
@@ -340,6 +395,72 @@ class QuotaService:
             )
         )
         await self.session.flush()
+        return quota
+
+    async def credit_tokens(
+        self,
+        user_id: uuid.UUID | str,
+        tokens: int,
+        *,
+        reference: str,
+        actor_id: uuid.UUID | str | None = None,
+    ) -> UsageQuota:
+        """按 token 精确加额度（充值到账）。按 reference 幂等，重复调用不重复加。
+
+        - tokens 必须为正。
+        - reference 唯一标识一笔充值订单，配合唯一索引兜底并发重复。
+        - 不限量（unlimited）用户无需充值，直接返回当前额度。
+        - 额度行缺失时（如管理端删除过额度数据）只建 0 额度行，不补发角色默认额度，
+          保证「实付多少就入账多少」。
+        """
+        if tokens <= 0:
+            raise InvalidRequestError("充值 token 数必须为正")
+
+        existing = await self.session.scalar(
+            select(QuotaAdjustment).where(QuotaAdjustment.reference == reference)
+        )
+        if existing is not None:
+            return await self.ensure_paid_quota(user_id)
+
+        quota = await self.ensure_paid_quota(user_id)
+
+        quota = await self.session.scalar(
+            select(UsageQuota).where(UsageQuota.id == quota.id).with_for_update()
+        )
+        if quota is None:
+            raise InvalidRequestError("用户额度不存在")
+        if quota.limit_source == "unlimited":
+            return quota
+        before = quota.limit_value
+        after = before + tokens
+        try:
+            async with self.session.begin_nested():
+                quota.limit_value = after
+                quota.display_value = after
+                quota.limit_source = "manual"
+                quota.adjust_reason = "充值到账"
+                quota.adjusted_by = actor_id
+                quota.adjusted_at = utcnow()
+                self.session.add(
+                    QuotaAdjustment(
+                        user_id=user_id,
+                        actor_id=actor_id,
+                        quota_key=DEFAULT_QUOTA_KEY,
+                        period="total",
+                        action="increase",
+                        units=1,
+                        unit_size=tokens,
+                        before_limit=before,
+                        after_limit=after,
+                        before_used=quota.used_value,
+                        reason="充值到账",
+                        reference=reference,
+                    )
+                )
+                await self.session.flush()
+        except IntegrityError:
+            # reference 唯一索引冲突：并发重复充值，直接返回当前额度。
+            await self.session.refresh(quota)
         return quota
 
     async def check(self, user_id: uuid.UUID | str, quota_key: str) -> bool:

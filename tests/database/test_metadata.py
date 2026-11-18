@@ -60,6 +60,9 @@ EXPECTED_TABLES = {
     "summary_updates",
     "chat_shares",
     "skill_customizations",
+    "doc_articles",
+    "content_tasks",
+    "plan_todos",
 }
 
 ON_DELETE = {
@@ -131,6 +134,9 @@ ON_DELETE = {
     ("summary_updates", "user_id"): "CASCADE",
     ("chat_shares", "owner_id"): "SET NULL",
     ("skill_customizations", "user_id"): "CASCADE",
+    ("doc_articles", "user_id"): "CASCADE",
+    ("content_tasks", "user_id"): "CASCADE",
+    ("plan_todos", "plan_id"): "CASCADE",
 }
 
 

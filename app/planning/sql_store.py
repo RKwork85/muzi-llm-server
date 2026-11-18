@@ -7,7 +7,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import ValidationError
 
@@ -18,6 +18,7 @@ from app.models.planning import (
     PersistentPlanAction,
     PersistentPlanDecision,
     PersistentPlanRevision,
+    PersistentPlanTodo,
     PersistentPlanningEvent,
     PersistentPlanningOutbox,
 )
@@ -36,8 +37,12 @@ from app.planning.contracts import (
     PlanSnapshot,
     PlanStatus,
     PlanStep,
+    PlanTodo,
+    PlanTodoSet,
     PlanningEvent,
     PlanningEventType,
+    TodoStatus,
+    TodoUpdateRequest,
     can_transition_plan,
 )
 from app.planning.runtime import (
@@ -50,7 +55,14 @@ from app.planning.runtime import (
     PlanningPolicyError,
     InteractionOrchestrator,
     _PLAN_REVISION_ACTIONS,
+    _TODO_WRITABLE_STATUSES,
+    complete_remaining_todos,
     compute_revision_changes,
+    ensure_todos_fresh,
+    first_startable_todo,
+    mark_todo_in_progress,
+    merge_todo_items,
+    todos_from_steps,
 )
 from app.planning import revisions
 from app.providers.base import LLMProvider
@@ -279,6 +291,8 @@ class SqlPlanningStore:
         )
 
         proposal: DecisionProposal | None = None
+        plan_usage = None
+        plan_meter = None
         try:
             async for event, payload in engine.propose_stream(
                 goal=current.goal, user_message=message, plan=current, history=history
@@ -293,9 +307,19 @@ class SqlPlanningStore:
                 elif event == "done":
                     proposal = payload
         finally:
-            await self._settle_plan(owner, engine, plan_id, current.revision, str(row.conversation_id))
+            plan_usage, plan_meter = await self._settle_plan(owner, engine, plan_id, current.revision, str(row.conversation_id))
         if proposal is None:
             return
+
+        if plan_meter is not None:
+            from app.metering.persist import usage_public
+
+            public = usage_public(plan_usage)
+            if plan_meter.get("breakdown"):
+                public["breakdown"] = plan_meter["breakdown"]
+            if plan_meter.get("tool_usage"):
+                public["tool_usage"] = plan_meter["tool_usage"]
+            yield format_sse("usage", {"usage": public, "meter": plan_meter})
 
         InteractionOrchestrator().enforce(proposal, current)
         updated, interaction = await self.apply_proposal(plan_id, owner, current, proposal)
@@ -316,7 +340,7 @@ class SqlPlanningStore:
         plan_id: str,
         revision: int,
         conversation_id: str | None = None,
-    ) -> None:
+    ) -> tuple[Any, dict[str, Any]]:
         from app.authorization.application.audit_service import QuotaService
         from app.core.context import get_request_id
 
@@ -335,7 +359,7 @@ class SqlPlanningStore:
             extra={"plan_id": plan_id, "revision": revision},
             trace_id=plan_id,
         )
-        await self._persist_plan_meter(
+        return await self._persist_plan_meter(
             owner,
             engine,
             plan_id,
@@ -356,7 +380,7 @@ class SqlPlanningStore:
         request_id: str,
         amount: int,
         conversation_id: str | None,
-    ) -> None:
+    ) -> tuple[Any, dict[str, Any]]:
         from app.core.config import get_settings
         from app.metering.attribute import build_meter
         from app.metering.persist import persist_meters
@@ -401,6 +425,7 @@ class SqlPlanningStore:
             request_id=request_id,
             trace_id=plan_id,
         )
+        return usage, meter
 
     async def apply_proposal(
         self,
@@ -866,8 +891,201 @@ class SqlPlanningStore:
             raise PlanningConflict("switching mode does not authorize execution")
         updated = self._revise(current, status=PlanStatus.EXECUTING)
         await self._store_revision(row, current, updated)
+        await self._initialize_todo_rows(row, updated)
         await self._emit(row, PlanningEventType.RUN_STARTED, {"revision": updated.revision, "authorization_id": authorization_id})
         return updated
+
+    async def approve_and_authorize(
+        self,
+        plan_id: str,
+        owner: User,
+        *,
+        expected_revision: int,
+        authorization_id: str,
+    ) -> tuple[PlanSnapshot, int]:
+        """单次门：确认计划 → 切换 Agent → 授权执行，一次调用收敛三步。
+
+        内部仍顺序走 approve → switch_mode → authorize_execution，保留完整的
+        版本链（APPROVED / READY_FOR_HANDOFF / EXECUTING）与事件审计，仅省去
+        三次 HTTP 往返。执行前权限重校验由 API 层负责（与 authorize-execution 相同）。
+        返回 (执行中快照, 被批准的版本号)。
+        """
+        approved = await self.approve(plan_id, owner, expected_revision)
+        ready = await self.switch_mode(plan_id, owner, approved.revision, "agent")
+        executing = await self.authorize_execution(
+            plan_id,
+            owner,
+            approved_revision=approved.revision,
+            expected_revision=ready.revision,
+            authorization_id=authorization_id,
+        )
+        return executing, approved.revision
+
+    async def emit_run_progress(self, plan_id: str, owner: User, payload: dict[str, Any]) -> None:
+        """执行期粗粒度进度事件（run.progress）。计划不在执行中时静默跳过。"""
+        try:
+            row = await self._owned_plan(plan_id, owner.id)
+        except PlanningNotFound:
+            return
+        current = PlanSnapshot.model_validate((await self._current_revision(row)).snapshot)
+        if current.status is not PlanStatus.EXECUTING:
+            return
+        await self._emit(row, PlanningEventType.RUN_PROGRESS, payload)
+
+    async def auto_advance_todo(self, plan_id: str, owner: User) -> None:
+        """执行期兜底：点亮第一个依赖已满足且仍待办的步骤。幂等。
+
+        仅当清单里没有任何 in_progress 项时才推进一次，不覆盖模型显式
+        `update_todos` 设定的状态；依赖链全部 completed 才视为可开始。
+        """
+        row = await self._owned_plan(plan_id, owner.id, for_update=True)
+        current = PlanSnapshot.model_validate((await self._current_revision(row)).snapshot)
+        if current.status not in _TODO_WRITABLE_STATUSES:
+            return
+        existing = await self._load_todos(row)
+        if existing is None:
+            existing = await self._initialize_todo_rows(row, current)
+        target = first_startable_todo(existing.todos)
+        if target is None:
+            return
+        merged = mark_todo_in_progress(existing.todos, target.id)
+        await self._replace_todo_rows(row, merged, current.revision)
+        await self._emit(
+            row,
+            PlanningEventType.TODO_UPDATED,
+            {
+                "merge": True,
+                "source_plan_revision": current.revision,
+                "todos": [todo.model_dump(mode="json") for todo in merged],
+            },
+        )
+
+    async def complete_todos(self, plan_id: str, owner: User) -> None:
+        """终态兜底：运行完成时把剩余 pending / in_progress 项推进到 completed。
+
+        必须在计划仍处于 EXECUTING 时调用（终态状态转移之前），否则跳过。
+        """
+        row = await self._owned_plan(plan_id, owner.id, for_update=True)
+        current = PlanSnapshot.model_validate((await self._current_revision(row)).snapshot)
+        if current.status not in _TODO_WRITABLE_STATUSES:
+            return
+        existing = await self._load_todos(row)
+        if existing is None:
+            return
+        if not any(todo.status in {TodoStatus.PENDING, TodoStatus.IN_PROGRESS} for todo in existing.todos):
+            return
+        merged = complete_remaining_todos(existing.todos)
+        await self._replace_todo_rows(row, merged, current.revision)
+        await self._emit(
+            row,
+            PlanningEventType.TODO_UPDATED,
+            {
+                "merge": True,
+                "source_plan_revision": current.revision,
+                "todos": [todo.model_dump(mode="json") for todo in merged],
+            },
+        )
+
+    async def get_todos(self, plan_id: str, owner: User) -> PlanTodoSet | None:
+        row = await self._owned_plan(plan_id, owner.id)
+        return await self._load_todos(row)
+
+    async def update_todos(self, plan_id: str, owner: User, request: TodoUpdateRequest) -> PlanTodoSet:
+        """更新执行期清单。清单写入不修改 plans.current_revision。"""
+        row = await self._owned_plan(plan_id, owner.id, for_update=True)
+        current = PlanSnapshot.model_validate((await self._current_revision(row)).snapshot)
+        if current.status not in _TODO_WRITABLE_STATUSES:
+            raise PlanningConflict("checklist can only change while the plan is executing")
+        if request.expected_plan_revision is not None and current.revision != request.expected_plan_revision:
+            raise PlanningConflict(f"revision conflict; latest revision is {current.revision}")
+        existing = await self._load_todos(row)
+        if existing is None:
+            existing = await self._initialize_todo_rows(row, current)
+        else:
+            ensure_todos_fresh(existing, current)
+        merged = merge_todo_items(existing.todos, request)
+        await self._replace_todo_rows(row, merged, current.revision)
+        await self._emit(
+            row,
+            PlanningEventType.TODO_UPDATED,
+            {
+                "merge": request.merge,
+                "source_plan_revision": current.revision,
+                "todos": [todo.model_dump(mode="json") for todo in merged],
+            },
+        )
+        return PlanTodoSet(
+            plan_id=plan_id,
+            source_plan_revision=current.revision,
+            todos=merged,
+            updated_at=datetime.now(UTC),
+        )
+
+    async def _load_todos(self, row: PersistentPlan) -> PlanTodoSet | None:
+        items = list(
+            await self._session.scalars(
+                select(PersistentPlanTodo)
+                .where(PersistentPlanTodo.plan_id == row.id)
+                .order_by(PersistentPlanTodo.position, PersistentPlanTodo.created_at)
+            )
+        )
+        if not items:
+            return None
+        return PlanTodoSet(
+            plan_id=row.public_id,
+            source_plan_revision=max(item.source_plan_revision for item in items),
+            todos=[
+                PlanTodo(
+                    id=item.todo_id,
+                    content=item.content,
+                    status=TodoStatus(item.status),
+                    depends_on=list(item.depends_on or []),
+                )
+                for item in items
+            ],
+            updated_at=max(item.updated_at for item in items),
+        )
+
+    async def _initialize_todo_rows(self, row: PersistentPlan, plan: PlanSnapshot) -> PlanTodoSet:
+        """幂等初始化：已有清单直接返回，否则从计划步骤生成并 emit 一次。"""
+        existing = await self._load_todos(row)
+        if existing is not None:
+            return existing
+        todos = todos_from_steps(plan)
+        await self._replace_todo_rows(row, todos, plan.revision)
+        await self._emit(
+            row,
+            PlanningEventType.TODO_UPDATED,
+            {
+                "merge": False,
+                "source_plan_revision": plan.revision,
+                "todos": [todo.model_dump(mode="json") for todo in todos],
+            },
+        )
+        return PlanTodoSet(
+            plan_id=row.public_id,
+            source_plan_revision=plan.revision,
+            todos=todos,
+            updated_at=datetime.now(UTC),
+        )
+
+    async def _replace_todo_rows(
+        self, row: PersistentPlan, todos: list[PlanTodo], source_revision: int
+    ) -> None:
+        await self._session.execute(delete(PersistentPlanTodo).where(PersistentPlanTodo.plan_id == row.id))
+        for position, todo in enumerate(todos):
+            self._session.add(
+                PersistentPlanTodo(
+                    plan_id=row.id,
+                    todo_id=todo.id,
+                    content=todo.content,
+                    status=todo.status.value,
+                    position=position,
+                    depends_on=list(todo.depends_on),
+                    source_plan_revision=source_revision,
+                )
+            )
+        await self._session.flush()
 
     async def events_after(self, plan_id: str, owner: User, after: int) -> tuple[list[PlanningEvent], int]:
         if after < 0:

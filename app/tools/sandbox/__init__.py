@@ -8,6 +8,7 @@
 """
 
 from app.tools.sandbox.provider import (
+    SandboxDependencyRejected,
     SandboxExecutionError,
     SandboxResult,
     SandboxSpec,
@@ -16,6 +17,7 @@ from app.tools.sandbox.provider import (
 )
 
 __all__ = [
+    "SandboxDependencyRejected",
     "SandboxExecutionError",
     "SandboxResult",
     "SandboxSpec",

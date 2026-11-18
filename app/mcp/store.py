@@ -38,6 +38,7 @@ class ConnectionRecord:
     refresh_token_encrypted: str | None
     expires_at: datetime | None
     selected_tools: list[str] = field(default_factory=list)
+    last_error: str | None = None
 
 
 @dataclass
@@ -57,6 +58,8 @@ class CommunityConnectorRecord:
     url: str
     icon_url: str | None = None
     website_url: str | None = None
+    auth_headers: str = ""
+    allow_write: bool = False
 
 
 class MemoryStore:
@@ -97,6 +100,9 @@ class MemoryStore:
     async def delete_connections_by_connector(self, name: str) -> None:
         for key in [key for key in self.connections if key[1] == name]:
             self.connections.pop(key, None)
+
+    async def connector_in_use(self, name: str) -> bool:
+        return any(key[1] == name for key in self.connections)
 
     async def delete_client_by_connector(self, name: str) -> None:
         self.clients.pop(name, None)
@@ -202,6 +208,7 @@ class SqlStore:
                     refresh_token_encrypted=record.refresh_token_encrypted,
                     expires_at=record.expires_at,
                     selected_tools=list(record.selected_tools),
+                    last_error=record.last_error,
                 )
             )
         else:
@@ -210,6 +217,7 @@ class SqlStore:
             row.refresh_token_encrypted = record.refresh_token_encrypted
             row.expires_at = record.expires_at
             row.selected_tools = list(record.selected_tools)
+            row.last_error = record.last_error
         await self.session.flush()
 
     async def get_connection(self, user_id: str, name: str) -> ConnectionRecord | None:
@@ -305,6 +313,8 @@ class SqlStore:
                     url=record.url,
                     icon_url=record.icon_url,
                     website_url=record.website_url,
+                    auth_headers=record.auth_headers,
+                    allow_write=record.allow_write,
                 )
             )
         else:
@@ -315,6 +325,8 @@ class SqlStore:
             row.url = record.url
             row.icon_url = record.icon_url
             row.website_url = record.website_url
+            row.auth_headers = record.auth_headers
+            row.allow_write = record.allow_write
         await self.session.flush()
 
     async def delete_community_connector(self, name: str) -> None:
@@ -324,6 +336,12 @@ class SqlStore:
     async def delete_connections_by_connector(self, name: str) -> None:
         await self.session.execute(delete(McpConnection).where(McpConnection.connector_name == name))
         await self.session.flush()
+
+    async def connector_in_use(self, name: str) -> bool:
+        row = await self.session.scalar(
+            select(McpConnection.id).where(McpConnection.connector_name == name).limit(1)
+        )
+        return row is not None
 
     async def delete_client_by_connector(self, name: str) -> None:
         await self.session.execute(delete(McpOAuthClient).where(McpOAuthClient.connector_name == name))
@@ -340,6 +358,8 @@ def _community(row: CommunityConnector) -> CommunityConnectorRecord:
         url=row.url,
         icon_url=row.icon_url,
         website_url=row.website_url,
+        auth_headers=row.auth_headers,
+        allow_write=row.allow_write,
     )
 
 
@@ -353,4 +373,5 @@ def _connection(row: McpConnection) -> ConnectionRecord:
         refresh_token_encrypted=row.refresh_token_encrypted,
         expires_at=row.expires_at,
         selected_tools=[item for item in selected if isinstance(item, str)],
+        last_error=row.last_error,
     )

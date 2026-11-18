@@ -45,6 +45,7 @@ class CommunityInstall(BaseModel):
     description: str = ""
     icon_url: str = ""
     website_url: str = ""
+    auth_headers: str = ""
 
 
 def _validate_bridge_credentials(name: str, body: BridgeCredentials) -> dict[str, str]:
@@ -166,6 +167,39 @@ async def disconnect(name: str, request: Request, service: McpService = Depends(
     return {"status": "disconnected"}
 
 
+class AccessToken(BaseModel):
+    """用户自带的连接凭据。token 为 Bearer 令牌，headers 为自定义认证头。"""
+
+    token: str = Field(default="", max_length=4096)
+    headers: dict[str, str] = Field(default_factory=dict)
+
+
+@router.put("/connectors/{name}/auth", summary="用访问令牌/认证头连接（无标准 OAuth 的服务）")
+async def put_auth(
+    name: str,
+    body: AccessToken,
+    request: Request,
+    service: McpService = Depends(required_mcp),
+) -> dict[str, object]:
+    """社区目录里只认 `Authorization: Bearer <token>` 或 `X-API-Key` 这类自定义头的远程 MCP 走这条路。"""
+    user_id = await service.require_user(request)
+    tools = await service.connect_with_credentials(user_id, name, token=body.token, headers=body.headers)
+    return {"status": "connected", "connector": name, "selected_tools": tools}
+
+
+@router.put("/connectors/{name}/token", summary="用访问令牌连接（兼容旧入口）")
+async def put_token(
+    name: str,
+    body: AccessToken,
+    request: Request,
+    service: McpService = Depends(required_mcp),
+) -> dict[str, object]:
+    """等价于 `/auth` 的 `token` 字段，保留给旧调用方。"""
+    user_id = await service.require_user(request)
+    tools = await service.connect_with_token(user_id, name, body.token)
+    return {"status": "connected", "connector": name, "selected_tools": tools}
+
+
 @router.get("/connectors/{name}/credentials", summary="查询 bridge 凭据是否已配置")
 async def get_credentials(name: str, request: Request, service: McpService = Depends(required_mcp)) -> dict[str, object]:
     user_id = await service.require_user(request)
@@ -201,20 +235,31 @@ async def community_search(
 
 
 @router.get("/community/connectors", summary="已安装的社区连接器目录")
-async def community_list(service: McpService = Depends(required_mcp)) -> dict[str, object]:
-    return {"connectors": await service.community_connectors()}
+async def community_list(request: Request, service: McpService = Depends(required_mcp)) -> dict[str, object]:
+    user_id = await service.require_user(request)
+    return {"connectors": await service.community_connectors(user_id)}
 
 
-@router.post("/community/connectors", summary="安装社区远程连接器为平台目录项")
+@router.post("/community/connectors", summary="接入社区远程连接器并开始授权")
 async def community_install(
     body: CommunityInstall,
     request: Request,
     service: McpService = Depends(required_mcp),
-) -> dict[str, str]:
-    await service.require_user(request)
+) -> dict[str, object]:
+    """接入目录项并立刻给出「下一步」。
+
+    安装本身只是往平台目录里加一条记录，不产生任何可用能力；真正的「能用」发生在
+    用户完成授权之后。所以两步必须绑在一起，并把下一步告诉前端：
+
+    - ``next=oauth``：跳转 ``authorization_url``。
+    - ``next=token``：该服务没有标准 OAuth，前端弹窗让用户粘贴访问令牌。
+
+    授权无法发起时不留下「已安装但永远连不上」的目录项：本次新建的目录项回滚。
+    """
+    user_id = await service.require_user(request)
     if not body.qualified_name.strip() or not body.url.strip():
         raise InvalidRequestError("qualified_name 与 url 不能为空")
-    return await service.install_community(
+    installed = await service.install_community(
         body.qualified_name.strip(),
         body.transport,
         body.url.strip(),
@@ -222,7 +267,20 @@ async def community_install(
         body.description,
         body.icon_url,
         body.website_url,
+        body.auth_headers,
     )
+    name = str(installed["name"])
+    try:
+        authorization_url = await service.begin(user_id, name)
+    except McpUnavailableError:
+        # 官方目录里大量服务只认自带的 Bearer Token。保留目录项，改走令牌连接，
+        # 而不是把用户丢在一张「已安装但未连接」的死卡片上。
+        return {**installed, "next": "token"}
+    except Exception:
+        if installed.get("status") == "created":
+            await service.uninstall_community(name)
+        raise
+    return {**installed, "next": "oauth", "authorization_url": authorization_url}
 
 
 @router.delete("/community/connectors/{name}", summary="卸载社区远程连接器")
@@ -231,6 +289,6 @@ async def community_uninstall(
     request: Request,
     service: McpService = Depends(required_mcp),
 ) -> dict[str, str]:
-    await service.require_user(request)
-    await service.uninstall_community(name)
+    user_id = await service.require_user(request)
+    await service.uninstall_community(name, user_id=user_id)
     return {"status": "uninstalled"}

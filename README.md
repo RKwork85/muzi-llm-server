@@ -24,6 +24,7 @@ app/
   schemas/
 alembic/               # 数据库迁移
 deploy/docker/         # PostgreSQL / Redis 的 Docker Compose
+docs/                  # 部署与架构文档（含 SSE_DEPLOYMENT.md）
 ```
 
 配置从环境变量和本机 `.env` 读取。`.env.example` 只有占位符。
@@ -186,7 +187,21 @@ python -m uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8001
 ```
 
+生产环境**不要使用 `--reload`**：热重载会踢掉所有实时推送长连接。
+
 端口需与前端反向代理或 `VITE_API_BASE_URL` 保持一致（默认约定为 `8001`）。
+
+建议用启动脚本固定 fd 上限，避免换机器后行为不一致：
+
+```bash
+#!/usr/bin/env bash
+set -e
+# 实时推送（SSE）每条在线连接占 1 个 fd，系统默认 1024 不够
+ulimit -n 65535
+exec python -m uvicorn app.main:app --host 0.0.0.0 --port 8001
+```
+
+**暂不要加 `--workers`**：Agent 任务保存在进程内 `TaskManager._tasks` 字典中，多 worker 后任务创建在 A 进程、轮询/取消打到 B 进程会查不到。需要横向扩展时先引入共享存储（见「必要说明」）。
 
 ## 生产部署
 
@@ -196,6 +211,7 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8001
 2. 启动 PostgreSQL / Redis 并完成迁移。
 3. 填写 `DEEPSEEK_API_KEY`。
 4. 需要文件上传时，启动 qs-oss 服务并配置 `OSS_UPLOAD_BASE_URL`。
+5. **确认文件描述符上限**：实时推送（SSE）每条在线连接占 1 个 fd，Linux 默认 `ulimit -n 1024`，约 970 个在线页面后新请求会全部失败，且监控上看不出异常。详见 [实时推送（SSE）部署说明](docs/SSE_DEPLOYMENT.md)。
 
 注意：生产模式下若 `DATABASE_STARTUP_REQUIRED=false` 或数据库不可用，进程会拒绝启动，防止回退到内存授权。
 

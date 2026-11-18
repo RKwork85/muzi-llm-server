@@ -26,7 +26,7 @@ from app.core.config import Settings
 from app.data.context import CURRENT_DATA_STORE, CURRENT_OSS_CLIENT, CURRENT_TASK_ID
 from app.data.oss_client import oss_client_from_settings
 from app.data.store import DataStore
-from app.core.exceptions import AgentPolicyRejectedError, AgentTaskNotFoundError
+from app.core.exceptions import AgentPolicyRejectedError, AgentTaskLimitError, AgentTaskNotFoundError
 from app.providers.base import LLMProvider
 from app.services.prompt_service import PromptService
 from app.tools.registry import ToolRegistry
@@ -78,6 +78,9 @@ class AgentRuntime:
             thread_name_prefix="agent-tool",
         )
         self._network_gate = asyncio.Semaphore(settings.tools_network_concurrency)
+        # 并发准入闸门：任务槽位满时排队等待，而不是立刻拒绝。
+        self._admission = asyncio.Semaphore(settings.agent_max_active_tasks)
+        self._admission_timeout = settings.agent_admission_timeout_seconds
         self._cleanup_timeout = settings.agent_cancel_cleanup_seconds
         self.skill_runtime: object | None = None
         self._skill_principals: dict[str, str] = {}
@@ -106,9 +109,10 @@ class AgentRuntime:
                 self._registry,
                 self._settings,
                 request.toolsets,
-                request.grants,
                 mcp_user_id,
-                permissions=None if execution is None else execution.effective_permissions,
+                permissions=frozenset() if execution is None else execution.effective_permissions,
+                workspace_scope=workspace_scope,
+                owned_scopes=None if execution is None else execution.owned_workspace_scopes,
             )
             remote: list = []
             want_remote = mcp_service is not None and mcp_user_id is not None
@@ -145,23 +149,39 @@ class AgentRuntime:
         if selected & {"research", "workspace", "data", "weather"} or set(granted) & sensitive:
             prompt = f"{prompt}\n\n{UNTRUSTED_PROMPT}"
         registry = overlay_tools(self._settings, self._registry, remote) if remote else self._registry
+        # 并发准入：槽位满时排队等待，超时才拒绝，避免第 N+1 个用户瞬间失败。
+        try:
+            await asyncio.wait_for(self._admission.acquire(), timeout=self._admission_timeout)
+        except TimeoutError:
+            raise AgentTaskLimitError("当前使用人数较多，请稍后重试") from None
         record = self._tasks.create(request_id, task_id=task_id, owner_id=owner_id)
-        record.publisher = EventPublisher(
-            request_id=record.request_id,
-            task_id=record.task_id,
-            max_queue_size=policy.max_event_queue_size,
-            observer=event_observer,
-        )
-        skill_principal_id = owner_id or mcp_user_id
-        prompt, skill_result = self._apply_registered_skills(prompt, request, record.task_id, skill_principal_id)
-        if skill_result is not None and skill_principal_id:
-            await self._record_skill_usage(skill_principal_id, record.task_id, skill_result)
-        worker = asyncio.create_task(
-            self._execute(record, request.message, prompt, policy, workspace_scope, mcp_user_id, registry),
-            name=f"agent:{record.task_id}",
-        )
-        record.worker = worker
-        return record.view()
+        try:
+            record.publisher = EventPublisher(
+                request_id=record.request_id,
+                task_id=record.task_id,
+                max_queue_size=policy.max_event_queue_size,
+                observer=event_observer,
+            )
+            skill_principal_id = owner_id or mcp_user_id
+            prompt, skill_result = self._apply_registered_skills(prompt, request, record.task_id, skill_principal_id)
+            if skill_result is not None and skill_principal_id:
+                await self._record_skill_usage(skill_principal_id, record.task_id, skill_result)
+            worker = asyncio.create_task(
+                self._execute(record, request.message, prompt, policy, workspace_scope, mcp_user_id, registry),
+                name=f"agent:{record.task_id}",
+            )
+            # 运行结束时（正常/失败/取消，甚至尚未启动即被取消）都归还准入名额。
+            # 用 done callback 而不是在 _execute 的 finally 里释放，可避免「任务被取消时
+            # 协程从未启动、finally 不执行」导致的槽位泄漏。
+            worker.add_done_callback(lambda _task: self._admission.release())
+            record.worker = worker
+            return record.view()
+        except BaseException:
+            # 运行没能成功交给 worker（技能应用/计费失败等）：归还名额，并把任务落到终态，
+            # 避免 active_count 长期虚高、且 semaphore 槽位泄漏。
+            self._admission.release()
+            self._tasks.finish_failed(record, "AGENT_INTERNAL_ERROR")
+            raise
 
     def _apply_registered_skills(
         self,

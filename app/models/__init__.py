@@ -3,6 +3,7 @@
 from app.core.database.redaction import register_redaction_listeners
 from app.models.ask_run import AskRun
 from app.models.base import Base
+from app.models.content import ContentTask
 from app.models.planning import (
     PersistentInteraction,
     PersistentInteractionSubmission,
@@ -39,6 +40,7 @@ from app.models.tables import (
     CommunityConnector,
     ConversationMessage,
     ConversationSession,
+    DocArticle,
     ExecutionEvent,
     PluginInstallation,
     ProfileEdit,
@@ -80,6 +82,8 @@ __all__ = [
     "PersistentPlanningOutbox",
     "ConversationMessage",
     "ConversationSession",
+    "ContentTask",
+    "DocArticle",
     "ExecutionEvent",
     "PluginInstallation",
     "ProfileEdit",

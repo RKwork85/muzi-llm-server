@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
+import json
+from collections.abc import AsyncIterator
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import StreamingResponse
+from sqlalchemy import select
 
-from app.api.deps import get_authenticated_user
+from app.api.deps import get_authenticated_user, get_stream_user_id
 from app.authorization.application.authorization_service import AuthorizationService
+from app.authorization.application.visibility import visible_tools
 from app.core.database.deps import DbSession
+from app.core.config import get_settings
+from app.models.rbac import ResourceGrant
 from app.models.tables import User
-from app.schemas.auth import UserOut
+from app.schemas.auth import ChangeUsernameRequest, UserOut
+from app.services.auth_service import AuthService
 from app.schemas.avatar import AvatarStatusOut, AvatarUpload
+from app.services.recharge_events import subscribe as subscribe_recharge_events
 from app.schemas.preferences import (
     BackgroundSettings,
     DEFAULT_COLOR_CHAT,
@@ -19,7 +28,15 @@ from app.schemas.preferences import (
     UserPreferencesOut,
     UserPreferencesUpdate,
 )
-from app.schemas.rbac import MeResponse, QuotaSummary, UsageListResponse, UsageRecordOut, UsageReportRequest
+from app.schemas.rbac import (
+    CapabilitiesOut,
+    MeResponse,
+    ModeCapabilitiesOut,
+    QuotaSummary,
+    UsageListResponse,
+    UsageRecordOut,
+    UsageReportRequest,
+)
 from app.services.avatar_service import AvatarService
 from app.authorization.application.audit_service import QuotaService
 from app.authorization.application.usage_turns import load_usage_analysis
@@ -27,8 +44,17 @@ from app.authorization.application.chat_run_detail import load_chat_run_detail
 from app.core.exceptions import ChatRunNotFoundError, InvalidRequestError
 from app.schemas.chat_run import ChatRunDetailResponse
 from app.schemas.usage_analysis import UsageAnalysisResponse
+from app.api.v1.endpoints.mcp import optional_mcp
+from app.mcp.service import McpService
+from app.tools.capabilities import MCP_MODES, MODE_TOOL_NAMES
+from app.authorization.application.execution_guard import bind_workspace_grant
+from app.tools.plugins import visible_plugins
+from app.tools.registry import ToolRegistry, build_agent_registry
+from app.tools.workspace_scope import is_user_scope, scope_dirname
 
 router = APIRouter(prefix="/me", tags=["me"])
+
+_MODES = ("ask", "plan", "agent")
 
 
 @router.get("", response_model=MeResponse, summary="当前用户信息与有效权限")
@@ -53,6 +79,59 @@ async def get_me(
     )
 
 
+@router.get("/capabilities", response_model=CapabilitiesOut, summary="读取各模式实际可用的工具")
+async def get_capabilities(
+    request: Request,
+    user: Annotated[User, Depends(get_authenticated_user)],
+    session: DbSession,
+    mcp: McpService | None = Depends(optional_mcp),
+) -> CapabilitiesOut:
+    """工具是否出现由服务端能力投影决定，前端不再自行推导 toolsets/grants。
+
+    传入 X-Workspace-Key 时，agent 模式会按该工作区是否已归属来收窄写类工具。
+    """
+    snapshot = await AuthorizationService(session).snapshot(user.id)
+    registry = _tool_registry(request)
+    settings = getattr(request.app.state, "settings", None) or get_settings()
+    scope = scope_dirname(
+        request.headers.get("x-workspace-key") or request.query_params.get("workspace_key")
+    )
+    # 与真实请求保持一致：首次出示合法 scope 即登记归属，之后 agent 的写类工具才可见。
+    await bind_workspace_grant(session, user.id, scope)
+    owned = await _owned_workspaces(session, user.id)
+    # 连接器授权是「按人」的运行时事实，不在权限位里，必须单独读。
+    # 只读库不发网络请求，所以放在这个高频接口上不会拖慢页面。
+    connectors = await (mcp.authorized_connectors(str(user.id)) if mcp is not None else frozenset())
+
+    modes: dict[str, ModeCapabilitiesOut] = {}
+    for mode in _MODES:
+        visibility = visible_tools(
+            registry,
+            settings,
+            mode=mode,
+            permissions=snapshot.permissions,
+            workspace_scope=scope,
+            owned_scopes=owned,
+            offered=MODE_TOOL_NAMES[mode],
+            include_mcp=mode in MCP_MODES,
+            mcp_user_id=str(user.id) if mode in MCP_MODES else None,
+        )
+        plugins = visible_plugins(
+            visibility.allowed,
+            permissions=snapshot.permissions,
+            mode=mode,
+            connectors=connectors,
+        )
+        modes[mode] = ModeCapabilitiesOut(
+            tools=list(visibility.allowed),
+            toolsets=list(visibility.toolsets(registry)),
+            denied=dict(visibility.denied),
+            plugins=list(plugins.allowed),
+            denied_plugins=dict(plugins.denied),
+        )
+    return CapabilitiesOut(modes=modes)
+
+
 @router.get("/quota", response_model=QuotaSummary, summary="读取我的额度剩余")
 async def get_my_quota(
     user: Annotated[User, Depends(get_authenticated_user)],
@@ -60,6 +139,46 @@ async def get_my_quota(
 ) -> QuotaSummary:
     summary = await QuotaService(session).get_quota_summary(user.id)
     return QuotaSummary(**summary)
+
+
+@router.get("/events", summary="SSE：实时推送额度到账等事件")
+async def stream_my_events(
+    request: Request,
+    user_id: Annotated[str, Depends(get_stream_user_id)],
+) -> StreamingResponse:
+    """登录态 SSE 长连接。充值到账后服务端主动推送，前端无需轮询或刷新。
+
+    约定：
+    - 事件名即 `type`（如 `quota.credited`），`data` 为 JSON。
+    - 空闲每 15 秒发一次注释帧 `: ping` 保活，避免代理断连。
+    - 客户端断开或服务重启后连接结束，由前端按退避策略重连。
+
+    鉴权刻意用 `get_stream_user_id`（自带短事务）而不是 `get_authenticated_user`：
+    后者借的是请求级数据库连接，要等响应结束才归还，而这条响应在客户端断开前
+    永远不会结束——那样每条 SSE 都会长期占住一个连接池名额，几个页签就能把池子
+    抽干，之后所有请求都卡在等连接上（前端表现为「页面卡死」）。
+    """
+
+    async def body() -> AsyncIterator[bytes]:
+        # 首帧尽快让代理与浏览器确认握手成功，前端据此把状态切到「已连接」。
+        yield b": connected\n\n"
+        async for event in subscribe_recharge_events(user_id):
+            # 服务重启/进程关闭时 uvicorn 会先标记连接断开，这里及时收尾，
+            # 避免长连接把优雅关闭一直拖住。
+            if await request.is_disconnected():
+                break
+            if event is None:
+                yield b": ping\n\n"
+                continue
+            frame = f"event: {event.get('type', 'message')}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+            yield frame.encode("utf-8")
+
+    headers = {
+        "Cache-Control": "no-cache",
+        # 关闭 nginx 等反向代理的响应缓冲，否则事件会被攒着一起下发。
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(body(), media_type="text/event-stream", headers=headers)
 
 
 @router.get("/usage", response_model=UsageListResponse, summary="读取我的额度消耗明细")
@@ -188,6 +307,25 @@ async def report_my_usage(
     return QuotaSummary(**summary)
 
 
+def _tool_registry(request: Request) -> ToolRegistry:
+    service = getattr(request.app.state, "chat_service", None)
+    tools = getattr(service, "ask_tools", None)
+    registry = getattr(tools, "registry", None)
+    return registry if registry is not None else build_agent_registry()
+
+
+async def _owned_workspaces(session, user_id) -> frozenset[str]:
+    rows = await session.scalars(
+        select(ResourceGrant.resource_id).where(
+            ResourceGrant.user_id == user_id,
+            ResourceGrant.resource_type == "workspace",
+            ResourceGrant.grant_type == "allow",
+            ResourceGrant.revoked_at.is_(None),
+        )
+    )
+    return frozenset(str(item) for item in rows if is_user_scope(str(item)))
+
+
 def _usage_record_out(record) -> UsageRecordOut:
     ctx = record.context_json or {}
     # 兼容历史数据：旧版以 total_tokens 作为 metric，统一归为「对话」。
@@ -284,4 +422,23 @@ async def update_avatar(
     return AvatarStatusOut(
         avatar=user.avatar,
         remaining=await service.remaining(user),
+    )
+
+
+@router.put("/username", response_model=UserOut, summary="修改我的用户名")
+async def update_username(
+    body: ChangeUsernameRequest,
+    user: Annotated[User, Depends(get_authenticated_user)],
+    session: DbSession,
+) -> UserOut:
+    """修改用户名后回传最新的用户信息，前端据此同步本地 store。"""
+    await AuthService(session).change_username(user, body.username)
+    return UserOut(
+        id=user.id,
+        email=user.email,
+        username=user.username,
+        display_name=user.display_name,
+        status=user.status,
+        avatar=user.avatar,
+        phone=user.phone,
     )

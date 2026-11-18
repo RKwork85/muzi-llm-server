@@ -136,6 +136,19 @@ def test_plan_approval_mode_switch_and_execution_authorization_are_distinct_cont
     assert authorization.expected_revision == 5
 
 
+def test_single_gate_still_requires_execution_authorization_id() -> None:
+    """单次门收敛三次往返，但执行授权审计标识（authorization_id）仍是必填。"""
+    from app.planning.contracts import ApproveAndExecuteRequest
+
+    gate = ApproveAndExecuteRequest.model_validate(
+        {"expected_revision": 4, "authorization_id": "auth_12345"}
+    )
+    assert gate.expected_revision == 4
+    # 缺 authorization_id 拒绝：确认计划不能绕过执行授权审计。
+    with pytest.raises(ValidationError):
+        ApproveAndExecuteRequest.model_validate({"expected_revision": 4})
+
+
 def test_handoff_requires_explicit_revalidation_and_steps() -> None:
     handoff = PlanHandoff.model_validate(
         {

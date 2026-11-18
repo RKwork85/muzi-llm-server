@@ -261,10 +261,15 @@ class ToolExecutor:
 
 
 def _tool_budget(clock: RunClock, spec: ToolSpec, now: float | None) -> float:
-    budget = clock.tool_timeout(now)
-    if spec.timeout_s is not None:
-        budget = min(budget, spec.timeout_s)
-    return budget
+    """单次工具预算：优先用工具自己声明的 timeout_s，再受总时限约束。
+
+    之前直接取 ``clock.tool_timeout()``（= ``tool_timeout_seconds``，默认 2 秒），
+    于是 ``execute_skill_script`` / ``run_python`` 这类秒级工具在通道 B 里几乎必超时，
+    看起来像「技能没真正执行」。
+    """
+    remaining = clock.remaining(now)
+    declared = spec.timeout_s if spec.timeout_s is not None else clock.policy.tool_timeout_seconds
+    return min(float(declared), remaining)
 
 
 def _parse_object(arguments: str) -> dict[str, Any]:

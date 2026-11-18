@@ -172,6 +172,23 @@ class MeResponse(BaseModel):
     data_scope: str = "self"
 
 
+class ModeCapabilitiesOut(BaseModel):
+    """某个模式下实际可用的工具、工具集与 `/` 插件面板。"""
+
+    tools: list[str] = Field(default_factory=list)
+    toolsets: list[str] = Field(default_factory=list)
+    # 工具名 → 不可用原因（mode_not_offered / permission_missing / ...）。
+    denied: dict[str, str] = Field(default_factory=dict)
+    # `/` 面板插件 id（与前端 SLASH_PLUGINS 对应）。
+    plugins: list[str] = Field(default_factory=list)
+    # 插件 id → 不可用原因（permission_missing / capability_missing）。
+    denied_plugins: dict[str, str] = Field(default_factory=dict)
+
+
+class CapabilitiesOut(BaseModel):
+    modes: dict[str, ModeCapabilitiesOut] = Field(default_factory=dict)
+
+
 class QuotaSummary(BaseModel):
     quota_key: str
     limit_value: int

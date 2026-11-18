@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from app.agents.models import TaskStatus, ToolExecutionStatus
+from app.content.states import TaskStage as ContentTaskStage
+from app.content.states import TaskStatus as ContentTaskStatus
 
 USER_STATUSES = ("active", "disabled")
 ROLE_STATUSES = ("active", "disabled")
@@ -28,6 +30,11 @@ TASK_TYPES = ("chat", "agent")
 TASK_STATUSES = tuple(status.value for status in TaskStatus)
 EXECUTION_STATUSES = ("pending", "running", "succeeded", "failed", "cancelled")
 TOOL_CALL_STATUSES = ("running", *(status.value for status in ToolExecutionStatus))
+
+# 内容创作任务（app/content 板块）。
+CONTENT_TASK_STATUSES = tuple(status.value for status in ContentTaskStatus)
+CONTENT_TASK_STAGES = tuple(stage.value for stage in ContentTaskStage)
+CONTENT_DELIVER_TYPES = ("image-text", "note", "video")
 
 
 def sql_in(column: str, values: tuple[str, ...]) -> str:

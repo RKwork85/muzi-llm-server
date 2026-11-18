@@ -15,7 +15,7 @@ from app.agents.executor import ToolExecutor
 from app.agents.loop import AgentLoop
 from app.agents.models import TaskStatus
 from app.agents.policy import PolicyError, RunClock, default_server_policy, server_policy_from_settings
-from app.agents.toolsets import resolve_tool_names
+from app.agents.toolsets import agent_tool_names
 from app.tools.registry import ToolRegistry, ToolSpec, build_default_registry
 from tests.conftest import make_settings
 from tests.fakes import FakeProvider, make_result, make_tool_call
@@ -54,30 +54,32 @@ def test_write_access_is_rejected_and_high_risk_stays_rejected() -> None:
 
 
 def test_unknown_and_disabled_toolsets() -> None:
+    from app.agents.policy import basic_tool_names
+
     registry = build_default_registry()
     settings = make_settings()
     with pytest.raises(PolicyError) as unknown:
-        resolve_tool_names(registry, settings, ["nope"])
+        agent_tool_names(registry, settings, ["nope"])
     assert unknown.value.code == "TOOLSET_UNKNOWN"
     with pytest.raises(PolicyError) as disabled:
-        resolve_tool_names(registry, settings, ["mcp"])
+        agent_tool_names(registry, settings, ["mcp"])
     assert disabled.value.code == "TOOLSET_UNAVAILABLE"
     with pytest.raises(PolicyError) as offline:
-        resolve_tool_names(registry, settings, ["basic", "research"])
+        agent_tool_names(registry, settings, ["basic", "research"])
     assert offline.value.code == "TOOLSET_UNAVAILABLE"
-    assert resolve_tool_names(registry, settings, None) == ("calculator", "get_current_time")
+    assert basic_tool_names(registry) == ("calculator", "get_current_time")
     enabled = make_settings(tools_network_enabled=True)
-    assert resolve_tool_names(registry, enabled, ["research"]) == ()
+    assert agent_tool_names(registry, enabled, ["research"]) == ()
 
 
 def test_workspace_root_cannot_be_the_project_root(tmp_path) -> None:
     registry = build_default_registry()
     blocked = make_settings(tools_workspace_root=".")
     with pytest.raises(PolicyError) as caught:
-        resolve_tool_names(registry, blocked, ["workspace"])
+        agent_tool_names(registry, blocked, ["workspace"])
     assert caught.value.code == "TOOLSET_UNAVAILABLE"
     opened = make_settings(tools_workspace_root=str(tmp_path))
-    assert resolve_tool_names(registry, opened, ["workspace"]) == ()
+    assert agent_tool_names(registry, opened, ["workspace"]) == ()
 
 
 def test_artifact_summary_drops_body_and_enforces_count() -> None:
@@ -265,7 +267,9 @@ async def test_network_queue_time_can_expire_the_budget() -> None:
         )
     )
     await started.wait()
-    short = policy.model_copy(update={"tool_timeout_seconds": 0.05, "max_wall_time_seconds": 30})
+    # 工具队列等待必须消耗「本次运行」的剩余时限；这里用极小的总时限复现，
+    # 而不是压缩 tool_timeout_seconds——后者只是未声明超时的工具的默认值。
+    short = policy.model_copy(update={"max_wall_time_seconds": 0.05})
     second = await executor.execute(
         tool_call_id="call_wait",
         tool_name="web_search",

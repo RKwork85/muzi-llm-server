@@ -77,7 +77,7 @@ sequenceDiagram
 |---|---|---|---|
 | `agents.create_run` | HTTP JSON | `AgentTaskResponse` | 不决策、不执行 |
 | `AgentRuntime.start` | `AgentRequest`、request id | 任务视图；另起后台任务 | 装配策略和提示词 |
-| `resolve_tool_names` | 注册表、Settings、toolsets | 工具名元组，或 `PolicyError` | 权限的第一道门 |
+| `agent_tool_names` | 注册表、Settings、toolsets、执行上下文 | 工具名元组，或 `PolicyError` | 唯一的权限投影入口：可见即授权 |
 | `merge_execution_policy` | 服务端 `ExecutionPolicy`、请求 | 更严的策略 | 权限的数值和名单收紧 |
 | `PromptService.render` | 模板名 | 系统提示词 | 不参与工具选择 |
 | `ContextManager.render` | 已累积的消息和策略预算 | 发给模型的消息列表 | 裁剪，不决策 |

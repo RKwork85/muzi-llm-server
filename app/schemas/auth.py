@@ -58,6 +58,17 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(max_length=128)
 
 
+class ChangeUsernameRequest(BaseModel):
+    """修改用户名。实际格式校验在服务层完成，保证与注册时的规则完全一致。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str = Field(
+        max_length=32,
+        description="2-32 个字符，以字母或汉字开头，可包含字母、汉字、数字和下划线",
+    )
+
+
 class UserOut(BaseModel):
     id: UUID
     email: str

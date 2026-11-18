@@ -83,6 +83,34 @@ class PersistentPlanDecision(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True, server_default=text("true"))
 
 
+class PersistentPlanTodo(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """执行期清单项。
+
+    与 plans 是一对多，但**不属于** PlanSnapshot：todo 变更不修改
+    plans.current_revision，避免执行期进度让带 expected_revision 的动作全部失效。
+    """
+
+    __tablename__ = "plan_todos"
+    __table_args__ = (
+        CheckConstraint("status IN ('pending', 'in_progress', 'completed', 'cancelled')", name="ck_plan_todos_status"),
+        UniqueConstraint("plan_id", "todo_id", name="uq_plan_todos_plan_todo"),
+        Index("ix_plan_todos_plan_position", "plan_id", "position"),
+        {"comment": "Execution checklist item; independent of plan revision."},
+    )
+
+    plan_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("plans.id", name="fk_plan_todos_plan_id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    todo_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    content: Mapped[str] = mapped_column(String(2000), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
+    position: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    depends_on: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    source_plan_revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+
 class PersistentInteraction(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "plan_interactions"
     __table_args__ = (
