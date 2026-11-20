@@ -76,6 +76,14 @@ _PLANNING_ERROR_MESSAGES = {
 }
 
 
+def _render_plan_instructions() -> str:
+    """读取 plan_mode.md 作为规划引擎的统一行为提示词；缺失时退回空串。"""
+    try:
+        return PromptService().render("plan_mode")
+    except Exception:  # noqa: BLE001 - 提示词缺失不应阻断规划主流程
+        return ""
+
+
 class SqlPlanningStore:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
@@ -249,6 +257,7 @@ class SqlPlanningStore:
             provider,
             model=settings.deepseek_model,
             timeout_seconds=settings.deepseek_timeout_seconds,
+            plan_instructions=_render_plan_instructions(),
         )
         proposal = await engine.propose(goal=current.goal, user_message=message, plan=current, history=history)
         await self._settle_plan(owner, engine, plan_id, current.revision, str(row.conversation_id))
@@ -268,8 +277,10 @@ class SqlPlanningStore:
         message: str,
         provider: LLMProvider,
         settings: Settings,
+        tool_service: Any | None = None,
+        allowed_tools: tuple[str, ...] = (),
     ):
-        """流式继续规划对话。逐段产出 SSE 帧：delta（说明文字打字机）→ plan / interaction → done。"""
+        """流式继续规划对话。逐段产出 SSE 帧：tool（只读研究）→ delta → plan / interaction → done。"""
         from app.core.sse import format_sse
         from app.planning.runtime import PlanningDecisionEngine
 
@@ -288,6 +299,9 @@ class SqlPlanningStore:
             provider,
             model=settings.deepseek_model,
             timeout_seconds=settings.deepseek_timeout_seconds,
+            plan_instructions=_render_plan_instructions(),
+            tool_service=tool_service,
+            allowed_tools=allowed_tools,
         )
 
         proposal: DecisionProposal | None = None
@@ -301,6 +315,8 @@ class SqlPlanningStore:
                     yield format_sse("delta", {"content": payload})
                 elif event == "interaction_pending":
                     yield format_sse("interaction_pending", {"action": payload})
+                elif event == "tool":
+                    yield format_sse("tool", payload)
                 elif event == "error":
                     yield format_sse("error", {"error": {"code": payload, "message": _PLANNING_ERROR_MESSAGES.get(payload, "规划请求失败")}})
                     return

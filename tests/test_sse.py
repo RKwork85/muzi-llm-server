@@ -89,18 +89,16 @@ def test_stream_keeps_the_last_usage_in_a_round(client: TestClient, provider: Fa
     assert '"total_tokens":6' not in body
 
 
-def test_plan_stream_injects_plan_mode_prompt(app, provider: FakeProvider) -> None:
-    from app.services.prompt_service import PromptService
-
+def test_plan_stream_no_longer_injects_plan_mode_prompt(app, provider: FakeProvider) -> None:
+    """Plan 已收敛到交互式规划子系统：对话通道不再注入 plan_mode.md、不再挂载工具。"""
     service = _service(app, provider)
     request = StreamChatRequest.model_validate(chat_payload(mode="plan"))
     prepared = service.prepare_stream(request)
 
     system = prepared.provider_request.messages[0]["content"]
-    assert "Interactive Planning Agent" in system
-    assert PromptService().render("plan_mode")[:40] in system
-    # 文件存在时不应再拼上内置的精简说明
-    assert "你处于 Plan 模式。只能使用只读工具了解情况" not in system
+    assert "Interactive Planning Agent" not in system
+    assert prepared.allowed_tools == ()
+    assert prepared.provider_request.tools is None
 
 
 def test_ask_stream_does_not_inject_plan_mode_prompt(app, provider: FakeProvider) -> None:

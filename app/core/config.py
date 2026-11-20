@@ -97,6 +97,17 @@ class Settings(BaseSettings):
     sandbox_network_enabled: bool = True
     # 沙盒能否看到用户工作区（只读挂载 / 路径透出）。
     sandbox_workspace_access: bool = True
+    # 沙盒产物出口：只有 MUZI_OUTPUT 目录的写入会保留并可交付。
+    sandbox_output_max_files: int = Field(default=20, ge=1, le=100)
+    sandbox_output_max_bytes: int = Field(
+        default=20 * 1024 * 1024, ge=1024, le=200 * 1024 * 1024
+    )
+    # local 后端把工作区复制成只读快照再交给子进程；超过上限就不复制，
+    # 退回真实路径（此时只读靠工具描述约定，不阻断读取）。
+    sandbox_workspace_mirror_max_bytes: int = Field(
+        default=32 * 1024 * 1024, ge=0, le=512 * 1024 * 1024
+    )
+    sandbox_workspace_mirror_max_files: int = Field(default=1000, ge=0, le=10000)
     # 依赖安装总闸门：关闭后运行时不再跑 pip（已装在执行环境里的包仍可 import）。
     sandbox_dependencies_enabled: bool = True
     sandbox_dependency_allowlist: str = (
@@ -140,6 +151,8 @@ class Settings(BaseSettings):
     oss_upload_base_url: str = ""
     oss_upload_prefix: str = "agent-data"
     oss_upload_timeout_seconds: float = Field(default=20, gt=0, le=30)
+    # 网关开了 API_TOKEN 时必须一致，否则写接口 401。
+    oss_upload_token: str = ""
     mcp_enabled: bool = False
     mcp_server_name: str = "server"
     mcp_command: str = ""

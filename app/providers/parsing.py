@@ -8,7 +8,9 @@ from typing import Any
 from app.core.exceptions import InvalidModelResponseError
 from app.providers.base import CompletionResult, StreamChunk, ToolCall, UsageStats
 
-_MAX_TOOL_CALLS = 5
+# 结构性 sanity 上限，不是业务策略。模型一轮并行发多个工具调用是合法的，
+# 这里只防止解析出病态数量的调用（例如流式重复拼接导致爆炸）。
+_MAX_TOOL_CALLS = 128
 
 
 def read_field(obj: Any, name: str, default: Any = None) -> Any:

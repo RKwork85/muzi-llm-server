@@ -23,7 +23,7 @@ from app.agents.toolsets import agent_tool_names
 from app.agents.provider_adapter import redact_exception
 from app.agents.task_manager import TaskManager, TaskRecord
 from app.core.config import Settings
-from app.data.context import CURRENT_DATA_STORE, CURRENT_OSS_CLIENT, CURRENT_TASK_ID
+from app.data.context import CURRENT_DATA_STORE, CURRENT_OSS_CLIENT, CURRENT_TASK_ID, CURRENT_USER_ID
 from app.data.oss_client import oss_client_from_settings
 from app.data.store import DataStore
 from app.core.exceptions import AgentPolicyRejectedError, AgentTaskLimitError, AgentTaskNotFoundError
@@ -311,6 +311,7 @@ class AgentRuntime:
         task_token = CURRENT_TASK_ID.set(record.task_id)
         store_token = CURRENT_DATA_STORE.set(self._data_store)
         oss_token = CURRENT_OSS_CLIENT.set(self._oss_client)
+        oss_user_token = CURRENT_USER_ID.set(mcp_user_id)
         scope_token = (
             CURRENT_WORKSPACE_SCOPE.set(workspace_scope) if workspace_scope is not None else None
         )
@@ -339,6 +340,7 @@ class AgentRuntime:
             CURRENT_MCP_USER.reset(user_token)
             if scope_token is not None:
                 CURRENT_WORKSPACE_SCOPE.reset(scope_token)
+            CURRENT_USER_ID.reset(oss_user_token)
             CURRENT_OSS_CLIENT.reset(oss_token)
             CURRENT_DATA_STORE.reset(store_token)
             CURRENT_TASK_ID.reset(task_token)

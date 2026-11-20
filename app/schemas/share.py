@@ -41,4 +41,6 @@ class SharePublicResponse(ApiContract):
     snapshot: dict[str, Any]
     source_name: str
     source_username: str | None = None
+    source_avatar: str | None = None
+    source_id: str | None = None
     created_at: datetime

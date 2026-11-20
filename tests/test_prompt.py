@@ -38,23 +38,20 @@ def test_plan_mode_prompt_is_loaded() -> None:
     assert "plan_mode" in service.names()
 
 
-def test_plan_mode_prompt_is_injected_only_for_plan() -> None:
-    from app.services.chat_service import ChatService, _mode_prompt
+def test_plan_mode_prompt_is_not_injected_by_chat() -> None:
+    """Plan 已收敛到交互式规划子系统：对话通道不再注入 plan_mode 说明。"""
+    from app.services.chat_service import _mode_prompt
 
-    service = object.__new__(ChatService)
-    service.prompts = PromptService()
-    plan_text = _mode_prompt("plan", [], service._plan_instructions())
-    assert "Interactive Planning Agent" in plan_text
-    assert "只读" in plan_text
+    assert _mode_prompt("plan", []) == ""
     # Ask 与 Agent 不应拼上 Plan 的说明
-    assert _mode_prompt("ask", [], service._plan_instructions()) == ""
+    assert _mode_prompt("ask", []) == ""
 
 
 def test_ask_mode_still_injects_slash_plugin_notes() -> None:
     """ask 没有技能脚本，但 `/` 选中的插件说明必须注入，否则前端选了等于没选。"""
     from app.services.chat_service import _mode_prompt
 
-    text = _mode_prompt("ask", ["pdf", "word"], "")
+    text = _mode_prompt("ask", ["pdf", "word"])
     assert "PDF 文档处理" in text
     assert "Word 文档处理" in text
     # ask 走内置工具：不能出现「按这些做法完成任务」这种执行口吻
@@ -63,31 +60,11 @@ def test_ask_mode_still_injects_slash_plugin_notes() -> None:
     assert "Plan 模式" not in text
 
 
-def test_plan_mode_plugin_notes_are_reference_only() -> None:
-    from app.services.chat_service import ChatService, _mode_prompt
-
-    service = object.__new__(ChatService)
-    service.prompts = PromptService()
-    text = _mode_prompt("plan", ["pdf"], service._plan_instructions())
-    assert "PDF 文档处理" in text
-    assert "只作为计划参考" in text
-
-
 def test_agent_mode_plugin_notes_require_execution() -> None:
     from app.services.chat_service import _mode_prompt
 
-    text = _mode_prompt("agent", ["pdf"], "")
+    text = _mode_prompt("agent", ["pdf"])
     assert "按这些做法完成任务" in text
-
-
-def test_plan_prompt_falls_back_when_file_missing(tmp_path: Path) -> None:
-    from app.services.chat_service import ChatService, _mode_prompt
-
-    service = object.__new__(ChatService)
-    service.prompts = PromptService(tmp_path)
-    assert service._plan_instructions() == ""
-    fallback = _mode_prompt("plan", [], service._plan_instructions())
-    assert "你处于 Plan 模式" in fallback
 
 
 def test_unknown_prompt_name() -> None:

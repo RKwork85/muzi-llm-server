@@ -87,7 +87,11 @@ def test_capability_matrix_projects_tools_from_permissions(tmp_path) -> None:
 
 
 def test_ask_mode_masks_skill_tools(tmp_path) -> None:
-    """Ask 模式屏蔽 Skill：不暴露发现/加载/读取技能工具，Agent 与 Plan 保持原有能力。"""
+    """Ask 模式屏蔽 Skill：不暴露发现/加载/读取技能工具；Agent 保持完整能力。
+
+    Plan 已收敛到交互式规划子系统（app/planning），对话通道按兼容口径返回空名单，
+    只读工具由规划引擎按 PLAN_TOOLS 白名单挂载。
+    """
     registry = build_agent_registry()
     settings = make_settings(skills_root=str(tmp_path / "skills"))
     ask = set(chat_mode_tool_names(registry, settings, "ask"))
@@ -98,10 +102,7 @@ def test_ask_mode_masks_skill_tools(tmp_path) -> None:
     agent = set(chat_mode_tool_names(registry, settings, "agent"))
     assert {"discover_skills", "load_skill", "read_skill_resource"} <= agent
 
-    plan = set(chat_mode_tool_names(registry, settings, "plan"))
-    assert "discover_skills" in plan
-    assert "load_skill" not in plan
-    assert "read_skill_resource" not in plan
+    assert chat_mode_tool_names(registry, settings, "plan") == ()
 
 
 def test_explicit_workspace_toolset_does_not_grant_write_or_delete(tmp_path) -> None:

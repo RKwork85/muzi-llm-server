@@ -112,13 +112,109 @@ class AuthorizationService:
         return list(rows)
 
     async def snapshot(self, user_id: uuid.UUID | str) -> PermissionSnapshot:
+        """单个用户的有效权限快照。
+
+        与 ``snapshot_many`` 保持语义一致，用于单用户场景（/me、详情、写操作后回显）。
+        """
         roles = await self.get_user_roles(user_id)
-        permissions = await self.get_effective_permissions(user_id)
+        if SUPER_ADMIN_ROLE_CODE in roles:
+            return PermissionSnapshot(
+                roles=tuple(roles),
+                permissions=frozenset(PERMISSION_BY_CODE),
+                data_scope="all",
+            )
+        denied, granted = await self._resolve(user_id)
         return PermissionSnapshot(
             roles=tuple(roles),
-            permissions=frozenset(permissions),
-            data_scope=await self.get_data_scope(user_id),
+            permissions=frozenset(granted - denied),
+            data_scope="all" if ADMIN_ROLE_CODE in roles else "self",
         )
+
+    async def snapshot_many(
+        self, user_ids: list[uuid.UUID | str]
+    ) -> dict[str, PermissionSnapshot]:
+        """批量计算多个用户的有效权限快照，避免列表页 N+1 查询。
+
+        一次查出所有目标用户的活动角色、角色权限与用户级授权，在内存中分组，
+        语义与逐用户 ``snapshot`` 完全一致。返回 key 为 ``str(user_id)``。
+        """
+        if not user_ids:
+            return {}
+        ids: list[uuid.UUID] = [
+            u if isinstance(u, uuid.UUID) else uuid.UUID(str(u)) for u in user_ids
+        ]
+        keys = [str(u) for u in ids]
+
+        # 1) 所有目标用户的活动角色（role id + code）
+        role_rows = await self.session.execute(
+            select(UserRole.user_id, Role.id, Role.code)
+            .join(Role, Role.id == UserRole.role_id)
+            .where(UserRole.user_id.in_(ids), Role.status == "active")
+            .order_by(Role.code)
+        )
+        roles_by_user: dict[str, list[str]] = {k: [] for k in keys}
+        role_ids_by_user: dict[str, list[uuid.UUID]] = {k: [] for k in keys}
+        all_role_ids: set[uuid.UUID] = set()
+        for uid, role_id, code in role_rows:
+            uk = str(uid)
+            roles_by_user.setdefault(uk, []).append(code)
+            role_ids_by_user.setdefault(uk, []).append(role_id)
+            all_role_ids.add(role_id)
+
+        # 2) 这些角色携带的权限
+        perms_by_role: dict[uuid.UUID, set[str]] = {}
+        if all_role_ids:
+            perm_rows = await self.session.execute(
+                select(RolePermission.role_id, Permission.code)
+                .join(Permission, Permission.id == RolePermission.permission_id)
+                .where(RolePermission.role_id.in_(all_role_ids))
+            )
+            for role_id, code in perm_rows:
+                perms_by_role.setdefault(role_id, set()).add(code)
+
+        # 3) 用户级显式授权/拒绝
+        now = utcnow()
+        user_perm_rows = await self.session.execute(
+            select(
+                UserPermission.user_id,
+                Permission.code,
+                UserPermission.grant_type,
+                UserPermission.expires_at,
+            )
+            .join(Permission, Permission.id == UserPermission.permission_id)
+            .where(UserPermission.user_id.in_(ids))
+        )
+        user_granted: dict[str, set[str]] = {k: set() for k in keys}
+        user_denied: dict[str, set[str]] = {k: set() for k in keys}
+        for uid, code, grant_type, expires_at in user_perm_rows:
+            if expires_at is not None and expires_at <= now:
+                continue
+            uk = str(uid)
+            if grant_type == "deny":
+                user_denied.setdefault(uk, set()).add(code)
+            else:
+                user_granted.setdefault(uk, set()).add(code)
+
+        # 4) 组装快照
+        result: dict[str, PermissionSnapshot] = {}
+        for uk in keys:
+            roles = tuple(roles_by_user.get(uk, []))
+            if SUPER_ADMIN_ROLE_CODE in roles:
+                permissions = frozenset(PERMISSION_BY_CODE)
+                data_scope = "all"
+            else:
+                granted: set[str] = set()
+                for role_id in role_ids_by_user.get(uk, []):
+                    granted |= perms_by_role.get(role_id, set())
+                granted |= user_granted.get(uk, set())
+                permissions = frozenset(granted - user_denied.get(uk, set()))
+                data_scope = "all" if ADMIN_ROLE_CODE in roles else "self"
+            result[uk] = PermissionSnapshot(
+                roles=roles,
+                permissions=permissions,
+                data_scope=data_scope,
+            )
+        return result
 
     async def get_data_scope(self, user_id: uuid.UUID | str) -> str:
         if await self._is_super_admin(user_id):

@@ -25,6 +25,7 @@ from app.tools.sandbox import (
     SandboxTimeoutError,
     get_provider,
 )
+from app.tools.sandbox import outputs
 from app.tools.web_tools import CURRENT_SETTINGS
 
 MAX_TIMEOUT_SECONDS = 60
@@ -63,6 +64,8 @@ def run_python(args: PythonArgs) -> str:
         dependencies=tuple(args.dependencies),
     )
     try:
+        # 产物出口在执行前拍快照：只把本次新写进 MUZI_OUTPUT 的文件报给模型。
+        before = outputs.snapshot(settings)
         result = get_provider(settings).run(spec)
     except SandboxTimeoutError as exc:
         return _error(
@@ -70,20 +73,20 @@ def run_python(args: PythonArgs) -> str:
             f"代码执行超过 {spec.timeout:.0f} 秒被中止；下面是中止前已产生的输出。",
             partial=exc.partial_output,
             timeout=spec.timeout,
+            extra=outputs.collect(settings, before),
         )
     except SandboxDependencyRejected as exc:
         return _error(exc.code, exc.message)
     except SandboxExecutionError:
         return _error("code_failed", "代码执行失败")
-    return json.dumps(
-        {
-            "language": "python",
-            "exit_code": result.exit_code,
-            "output": result.output,
-            "truncated": result.truncated,
-        },
-        ensure_ascii=False,
-    )
+    payload: dict[str, object] = {
+        "language": "python",
+        "exit_code": result.exit_code,
+        "output": result.output,
+        "truncated": result.truncated,
+    }
+    payload.update(outputs.collect(settings, before))
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _timeout(settings, requested: int | None) -> float:
@@ -94,11 +97,20 @@ def _timeout(settings, requested: int | None) -> float:
     return max(1.0, min(wanted, ceiling))
 
 
-def _error(code: str, message: str, *, partial: str = "", timeout: float = 0.0) -> str:
+def _error(
+    code: str,
+    message: str,
+    *,
+    partial: str = "",
+    timeout: float = 0.0,
+    extra: dict[str, object] | None = None,
+) -> str:
     payload: dict[str, object] = {"error": {"code": code, "message": message}}
     if partial.strip():
         payload["output"] = partial
         payload["partial"] = True
     if timeout:
         payload["timeout_seconds"] = timeout
+    if extra:
+        payload.update(extra)
     return json.dumps(payload, ensure_ascii=False)

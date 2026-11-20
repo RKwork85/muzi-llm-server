@@ -42,7 +42,7 @@ from app.planning.contracts import (
     can_transition_plan,
 )
 from app.planning import revisions
-from app.providers.base import CompletionResult, LLMProvider, ProviderChatRequest
+from app.providers.base import CompletionResult, LLMProvider, ProviderChatRequest, ToolCall
 from app.tools.capabilities import PLAN_TOOLS
 from app.tools.registry import ToolRegistry
 
@@ -1009,12 +1009,30 @@ class InteractionOrchestrator:
 
 
 class PlanningDecisionEngine:
-    """Ask the shared LLM for a structured proposal; never execute its actions."""
+    """Ask the shared LLM for a structured proposal; never execute its actions.
 
-    def __init__(self, provider: LLMProvider, *, model: str, timeout_seconds: float = 60) -> None:
+    支持「研究 + 提案」循环：规划阶段可用只读工具（PLAN_TOOLS）探查工作区/代码库，
+    再把最终决策写成 DecisionProposal。工具执行只读，服务端按白名单兜底校验。
+    """
+
+    def __init__(
+        self,
+        provider: LLMProvider,
+        *,
+        model: str,
+        timeout_seconds: float = 60,
+        plan_instructions: str = "",
+        tool_service: Any | None = None,
+        allowed_tools: tuple[str, ...] = (),
+        max_tool_rounds: int = 6,
+    ) -> None:
         self._provider = provider
         self._model = model
         self._timeout_seconds = timeout_seconds
+        self._plan_instructions = plan_instructions
+        self._tool_service = tool_service
+        self._allowed_tools = allowed_tools
+        self._max_tool_rounds = max_tool_rounds
         self.prompt_tokens = 0
         self.completion_tokens = 0
         self.total_tokens = 0
@@ -1023,6 +1041,12 @@ class PlanningDecisionEngine:
         self.cache_write_tokens = 0
         self.last_messages: list[dict[str, Any]] = []
         self.last_output_text = ""
+
+    def _tool_schemas(self) -> list[dict[str, Any]] | None:
+        """规划期只读工具的 OpenAI schema；无工具服务时返回 None。"""
+        if self._tool_service is None or not self._allowed_tools:
+            return None
+        return self._tool_service.schemas_for(list(self._allowed_tools))
 
     def _note_usage(self, usage) -> None:
         if usage is None:
@@ -1045,127 +1069,8 @@ class PlanningDecisionEngine:
             DecisionAction.UPDATE_PLAN.value,
             DecisionAction.REQUEST_APPROVAL.value,
         ]
-        system_prompt = (
-            "You are the assistant behind this app's Plan mode. Plan mode is a normal, "
-            "high-quality conversation: the user talks to you, you answer, and you think "
-            "through the problem together. A written plan is a tool you may use when it helps — "
-            "it is NOT a required deliverable. Many turns and many whole conversations end with "
-            "ordinary answers, and that is correct behavior.\n\n"
-            "When you need information from the user, collect it through the app's registered UI "
-            "interaction components (listed below) instead of a wall of questions in plain text.\n\n"
-            "Return exactly one JSON object conforming to this schema (the server validates it "
-            "strictly):\n"
-            f"{json.dumps(proposal_schema, ensure_ascii=False, separators=(',', ':'))}\n\n"
-            "ACTIONS — pick the one this turn actually needs:\n"
-            "  · respond (DEFAULT) — answer, explain, compare, recommend, discuss, or chat "
-            "normally in \"response\". This is right for the vast majority of turns: questions, "
-            "follow-ups, clarifications, opinions, small talk, and any answer that needs nothing "
-            "from the user. Never attach steps, a goal, or a review card just to look productive.\n"
-            "  · ask_user — you genuinely need a decision or fact from the user before you can "
-            "answer well or continue, and a card collects it more comfortably than free text. "
-            "Put ONE focused question in the interaction card; use \"response\" for the short "
-            "sentence that introduces it.\n"
-            "  · update_plan — the user asked you to write or revise a plan. Fill "
-            "goal/steps/assumptions and explain the draft in \"response\".\n"
-            "  · request_approval — the user asked to finalize/review a plan you already "
-            "drafted, or confirmed a draft is ready. The server turns it into the review card.\n"
-            "Never choose ready_for_handoff (approval, mode switch, and execution authorization "
-            "are separate user actions).\n\n"
-            "WHEN NOT TO PRODUCE A PLAN:\n"
-            "  · Do not end every turn — or every conversation — with update_plan or "
-            "request_approval. A normal answer, an explanation, a recommendation, or a single "
-            "clarifying question is a complete, valid turn.\n"
-            "  · Draft a plan only when the user asks for one (\"给我个方案\", \"写个计划\", "
-            "\"怎么排期\", \"列个步骤\", how would you build/arrange X), or when they ask to "
-            "change an existing draft. If it is unclear whether they want a plan, ask in plain "
-            "text instead of producing one.\n"
-            "  · When the user asks a factual question, wants your opinion, wants an explanation "
-            "of code or a design, or is just chatting, answer it directly — do not convert it "
-            "into requirements gathering.\n"
-            "  · If the user says 你决定 / 随便 / 你推荐, decide, explain why, and continue. "
-            "Do not keep asking.\n\n"
-            "REGISTERED UI INTERACTION COMPONENTS — when you ask the user for information "
-            "(action=\"ask_user\"), put the question(s) into the interaction card using ONE of "
-            "these registered component types. The client renders only these; any other "
-            "interaction.type is rejected, and a question left only in the response text will not "
-            "be collectable:\n"
-            "  · single_select — pick one of a small set of options (radio group).\n"
-            "  · multi_select — pick some options from a set (checkboxes).\n"
-            "  · text_input — one short single-line answer.\n"
-            "  · text_area — one longer multi-line answer.\n"
-            "  · confirmation — a yes/no gate.\n"
-            "  · form — collect a SMALL number of strongly-coupled hard constraints in one card "
-            "(at most 5 fields, and only when they must be answered together); each field is "
-            "text / textarea / number / single_select / multi_select. The client shows form "
-            "fields one step at a time, so keep the field list short.\n"
-            "Write prompt, option labels, descriptions, and form field labels in the user's "
-            "language.\n\n"
-            "CARD COPY — write the card like a restrained product surface, not like a friend "
-            "chatting:\n"
-            "  · prompt: ask the decision itself, one neutral sentence, short (roughly <= 30 "
-            "Chinese characters, similar in other languages). Never characterize, judge, or "
-            "diagnose the user's feelings, personality, or situation (avoid wording like "
-            "\"你整个人是懵的\", \"心气问题\", \"最真实的处境\"); ask about the choice, not "
-            "about the person.\n"
-            "  · description: optional, at most ONE short sentence on why this decision matters. "
-            "No metaphors, no persuasion, no commentary about what you will do next.\n"
-            "  · option labels: short, parallel noun phrases of similar length (about 2-10 "
-            "characters), mutually exclusive and concrete. Avoid vague filler options such as "
-            "\"其他\" unless the space is genuinely open.\n"
-            "  · option descriptions: one short clause (about <= 20 characters) stating a "
-            "concrete condition, difference, or consequence. No slang, exaggeration, emotional "
-            "coloring, or second-person commentary on the user.\n"
-            "  · Keep a calm, professional register throughout — plain, respectful, specific.\n\n"
-            "WHEN TO ASK — one card, only when it earns its place:\n"
-            "1. Classify each unknown before asking anything:\n"
-            "   - HARD CONSTRAINT: something that changes the answer or the plan's structure, "
-            "feasibility, scope, cost, or safety if it differs. Examples: for travel, 出发地/交通方式/"
-            "预算/同行人/天数; for a system design, 技术栈/规模/权限模型/合规要求; for an event, "
-            "日期/人数/预算/场地. If it would change the answer, ask it — never silently assume it.\n"
-            "   - SOFT PREFERENCE: a taste that shapes details but not the structure (which scenic "
-            "spots, which cuisine). Ask at most once, or assume and disclose.\n"
-            "   - TRIVIA: naming, colors, minor defaults. Always assume.\n"
-            "2. Prefer ONE focused card per turn: a single_select, multi_select, confirmation, or "
-            "text_input that resolves the single most important open question. Only use a form "
-            "when 2-5 hard constraints are strongly coupled and must be answered together (e.g. "
-            "出发地 + 交通方式 + 预算 when they jointly determine the route). Never dump 5+ "
-            "unrelated questions into one card. Ask only what is needed this turn.\n"
-            "3. If a reasonable default exists and the choice is cheap to change, proceed with it "
-            "and say so — do not interrogate the user for completeness.\n\n"
-            "GREETINGS, SMALL TALK, AND DISTRESS:\n"
-            "  · A greeting, thanks, or small talk: respond normally and warmly. No card, no "
-            "goal, no steps.\n"
-            "  · Emotional distress (\"我很难过\", \"我很焦虑\", \"我很矛盾\", \"我不知道该怎么办\"): "
-            "reply like a person first — brief, warm, not analytical. You may optionally offer "
-            "ONE single_select card if a choice genuinely helps (about 4 options such as 想说说发生"
-            "了什么 / 帮我梳理纠结的点 / 只想被陪一会儿 / 先不想细说). Never push planning here.\n\n"
-            "WHEN YOU DRAFT A PLAN (update_plan / request_approval):\n"
-            "  · goal is concise and concrete; 4-8 implementation-ready steps "
-            "(id/title/description/depends_on); assumptions only for things you actually assumed.\n"
-            "  · proposed_decisions[].source accepts ONLY \"assumed\" (or \"system\" for fixed "
-            "facts) — never \"user\". The server records the user's own answers with source "
-            "\"user\" by itself.\n"
-            "  · Also state low-risk assumptions in assumptions (plain text) so the review card "
-            "can list them separately from confirmed decisions.\n"
-            "  · A request_approval proposal must omit interaction (the server creates the review "
-            "card) and its response should summarize the plan and flag any remaining assumptions.\n"
-            "  · Planning is read-only; never request or claim tool execution.\n\n"
-            "OUTPUT FORMAT:\n"
-            "  · For ask_user return one interaction (type, prompt, optional description, options "
-            "for selection types, form for a form, optional constraints). Put a human-readable "
-            "decision_key in the interaction constraints (e.g. \"tech_stack\", \"hosting\") so the "
-            "answer is stored under a meaningful name. For a form, give each field a stable "
-            "semantic key (e.g. \"departure\", \"transport\", \"budget\") and set decision_key to a "
-            "meaningful group name. Do NOT include protocol_version, interaction_id, plan_id, "
-            "plan_revision, status, or plan_review — the server supplies lifecycle fields.\n"
-            "  · Write the JSON keys in this exact order: protocol_version, response, action, goal, "
-            "assumptions, proposed_decisions, steps, interaction. Keep response near the TOP "
-            "(right after protocol_version) so it streams to the user immediately; never put "
-            "response last.\n"
-            "  · \"response\" is the substantive answer in the user's language — the actual content "
-            "the user reads — not a meta paragraph about what you are doing.\n"
-            "  · Use confirmed decisions and history; never repeat questions already answered or "
-            "skipped."
+        system_prompt = self._system_prompt(
+            json.dumps(proposal_schema, ensure_ascii=False, separators=(",", ":"))
         )
         return ProviderChatRequest(
             model=self._model,
@@ -1188,6 +1093,15 @@ class PlanningDecisionEngine:
             max_tokens=8000,
             response_format={"type": "json_object"},
         )
+
+    def _system_prompt(self, schema_json: str) -> str:
+        """第一段用 plan_mode.md（行为与沟通准则），第二段是提案协议与提问上限。"""
+        parts: list[str] = []
+        instructions = (self._plan_instructions or "").strip()
+        if instructions:
+            parts.append(instructions)
+        parts.append(_PROPOSAL_PROTOCOL.replace("{schema}", schema_json))
+        return "\n\n".join(parts)
 
     @staticmethod
     def _parse_proposal(content: str) -> DecisionProposal:
@@ -1281,57 +1195,282 @@ class PlanningDecisionEngine:
         self, *, goal: str, user_message: str, plan: PlanSnapshot,
         history: list[dict[str, str]] | None = None,
     ):
-        """流式生成决策提案。逐段产出 response 文本（delta），最终产出完整 proposal。
+        """流式生成决策提案：先做只读工具研究，再产出最终 DecisionProposal。
 
-        yield 的元组：("delta", str) | ("done", DecisionProposal) | ("error", str)。
+        yield 的元组：
+          ("delta", str)               —— response 字段的打字机预览
+          ("interaction_pending", str) —— action=ask_user/request_approval 出现
+          ("tool", dict)               —— 研究工具事件（name/round/index/phase/detail/preview）
+          ("done", DecisionProposal) | ("error", str)
         """
         request = self._proposal_request(goal=goal, user_message=user_message, plan=plan, history=history)
         self.last_messages = list(request.messages)
-        buffer = ""
-        last_len = 0
-        action_announced = False
-        last_usage = None
-        try:
-            async for chunk in self._provider.stream_chat_completion(request):
-                if chunk is not None and chunk.usage is not None:
-                    last_usage = chunk.usage
-                if not chunk or not chunk.content:
-                    continue
-                buffer += chunk.content
-                preview = _extract_response_preview(buffer)
-                if len(preview) > last_len:
-                    yield ("delta", preview[last_len:])
-                    last_len = len(preview)
-                if not action_announced:
-                    match = _ACTION_FIELD.search(buffer)
-                    if match and match.group(1) in ("ask_user", "request_approval"):
-                        action_announced = True
-                        yield ("interaction_pending", match.group(1))
-        except Exception as exc:
-            self._note_usage(last_usage)
-            logger.warning("planning stream failed request_id=%s type=%s", get_request_id(), type(exc).__name__)
-            yield ("error", "PLANNING_UPSTREAM_FAILED")
-            return
-        self._note_usage(last_usage)
-        if not buffer.strip():
-            yield ("error", "PLANNING_POLICY_REJECTED")
-            return
-        try:
-            proposal = self._parse_proposal(buffer)
-        except PlanningPolicyError as parse_error:
-            # 一次校正重试。成功后前端会以 done 里的 response 覆盖已流出的文字。
-            corrected = await self._retry_proposal(request, buffer, str(parse_error))
-            if corrected is None:
+        messages: list[dict[str, Any]] = [dict(m) for m in request.messages]
+        tools = self._tool_schemas()
+        rounds = 0
+        while True:
+            stream_request = ProviderChatRequest(
+                model=self._model,
+                messages=messages,
+                temperature=request.temperature,
+                max_tokens=request.max_tokens,
+                tools=tools,
+                tool_choice="auto" if tools else None,
+            )
+            buffer = ""
+            last_len = 0
+            action_announced = False
+            round_usage = None
+            slots: dict[int, dict[str, str]] = {}
+            saw_tools = False
+            try:
+                async for chunk in self._provider.stream_chat_completion(stream_request):
+                    if chunk is not None and chunk.usage is not None:
+                        round_usage = chunk.usage
+                    if not chunk:
+                        continue
+                    if chunk.tool_call_parts:
+                        saw_tools = True
+                        _absorb_tool_parts(slots, chunk.tool_call_parts)
+                    if chunk.content:
+                        buffer += chunk.content
+                        preview = _extract_response_preview(buffer)
+                        if len(preview) > last_len:
+                            yield ("delta", preview[last_len:])
+                            last_len = len(preview)
+                        if not action_announced:
+                            match = _ACTION_FIELD.search(buffer)
+                            if match and match.group(1) in ("ask_user", "request_approval"):
+                                action_announced = True
+                                yield ("interaction_pending", match.group(1))
+            except Exception as exc:
+                self._note_usage(round_usage)
+                logger.warning("planning stream failed request_id=%s type=%s", get_request_id(), type(exc).__name__)
+                yield ("error", "PLANNING_UPSTREAM_FAILED")
+                return
+            self._note_usage(round_usage)
+
+            if not saw_tools:
+                # 最终提案轮：无工具调用，buffer 即最终 JSON。
+                self.last_output_text = buffer
+                if not buffer.strip():
+                    yield ("error", "PLANNING_POLICY_REJECTED")
+                    return
+                try:
+                    proposal = self._parse_proposal(buffer)
+                except PlanningPolicyError as parse_error:
+                    # 一次校正重试。成功后前端会以 done 里的 response 覆盖已流出的文字。
+                    corrected = await self._retry_proposal(request, buffer, str(parse_error))
+                    if corrected is None:
+                        yield ("error", "PLANNING_POLICY_REJECTED")
+                        return
+                    proposal = corrected
+                yield ("done", proposal)
+                return
+
+            # 研究轮：执行只读工具并回填结果，进入下一轮。
+            try:
+                calls = _calls_from_slots(slots)
+            except PlanningPolicyError:
                 yield ("error", "PLANNING_POLICY_REJECTED")
                 return
-            proposal = corrected
-        self.last_output_text = buffer
-        yield ("done", proposal)
+            if self._tool_service is None or rounds >= self._max_tool_rounds:
+                yield ("error", "PLANNING_POLICY_REJECTED")
+                return
+            rounds += 1
+            messages.append(_assistant_tool_message(calls, buffer))
+            for index, call in enumerate(calls):
+                yield ("tool", {"name": call.name, "round": rounds, "index": index, "phase": "started"})
+            try:
+                tool_messages = await self._tool_service.execute(
+                    calls, allowed=frozenset(self._allowed_tools)
+                )
+            except Exception as exc:
+                from app.core.exceptions import ToolNotAllowedError
+
+                if isinstance(exc, (PlanningPolicyError, ToolNotAllowedError)):
+                    yield ("error", "PLANNING_POLICY_REJECTED")
+                    return
+                logger.warning(
+                    "planning tool execution failed request_id=%s type=%s",
+                    get_request_id(), type(exc).__name__,
+                )
+                yield ("error", "PLANNING_UPSTREAM_FAILED")
+                return
+            messages.extend(tool_messages)
+            for index, call in enumerate(calls):
+                content = ""
+                if index < len(tool_messages):
+                    message = tool_messages[index]
+                    content = message.get("content", "") if isinstance(message, dict) else ""
+                detail, preview = _plan_tool_public(call.name, call.arguments, content)
+                yield ("tool", {"name": call.name, "round": rounds, "index": index,
+                                "phase": "done", "detail": detail, "preview": preview})
 
 
 _RESPONSE_FULL = re.compile(r'"response"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _RESPONSE_OPEN = re.compile(r'"response"\s*:\s*"((?:[^"\\]|\\.)*)$')
 _ACTION_FIELD = re.compile(r'"action"\s*:\s*"([a-z_]+)"')
+
+# 提案协议提示词（第二段）。第一段是 plan_mode.md（行为与沟通准则），
+# 这一段只写「必须返回的 JSON 协议」与「每任务澄清问题 ≤3 个」上限。
+# 用 `{schema}` 占位符，运行时以 `.replace` 注入 JSON schema。
+_PROPOSAL_PROTOCOL = (
+    "You are the assistant behind this app's Plan mode. A written plan is a tool you may use "
+    "when it helps — it is NOT a required deliverable. Many turns and many whole conversations "
+    "end with ordinary answers, and that is correct behavior.\n\n"
+    "Return exactly one JSON object conforming to this schema (the server validates it "
+    "strictly):\n{schema}\n\n"
+    "ACTIONS — pick the one this turn actually needs:\n"
+    "  · respond (DEFAULT) — answer, explain, compare, recommend, discuss, or chat normally "
+    "in \"response\". This is right for the vast majority of turns. Never attach steps, a goal, "
+    "or a review card just to look productive.\n"
+    "  · ask_user — you genuinely need a decision or fact from the user before you can answer "
+    "well or continue, and a card collects it more comfortably than free text. Put ONE focused "
+    "question in the interaction card; use \"response\" for the short sentence that introduces it.\n"
+    "  · update_plan — the user asked you to write or revise a plan. Fill goal/steps/assumptions "
+    "and explain the draft in \"response\".\n"
+    "  · request_approval — the user asked to finalize/review a plan you already drafted, or "
+    "confirmed a draft is ready. The server turns it into the review card.\n"
+    "Never choose ready_for_handoff (approval, mode switch, and execution authorization are "
+    "separate user actions).\n\n"
+    "RESEARCH (Plan mode is read-only):\n"
+    "  · You MAY use the provided read-only tools to inspect the workspace / codebase before "
+    "drafting a plan (list_directory, read_text_file, search_text, web_search, web_fetch, "
+    "discover_skills, calculator, get_current_time). Use them to ground a concrete plan in the "
+    "real project. Never claim a file, symbol, or change you did not actually observe.\n"
+    "  · You must NOT request write / execute / delete / deliver tools; the server only allows "
+    "the read-only set above.\n\n"
+    "WHEN NOT TO PRODUCE A PLAN:\n"
+    "  · Do not end every turn — or every conversation — with update_plan or request_approval. "
+    "A normal answer, an explanation, a recommendation, or a single clarifying question is a "
+    "complete, valid turn.\n"
+    "  · Draft a plan only when the user asks for one, or when they ask to change an existing "
+    "draft. If it is unclear whether they want a plan, ask in plain text instead of producing one.\n"
+    "  · When the user asks a factual question, wants your opinion, wants an explanation of code "
+    "or a design, or is just chatting, answer it directly.\n"
+    "  · If the user says 你决定 / 随便 / 你推荐, decide, explain why, and continue. Do not keep asking.\n\n"
+    "ASKING QUESTIONS — keep it minimal:\n"
+    "  · At most THREE clarification questions across the WHOLE task. Each question is ONE card "
+    "(single_select / multi_select / confirmation / text_input / text_area / form). Prefer a "
+    "reasonable default plus a disclosed assumption over another question.\n"
+    "  · Only ask HARD CONSTRAINTS — things that change the answer or the plan's structure, "
+    "feasibility, scope, cost, or safety. Assume trivia (names, colors, minor defaults).\n"
+    "  · Prefer ONE focused card per turn. Only use form when 2-5 hard constraints are strongly "
+    "coupled and must be answered together.\n\n"
+    "REGISTERED UI INTERACTION COMPONENTS — put questions into the interaction card using ONE of "
+    "these; the client renders only these, and a question left only in response text is not "
+    "collectable:\n"
+    "  · single_select / multi_select / text_input / text_area / confirmation / form "
+    "(form at most 5 fields; each field text / textarea / number / single_select / multi_select).\n"
+    "Write prompt, option labels, descriptions, and form field labels in the user's language.\n\n"
+    "CARD COPY — restrained product surface, not a friend chatting:\n"
+    "  · prompt: ask the decision itself, one neutral sentence, short (roughly <= 30 Chinese "
+    "characters). Never characterize, judge, or diagnose the user.\n"
+    "  · description: optional, at most ONE short sentence on why this decision matters.\n"
+    "  · option labels: short, parallel noun phrases (about 2-10 characters), mutually exclusive "
+    "and concrete. Avoid vague filler such as \"其他\" unless genuinely open.\n"
+    "  · Keep a calm, professional register throughout.\n\n"
+    "GREETINGS, SMALL TALK, AND DISTRESS:\n"
+    "  · A greeting, thanks, or small talk: respond normally and warmly. No card, no goal, no steps.\n"
+    "  · Emotional distress: reply like a person first — brief, warm, not analytical. Never push "
+    "planning here.\n\n"
+    "WHEN YOU DRAFT A PLAN (update_plan / request_approval):\n"
+    "  · goal is concise and concrete; 4-8 implementation-ready steps (id/title/description/"
+    "depends_on); assumptions only for things you actually assumed.\n"
+    "  · proposed_decisions[].source accepts ONLY \"assumed\" (or \"system\" for fixed facts) — "
+    "never \"user\". The server records the user's own answers with source \"user\" by itself.\n"
+    "  · Also state low-risk assumptions in assumptions (plain text).\n"
+    "  · A request_approval proposal must omit interaction, and its response should summarize the "
+    "plan and flag any remaining assumptions.\n"
+    "  · Planning is read-only; never request or claim tool execution.\n\n"
+    "OUTPUT FORMAT:\n"
+    "  · For ask_user return one interaction (type, prompt, optional description, options for "
+    "selection types, form for a form, optional constraints). Put a human-readable decision_key in "
+    "the interaction constraints (e.g. \"tech_stack\"). For a form, give each field a stable semantic "
+    "key and set decision_key to a meaningful group name. Do NOT include protocol_version, "
+    "interaction_id, plan_id, plan_revision, status, or plan_review — the server supplies lifecycle "
+    "fields.\n"
+    "  · Write the JSON keys in this exact order: protocol_version, response, action, goal, "
+    "assumptions, proposed_decisions, steps, interaction. Keep response near the TOP (right after "
+    "protocol_version) so it streams to the user immediately; never put response last.\n"
+    "  · \"response\" is the substantive answer in the user's language — the actual content the user "
+    "reads — not a meta paragraph about what you are doing.\n"
+    "  · Use confirmed decisions and history; never repeat questions already answered or skipped."
+)
+
+
+def _absorb_tool_parts(slots: dict[int, dict[str, str]], parts: Any) -> None:
+    """把流式 tool_call_parts 累积进按 index 分组的槽位。"""
+    for index, call_id, name, arguments in parts:
+        slot = slots.setdefault(index, {"id": "", "name": "", "arguments": ""})
+        if call_id:
+            slot["id"] = call_id
+        if name:
+            slot["name"] += name
+        if arguments:
+            slot["arguments"] += arguments
+
+
+def _calls_from_slots(slots: dict[int, dict[str, str]]) -> list[ToolCall]:
+    """把累积的槽位还原成工具调用列表；不完整或超量即拒绝。"""
+    calls: list[ToolCall] = []
+    for index in sorted(slots):
+        slot = slots[index]
+        if not slot["id"] or not slot["name"]:
+            raise PlanningPolicyError("planning model produced an incomplete tool call")
+        calls.append(ToolCall(id=slot["id"], name=slot["name"], arguments=slot["arguments"]))
+    if not calls or len(calls) > 5:
+        raise PlanningPolicyError("planning model requested an invalid number of tool calls")
+    return calls
+
+
+def _assistant_tool_message(calls: list[ToolCall], content: str) -> dict[str, Any]:
+    """构造带 tool_calls 的 assistant 消息，用于回填模型上下文。"""
+    return {
+        "role": "assistant",
+        "content": content or "",
+        "tool_calls": [
+            {"id": call.id, "type": "function",
+             "function": {"name": call.name, "arguments": call.arguments}}
+            for call in calls
+        ],
+    }
+
+
+def _plan_tool_public(name: str, arguments: str, content: str) -> tuple[str, str]:
+    """研究轮工具的展示摘要（detail, preview）。只读工具，无副作用。"""
+    detail = ""
+    preview = ""
+    try:
+        wrapped = json.loads(content or "")
+    except (json.JSONDecodeError, ValueError):
+        return detail, preview
+    result = wrapped.get("result") if isinstance(wrapped, dict) else None
+    if not isinstance(result, str):
+        return detail, preview
+    try:
+        inner = json.loads(result)
+    except (json.JSONDecodeError, ValueError):
+        inner = None
+    if isinstance(inner, dict):
+        if name == "web_search":
+            count = len(inner.get("results") or [])
+            if count:
+                detail = f"搜索到 {count} 条结果"
+        elif name == "list_directory":
+            entries = inner.get("entries") or []
+            detail = f"目录包含 {len(entries)} 项"
+        elif name == "search_text":
+            matches = inner.get("matches") or []
+            detail = f"找到 {len(matches)} 处匹配"
+        elif name == "read_text_file":
+            detail = inner.get("source", "")
+        elif name == "discover_skills":
+            detail = f"发现 {inner.get('count', 0)} 个技能"
+    if isinstance(inner, dict) and name == "read_text_file":
+        preview = str(inner.get("content") or "")[:300]
+    return detail, preview
 
 
 def _load_proposal_json(content: str) -> dict | None:

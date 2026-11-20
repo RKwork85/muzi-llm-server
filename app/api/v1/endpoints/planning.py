@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Any
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, Query, Request
@@ -32,7 +32,11 @@ from app.agents.models import TaskStatus
 from app.api.v1.endpoints.mcp import optional_mcp
 from app.mcp.service import McpService
 from app.core.context import get_request_id
-from app.tools.workspace_scope import scope_dirname
+from app.skills.tools import CURRENT_SKILL_PRINCIPAL, CURRENT_SKILL_RUNTIME
+from app.tools.capabilities import PLAN_TOOLS
+from app.tools.url_policy import UrlLedger
+from app.tools.web_tools import CURRENT_SETTINGS, CURRENT_URL_LEDGER, CURRENT_WEB_CLIENT
+from app.tools.workspace_scope import CURRENT_WORKSPACE_SCOPE, is_user_scope, scope_dirname
 from app.planning.api_schemas import (
     ConversationCreate,
     ConversationModeUpdate,
@@ -57,7 +61,7 @@ from app.planning.contracts import (
 )
 from app.planning import revisions
 from app.planning.plan_markdown import plan_filename, render_plan_markdown
-from app.planning.runtime import PlanningConflict, PlanningNotFound, PlanningPolicyError
+from app.planning.runtime import PlanningConflict, PlanningNotFound, PlanningOrchestrator, PlanningPolicyError
 from app.planning.sql_store import SqlPlanningStore
 
 router = APIRouter(tags=["planning"])
@@ -72,6 +76,23 @@ def _translate(exc: Exception) -> None:
     if isinstance(exc, PlanningPolicyError):
         raise PlanningPolicyErrorResponse(str(exc)) from None
     raise exc
+
+
+def _plan_tool_context(request: Request) -> tuple[Any, tuple[str, ...]]:
+    """从 chat_service 取 agent 注册表，投影出规划期只读工具白名单与执行服务。
+
+    白名单用 PlanningOrchestrator.validate_plan_tools 兜底（只允许 PLAN_TOOLS 中
+    已注册且 low 风险的工具）；执行期再由 ExecutionGuard 按「用户权限 × plan 模式」复核。
+    """
+    chat_service = getattr(request.app.state, "chat_service", None)
+    tool_service = getattr(chat_service, "ask_tools", None)
+    if tool_service is None or getattr(tool_service, "registry", None) is None:
+        return None, ()
+    try:
+        allowed = PlanningOrchestrator.validate_plan_tools(tool_service.registry, sorted(PLAN_TOOLS))
+    except PlanningPolicyError:
+        allowed = ()
+    return tool_service, allowed
 
 
 @router.post("/conversations", status_code=201, summary="创建持久化会话")
@@ -206,6 +227,31 @@ async def plan_message_stream(
     await QuotaService(session).authorize(user.id)
 
     async def stream_body():
+        workspace_scope = scope_dirname(request.headers.get("x-workspace-key"))
+        exec_ctx = await load_execution_context(
+            str(user.id),
+            runtime_mode="plan",
+            workspace_scope=workspace_scope,
+            plan_id=plan_id,
+        )
+        tool_service, allowed_tools = _plan_tool_context(request)
+        chat_service = getattr(request.app.state, "chat_service", None)
+        tokens: list[tuple[Any, Any]] = [
+            (CURRENT_EXECUTION, CURRENT_EXECUTION.set(exec_ctx)),
+            (CURRENT_SETTINGS, CURRENT_SETTINGS.set(request.app.state.settings)),
+            (CURRENT_WORKSPACE_SCOPE, CURRENT_WORKSPACE_SCOPE.set(
+                workspace_scope if is_user_scope(workspace_scope) else None)),
+            (CURRENT_URL_LEDGER, CURRENT_URL_LEDGER.set(UrlLedger(body.message))),
+        ]
+        web_client = getattr(chat_service, "web_client", None)
+        if web_client is not None:
+            tokens.append((CURRENT_WEB_CLIENT, CURRENT_WEB_CLIENT.set(web_client)))
+        skill_runtime = getattr(chat_service, "skill_runtime", None)
+        if skill_runtime is None:
+            skill_runtime = getattr(request.app.state, "skill_runtime", None)
+        if skill_runtime is not None:
+            tokens.append((CURRENT_SKILL_RUNTIME, CURRENT_SKILL_RUNTIME.set(skill_runtime)))
+            tokens.append((CURRENT_SKILL_PRINCIPAL, CURRENT_SKILL_PRINCIPAL.set(str(user.id))))
         try:
             async for frame in store.process_message_stream(
                 plan_id,
@@ -214,6 +260,8 @@ async def plan_message_stream(
                 body.message,
                 request.app.state.provider,
                 request.app.state.settings,
+                tool_service=tool_service,
+                allowed_tools=allowed_tools,
             ):
                 yield frame
             await session.commit()
@@ -226,6 +274,9 @@ async def plan_message_stream(
         except PlanningPolicyError as exc:
             yield format_sse("error", {"error": {"code": "PLANNING_POLICY_REJECTED", "message": str(exc)}})
             await session.rollback()
+        finally:
+            for var, token in reversed(tokens):
+                var.reset(token)
 
     return StreamingResponse(
         stream_body(),

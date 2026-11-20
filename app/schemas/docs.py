@@ -38,6 +38,7 @@ class DocListItem(ApiContract):
 
 class DocListResponse(ApiContract):
     items: list[DocListItem] = Field(default_factory=list)
+    total: int | None = Field(default=None)
 
 
 class DocDetailResponse(ApiContract):
@@ -51,3 +52,10 @@ class DocDetailResponse(ApiContract):
 
 class DocCreatedResponse(ApiContract):
     id: UUID
+
+
+class DocImageUploadResponse(ApiContract):
+    """正文插图上传结果。markdown 由后端拼好，前端只管插到光标处。"""
+
+    url: str
+    markdown: str

@@ -279,3 +279,55 @@ def test_result_is_truncated_and_stays_json() -> None:
     assert parsed["result"].endswith("...[truncated]")
     assert len(content) <= 96
     assert json.loads(service._bounded_content("calculator", "12"))["result"] == "12"
+
+
+# ---- 回归：一轮并发多个工具调用不能被判成「模型返回了无法解析的响应」----
+# 真实故障：模型一次发出 8 个并行 web_search，旧实现用 `len(calls) > 5`
+# 直接抛 INVALID_MODEL_RESPONSE，整条回答作废。并发数应由每个工具的
+# max_calls_per_run 与 max_tool_rounds 逐条限制，而不是判成坏响应。
+
+
+def test_parallel_tool_calls_above_old_limit_are_accepted() -> None:
+    from app.services.chat_service import _calls_from_slots
+
+    slots = {
+        index: {"id": f"call_{index}", "name": "calculator", "arguments": '{"expression":"1+1"}'}
+        for index in range(8)
+    }
+    calls = _calls_from_slots(slots)
+    assert [call.id for call in calls] == [f"call_{index}" for index in range(8)]
+
+
+def test_incomplete_tool_call_slot_is_still_invalid() -> None:
+    from app.core.exceptions import InvalidModelResponseError
+    from app.services.chat_service import _calls_from_slots
+
+    with pytest.raises(InvalidModelResponseError):
+        _calls_from_slots({0: {"id": "call_0", "name": "", "arguments": "{}"}})
+    with pytest.raises(InvalidModelResponseError):
+        _calls_from_slots({})
+
+
+def test_empty_tool_call_list_is_still_invalid() -> None:
+    from app.core.exceptions import InvalidModelResponseError
+
+    service = ToolService(build_default_registry(), make_settings())
+    with pytest.raises(InvalidModelResponseError):
+        import asyncio
+
+        asyncio.run(service.execute([]))
+
+
+def test_provider_parser_accepts_parallel_calls() -> None:
+    from types import SimpleNamespace
+
+    from app.providers.parsing import parse_tool_calls
+
+    raw = [
+        SimpleNamespace(
+            id=f"call_{index}",
+            function=SimpleNamespace(name="web_search", arguments='{"query":"x"}'),
+        )
+        for index in range(8)
+    ]
+    assert len(parse_tool_calls(raw)) == 8

@@ -479,3 +479,115 @@ async def test_decision_engine_prompt_does_not_force_a_plan() -> None:
     assert "NOT a required deliverable" in system_prompt
     assert "WHEN NOT TO PRODUCE A PLAN" in system_prompt
 
+
+class _FakeToolService:
+    """最小工具服务替身：只回 schema 与回填消息，可选择强制校验执行白名单。"""
+
+    def __init__(self, *, enforce_allowed: bool = True) -> None:
+        self.executed: list[ToolCall] = []
+        self.allowed: frozenset[str] | None = None
+        self.enforce_allowed = enforce_allowed
+
+    def schemas_for(self, names):
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": name,
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }
+            for name in names
+        ]
+
+    async def execute(self, calls, *, allowed=None):
+        self.allowed = allowed
+        if self.enforce_allowed and allowed is not None:
+            from app.core.exceptions import ToolNotAllowedError
+
+            for call in calls:
+                if call.name not in allowed:
+                    raise ToolNotAllowedError()
+        self.executed.extend(calls)
+        return [
+            {
+                "role": "tool",
+                "tool_call_id": call.id,
+                "content": json.dumps({"source": "server_tool", "name": call.name, "result": "ok"}),
+            }
+            for call in calls
+        ]
+
+
+@pytest.mark.asyncio
+async def test_planning_stream_runs_readonly_research_before_proposal() -> None:
+    """研究循环：先只读工具探查，再产出带步骤的 request_approval 提案。"""
+    from app.providers.base import StreamChunk
+    from tests.fakes import FakeProvider
+
+    final = json.dumps(
+        {
+            "protocol_version": "1.0",
+            "action": "request_approval",
+            "response": "已基于代码库现状给出方案。",
+            "goal": "分析支付服务架构",
+            "steps": [
+                {"id": "s1", "title": "梳理模块", "description": "定位支付相关模块"},
+                {"id": "s2", "title": "输出架构说明", "description": "整理调用链"},
+            ],
+        },
+        ensure_ascii=False,
+    )
+    provider = FakeProvider()
+    provider.push([StreamChunk(tool_call_parts=[(0, "call_1", "search_text", '{"query": "payment"}')])])
+    provider.push([StreamChunk(content=final)])
+    tool_service = _FakeToolService()
+    plan = PlanningOrchestrator().create_plan(
+        owner_id="user-a", conversation_id="conv-a", goal="分析支付服务架构"
+    )
+    engine = PlanningDecisionEngine(
+        provider, model="test-model", tool_service=tool_service, allowed_tools=("search_text",)
+    )
+    events = [
+        event
+        async for event in engine.propose_stream(
+            goal=plan.goal, user_message="分析这个项目的支付服务架构", plan=plan
+        )
+    ]
+    tool_events = [payload for kind, payload in events if kind == "tool"]
+    assert tool_events, "研究轮应产出 tool 事件"
+    assert tool_events[0]["name"] == "search_text"
+    assert tool_events[-1]["phase"] == "done"
+    assert tool_service.executed == [
+        ToolCall(id="call_1", name="search_text", arguments='{"query": "payment"}')
+    ]
+    assert tool_service.allowed == frozenset({"search_text"})
+    assert events[-1][0] == "done"
+    proposal = events[-1][1]
+    assert proposal.action == DecisionAction.REQUEST_APPROVAL
+    assert [step.id for step in proposal.steps] == ["s1", "s2"]
+
+
+@pytest.mark.asyncio
+async def test_planning_stream_rejects_tools_outside_the_readonly_allowlist() -> None:
+    """研究轮兜底：模型请求白名单外工具（如 write_text_file）时拒绝，不执行。"""
+    from app.providers.base import StreamChunk
+    from tests.fakes import FakeProvider
+
+    provider = FakeProvider()
+    provider.push([StreamChunk(tool_call_parts=[(0, "call_1", "write_text_file", '{"path": "x"}')])])
+    tool_service = _FakeToolService()
+    plan = PlanningOrchestrator().create_plan(
+        owner_id="user-a", conversation_id="conv-a", goal="Plan a system"
+    )
+    engine = PlanningDecisionEngine(
+        provider, model="test-model", tool_service=tool_service, allowed_tools=("search_text",)
+    )
+    events = [
+        event
+        async for event in engine.propose_stream(goal="Plan", user_message="Write a file", plan=plan)
+    ]
+    assert tool_service.executed == []
+    assert events[-1] == ("error", "PLANNING_POLICY_REJECTED")
+

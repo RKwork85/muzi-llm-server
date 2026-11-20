@@ -713,6 +713,8 @@ class ChatShare(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
     )
     source_name: Mapped[str] = mapped_column(String(120), nullable=False, default="", server_default=text("''"))
     source_username: Mapped[str | None] = mapped_column(String(32))
+    # 分享时快照分享者的头像（data URL），避免用户后续更换头像影响已发出的分享。
+    source_avatar: Mapped[str | None] = mapped_column(Text)
 
 
 class SkillCustomization(UUIDPrimaryKeyMixin, TimestampMixin, Base):

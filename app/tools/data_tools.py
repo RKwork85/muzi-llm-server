@@ -10,7 +10,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.data.context import CURRENT_DATA_STORE, CURRENT_OSS_CLIENT, CURRENT_TASK_ID
+from app.data.context import CURRENT_DATA_STORE, CURRENT_OSS_CLIENT, CURRENT_TASK_ID, CURRENT_USER_ID
 from app.data.oss_client import OssUploadError
 from app.data.store import DataStore, StoredFile
 from app.data.tabular import (
@@ -339,7 +339,9 @@ def list_package_files(args: PackageQuery) -> str:
 async def upload_to_oss(args: OssFileArgs) -> str:
     try:
         stored, content = _owned_file(args.file_id)
-        urls = await _oss().upload_files([(stored.file_name, content)], _oss_path())
+        urls = await _oss().upload_files(
+            [(stored.file_name, content)], _oss_path(), **_oss_kwargs()
+        )
         return _oss_result([stored], urls)
     except (DataError, OssUploadError) as exc:
         return _failure(exc)
@@ -350,7 +352,11 @@ async def upload_files_to_oss(args: OssFilesArgs) -> str:
         if len(args.file_ids) != len(set(args.file_ids)):
             raise DataError("OSS_UPLOAD_FAILED", "文件重复")
         owned = [_owned_file(file_id) for file_id in args.file_ids]
-        urls = await _oss().upload_files([(item.file_name, content) for item, content in owned], _oss_path())
+        urls = await _oss().upload_files(
+            [(item.file_name, content) for item, content in owned],
+            _oss_path(),
+            **_oss_kwargs(),
+        )
         return _oss_result([item for item, _content in owned], urls)
     except (DataError, OssUploadError) as exc:
         return _failure(exc)
@@ -480,6 +486,14 @@ def _oss():
 
 def _oss_path() -> str:
     return _oss().upload_path_for(_task_id())
+
+
+def _oss_kwargs() -> dict[str, str]:
+    """按用户分层所需的语义参数。user_id 缺失时回退旧布局（由 upload_files 自行判断）。"""
+    user_id = CURRENT_USER_ID.get()
+    if not user_id:
+        return {}
+    return {"user_id": user_id, "category": "data", "scope": _task_id()}
 
 
 def _owned_file(file_id: str):

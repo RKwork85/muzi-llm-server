@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -22,6 +23,7 @@ from importlib import metadata
 from pathlib import Path
 
 from app.tools.sandbox import dependencies as dep_policy
+from app.tools.sandbox.outputs import OUTPUT_DIRNAME
 from app.tools.sandbox.provider import (
     SandboxDependencyRejected,
     SandboxExecutionError,
@@ -29,13 +31,16 @@ from app.tools.sandbox.provider import (
     SandboxSpec,
     SandboxTimeoutError,
 )
-from app.tools.sandbox.workspace_bridge import detect_workspace, sandbox_env
+from app.tools.sandbox.workspace_bridge import WORKSPACE_ENV, detect_workspace, sandbox_env
 from app.tools.sandbox_dir import make_sandbox, purge, redact_paths, safe_env
 
 _MAX_OUTPUT = 8000
 _STDOUT_LOG = "_stdout.log"
 _STDERR_LOG = "_stderr.log"
 _INSTALL_LOG = "_install.log"
+_MIRROR_DIR = "_workspace"
+_MIRROR_MAX_BYTES = 32 * 1024 * 1024
+_MIRROR_MAX_FILES = 1000
 
 
 class SubprocessSandboxProvider:
@@ -48,9 +53,10 @@ class SubprocessSandboxProvider:
         sandbox = make_sandbox(spec.sandbox_prefix)
         try:
             self._write_files(sandbox, spec.files)
+            view = self._workspace_view(sandbox)
             if spec.dependencies:
-                self._install(sandbox, spec)
-            completed = self._execute(sandbox, spec)
+                self._install(sandbox, spec, view)
+            completed = self._execute(sandbox, spec, view)
             output = redact_paths(
                 f"{completed['stdout']}{completed['stderr']}",
                 sandbox,
@@ -64,9 +70,56 @@ class SubprocessSandboxProvider:
         finally:
             purge(sandbox)
 
+    # ---- 工作区视图 ----
+
+    def _workspace_view(self, sandbox: Path) -> dict[str, str]:
+        """把真实工作区渲染成「只读快照」，产物目录保持真实路径。
+
+        容器后端用只读 bind mount 强制只读；local 后端没有 mount，只能把工作区
+        复制进沙盒再注入路径——脚本改的只是副本，真实工作区碰不到。复制超限或
+        失败时退回真实路径（此时只读靠工具描述约定），至少不阻断读取。
+        """
+        settings = self._settings
+        if settings is None:
+            return {}
+        bridge = detect_workspace(settings)
+        if not bridge.visible:
+            return {}
+        extra = dict(bridge.env)
+        if bridge.path:
+            mirror = self._mirror(sandbox, Path(bridge.path))
+            if mirror is not None:
+                extra[WORKSPACE_ENV] = str(mirror)
+        return extra
+
+    def _mirror(self, sandbox: Path, root: Path) -> Path | None:
+        limit_bytes = int(
+            getattr(self._settings, "sandbox_workspace_mirror_max_bytes", _MIRROR_MAX_BYTES)
+            or _MIRROR_MAX_BYTES
+        )
+        limit_files = int(
+            getattr(self._settings, "sandbox_workspace_mirror_max_files", _MIRROR_MAX_FILES)
+            or _MIRROR_MAX_FILES
+        )
+        if not _within_limits(root, limit_files, limit_bytes):
+            return None
+        target = sandbox / _MIRROR_DIR
+        try:
+            # 产物目录在真实工作区里单独存在，不进快照，避免把历史产物再复制一份。
+            shutil.copytree(
+                root,
+                target,
+                ignore=shutil.ignore_patterns(OUTPUT_DIRNAME),
+                dirs_exist_ok=True,
+            )
+        except OSError:
+            shutil.rmtree(target, ignore_errors=True)
+            return None
+        return target
+
     # ---- 环境 ----
 
-    def _base_env(self, spec: SandboxSpec) -> dict[str, str]:
+    def _base_env(self, spec: SandboxSpec, view: dict[str, str] | None = None) -> dict[str, str]:
         settings = self._settings
         network = True if spec.network is None else bool(spec.network)
         if spec.dependencies:
@@ -75,7 +128,7 @@ class SubprocessSandboxProvider:
         extra = dict(spec.env)
         if settings is not None:
             bridge = detect_workspace(settings)
-            extra = {**sandbox_env(settings, bridge, offline=not network), **extra}
+            extra = {**sandbox_env(settings, bridge, offline=not network), **(view or {}), **extra}
         elif not network:
             from app.tools.sandbox.workspace_bridge import _offline_env
 
@@ -84,7 +137,7 @@ class SubprocessSandboxProvider:
 
     # ---- 依赖 ----
 
-    def _install(self, sandbox: Path, spec: SandboxSpec) -> None:
+    def _install(self, sandbox: Path, spec: SandboxSpec, view: dict[str, str] | None = None) -> None:
         settings = self._settings
         if settings is None:
             raise SandboxExecutionError()
@@ -104,7 +157,7 @@ class SubprocessSandboxProvider:
 
         target = sandbox / dep_policy.DEPS_DIR
         target.mkdir(parents=True, exist_ok=True)
-        env = self._base_env(SandboxSpec(argv=[], network=True))
+        env = self._base_env(SandboxSpec(argv=[], network=True), view)
         env["PYTHONPATH"] = str(target)
         argv = dep_policy.pip_argv(sys.executable, plan, target)
         log = sandbox / _INSTALL_LOG
@@ -166,9 +219,9 @@ class SubprocessSandboxProvider:
             raise SandboxExecutionError()
         return [executable, *argv[1:]]
 
-    def _execute(self, sandbox: Path, spec: SandboxSpec) -> dict[str, object]:
+    def _execute(self, sandbox: Path, spec: SandboxSpec, view: dict[str, str] | None = None) -> dict[str, object]:
         resolved = self._resolve(spec.argv)
-        env = self._base_env(spec)
+        env = self._base_env(spec, view)
         if spec.dependencies:
             env["PYTHONPATH"] = str(sandbox / dep_policy.DEPS_DIR)
         out_path = sandbox / _STDOUT_LOG
@@ -196,6 +249,37 @@ class SubprocessSandboxProvider:
             "stdout": out_path.read_text(encoding="utf-8", errors="replace") if out_path.exists() else "",
             "stderr": err_path.read_text(encoding="utf-8", errors="replace") if err_path.exists() else "",
         }
+
+
+def _within_limits(root: Path, max_files: int, max_bytes: int) -> bool:
+    """判断工作区是否值得整体复制；超限就不复制，退回真实路径。
+
+    只做数量与体积的粗判：够小才复制，避免一次 run_python 复制几百 MB。
+    """
+    if max_files <= 0 or max_bytes <= 0:
+        return False
+    files = 0
+    total = 0
+    stack = [root]
+    try:
+        while stack:
+            current = stack.pop()
+            for entry in os.scandir(current):
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        if current == root and entry.name == OUTPUT_DIRNAME:
+                            continue
+                        stack.append(Path(entry.path))
+                    elif entry.is_file(follow_symlinks=False):
+                        files += 1
+                        total += entry.stat(follow_symlinks=False).st_size
+                        if files > max_files or total > max_bytes:
+                            return False
+                except OSError:
+                    continue
+    except OSError:
+        return False
+    return True
 
 
 def _terminate(process: subprocess.Popen) -> None:

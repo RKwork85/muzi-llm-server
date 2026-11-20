@@ -17,6 +17,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
+from app.tools.sandbox.outputs import OUTPUT_ENV, output_dir
 from app.tools.sandbox.provider import (
     SandboxDependencyRejected,
     SandboxExecutionError,
@@ -146,6 +147,11 @@ class AgentBoxSandboxProvider:
         workspace = self._workspace_dir()
         if workspace is not None:
             argv.extend(["-v", f"{workspace}:/workspace:ro"])
+        # 唯一的可写出口：产物目录读写挂载，容器里用 /output。工作区保持 ro。
+        output = output_dir(self._settings)
+        if output is not None:
+            argv.extend(["-v", f"{output}:/output:rw"])
+            argv.extend(["-e", f"{OUTPUT_ENV}=/output"])
         for key, value in (spec.env or {}).items():
             argv.extend(["-e", f"{key}={value}"])
         argv.append(self._image)

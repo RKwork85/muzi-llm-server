@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import admin, agents, ark, auth, chat, comfy, content, deepseek, docs, files, history, internal, mcp, me, models, planning, plugins, recharge, share, skills
+from app.api.v1.endpoints import admin, agents, ark, assets, auth, chat, comfy, content, deepseek, docs, files, history, internal, mcp, me, models, planning, plugins, recharge, share, skills
 
 router = APIRouter()
 router.include_router(auth.router)
@@ -27,3 +27,4 @@ router.include_router(share.router)
 router.include_router(docs.router)
 router.include_router(content.router)
 router.include_router(comfy.router)
+router.include_router(assets.router)

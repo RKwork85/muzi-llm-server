@@ -6,10 +6,11 @@ import json
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.data.context import CURRENT_OSS_CLIENT, CURRENT_TASK_ID
+from app.data.context import CURRENT_OSS_CLIENT, CURRENT_TASK_ID, CURRENT_USER_ID
 from app.data.oss_client import OssUploadError
 from app.tools.file_sandbox import FileDenied, display_path, resolve_inside
 from app.tools.file_tools import workspace_root
+from app.tools.sandbox.outputs import OUTPUT_DIRNAME
 from app.tools.web_tools import CURRENT_SETTINGS
 
 USER_DOWNLOAD_KIND = "user_download"
@@ -25,9 +26,7 @@ async def deliver_file(args: DeliverArgs) -> str:
     try:
         settings = CURRENT_SETTINGS.get()
         root = workspace_root(settings)
-        target = resolve_inside(root, args.path)
-        if target == root or not target.is_file():
-            raise FileDenied()
+        target = _locate(root, args.path)
         content = target.read_bytes()
         limit = 1_000_000 if settings is None else settings.data_max_bytes
         if len(content) > limit:
@@ -36,7 +35,13 @@ async def deliver_file(args: DeliverArgs) -> str:
         if client is None:
             raise OssUploadError("OSS_UNAVAILABLE", "上传服务不可用")
         task_id = CURRENT_TASK_ID.get() or "ask"
-        urls = await client.upload_files([(target.name, content)], client.upload_path_for(task_id))
+        # 有 user_id 就走按用户分层的布局：users/{uid}/file/{YYYY-MM}/...
+        urls = await client.upload_files(
+            [(target.name, content)],
+            client.upload_path_for(task_id),
+            user_id=CURRENT_USER_ID.get(),
+            category="file",
+        )
         return json.dumps(
             {
                 "ok": True,
@@ -55,6 +60,23 @@ async def deliver_file(args: DeliverArgs) -> str:
         return _error(exc.code, exc.message)
     except OSError:
         return _error("file_unavailable", "路径不可用")
+
+
+def _locate(root, raw: str):
+    """先按给定路径找；找不到时再查产物目录。
+
+    `run_python` 生成的文件都落在 ``_out`` 下，模型经常只记得文件名（或写
+    ``_out/x.xmind``）。两个位置都认，避免「明明生成了却交付不了」。
+    """
+    target = resolve_inside(root, raw)
+    if target != root and target.is_file():
+        return target
+    if target == root:
+        raise FileDenied()
+    nested = resolve_inside(root, f"{OUTPUT_DIRNAME}/{raw}")
+    if nested.is_file():
+        return nested
+    raise FileDenied()
 
 
 def _error(code: str, message: str) -> str:

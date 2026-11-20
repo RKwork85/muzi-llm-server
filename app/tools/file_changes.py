@@ -12,7 +12,39 @@ from app.tools.file_tools import workspace_root
 from app.tools.web_tools import CURRENT_SETTINGS
 
 _MAX_CHARS = 100_000
-_BINARY_SUFFIXES = {".doc", ".docx", ".pdf", ".ppt", ".pptx", ".xls", ".xlsx"}
+# 这些后缀本质是二进制容器（压缩包/图片/音视频/Office），用文本写入必然产出坏文件。
+# 过去只挡了 Office，导致模型可以把 JSON 文本写成 .xmind 交付出去，用户打开只会看到
+# 「文件已损坏」。二进制产物应该走 run_python 写进 MUZI_OUTPUT，再用 deliver_file 交付。
+_BINARY_SUFFIXES = frozenset(
+    {
+        ".doc",
+        ".docx",
+        ".pdf",
+        ".ppt",
+        ".pptx",
+        ".xls",
+        ".xlsx",
+        ".xmind",
+        ".zip",
+        ".7z",
+        ".rar",
+        ".tar",
+        ".gz",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".bmp",
+        ".tif",
+        ".tiff",
+        ".mp3",
+        ".wav",
+        ".mp4",
+        ".mov",
+        ".avi",
+    }
+)
 
 
 class WriteArgs(BaseModel):
@@ -34,7 +66,13 @@ def write_text_file(args: WriteArgs) -> str:
             raise FileDenied()
         suffix = PurePath(args.path).suffix.lower()
         if suffix in _BINARY_SUFFIXES:
-            message = "Word 文档请使用 write_docx" if suffix in {".doc", ".docx"} else "该格式不能当文本写入"
+            if suffix in {".doc", ".docx"}:
+                message = "Word 文档请使用 write_docx"
+            else:
+                message = (
+                    "该格式是二进制容器，不能用文本写入；请在 run_python 里生成文件并写入 "
+                    "MUZI_OUTPUT 目录，再用 deliver_file 交付。不要用文本冒充二进制格式。"
+                )
             return json.dumps(
                 {"source": "workspace", "error": {"code": "file_unavailable", "message": message}},
                 ensure_ascii=False,

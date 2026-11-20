@@ -280,10 +280,8 @@ def test_ask_note_does_not_promise_missing_write_tools() -> None:
     assert "更高权限" in readonly
 
 
-def test_plan_prompt_carries_can_write_through() -> None:
-    """plan 分支同样要把 can_write 传下去，不能回退成默认的「可写」措辞。"""
+def test_plan_mode_no_longer_injects_plugin_notes() -> None:
+    """Plan 已收敛到交互式规划子系统：对话通道不再为 plan 注入插件说明。"""
     from app.services.chat_service import _mode_prompt
 
-    text = _mode_prompt("plan", ["pdf"], "计划说明", can_write=False)
-    assert "计划说明" in text
-    assert "需要写文件时用对应写入工具" not in text
+    assert _mode_prompt("plan", ["pdf"], can_write=False) == ""

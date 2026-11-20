@@ -79,7 +79,7 @@ async def create_share(
     chat_id = body.chat_id or str(snapshot.get("chatId") or "")
 
     # 把方舟临时图片转存 OSS，避免分享链接随临时凭证失效。
-    await persist_ark_images(snapshot, _oss_client(request), chat_id)
+    await persist_ark_images(snapshot, _oss_client(request), chat_id, str(user.id))
 
     share = ChatShare(
         share_id=_new_share_id(),
@@ -89,6 +89,7 @@ async def create_share(
         snapshot=snapshot,
         source_name=(user.display_name or user.username or "").strip()[:120],
         source_username=user.username,
+        source_avatar=user.avatar,
     )
     session.add(share)
     await session.flush()
@@ -151,5 +152,7 @@ async def get_share(share_id: str, session: DbSession) -> SharePublicResponse:
         snapshot=share.snapshot or {},
         source_name=share.source_name,
         source_username=share.source_username,
+        source_avatar=share.source_avatar,
+        source_id=str(share.owner_id) if share.owner_id else None,
         created_at=share.created_at,
     )

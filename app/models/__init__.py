@@ -2,6 +2,7 @@
 
 from app.core.database.redaction import register_redaction_listeners
 from app.models.ask_run import AskRun
+from app.models.assets import GeneratedAsset
 from app.models.base import Base
 from app.models.content import ContentTask
 from app.models.planning import (
@@ -85,6 +86,7 @@ __all__ = [
     "ContentTask",
     "DocArticle",
     "ExecutionEvent",
+    "GeneratedAsset",
     "PluginInstallation",
     "ProfileEdit",
     "RefreshToken",

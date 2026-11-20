@@ -18,6 +18,7 @@ from app.tools.sandbox import (
     SandboxTimeoutError,
     get_provider,
 )
+from app.tools.sandbox import outputs
 from app.tools.web_tools import CURRENT_SETTINGS
 
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}")
@@ -90,20 +91,25 @@ def run_command(args: CommandArgs) -> str:
         network=getattr(settings, "sandbox_network_enabled", True),
     )
     try:
+        before = outputs.snapshot(settings)
         result = get_provider(settings).run(spec)
     except SandboxTimeoutError as exc:
-        return _error("command_timeout", "命令超时", partial=exc.partial_output)
+        return _error(
+            "command_timeout",
+            "命令超时",
+            partial=exc.partial_output,
+            extra=outputs.collect(settings, before),
+        )
     except SandboxExecutionError:
         return _error("command_failed", "命令执行失败")
-    return json.dumps(
-        {
-            "command": args.command,
-            "exit_code": result.exit_code,
-            "output": result.output,
-            "truncated": result.truncated,
-        },
-        ensure_ascii=False,
-    )
+    payload: dict[str, object] = {
+        "command": args.command,
+        "exit_code": result.exit_code,
+        "output": result.output,
+        "truncated": result.truncated,
+    }
+    payload.update(outputs.collect(settings, before))
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _allowlist(settings: object) -> set[str]:
@@ -116,9 +122,17 @@ def _allowlist(settings: object) -> set[str]:
     return names
 
 
-def _error(code: str, message: str, *, partial: str = "") -> str:
+def _error(
+    code: str,
+    message: str,
+    *,
+    partial: str = "",
+    extra: dict[str, object] | None = None,
+) -> str:
     payload: dict[str, object] = {"error": {"code": code, "message": message}}
     if partial.strip():
         payload["output"] = partial
         payload["partial"] = True
+    if extra:
+        payload.update(extra)
     return json.dumps(payload, ensure_ascii=False)

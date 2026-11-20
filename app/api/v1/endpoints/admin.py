@@ -12,7 +12,10 @@ from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import func, select
 
 from app.authorization.application.audit_service import AuditService, QuotaService
-from app.authorization.application.authorization_service import AuthorizationService
+from app.authorization.application.authorization_service import (
+    AuthorizationService,
+    PermissionSnapshot,
+)
 from app.authorization.application.role_service import RoleService, UserPermissionService
 from app.authorization.dependencies import require_permission
 from app.authorization.domain.catalog import max_role_rank
@@ -46,8 +49,10 @@ async def _user_admin_out(
     session: DbSession,
     user: User,
     authz: AuthorizationService,
+    snapshot: PermissionSnapshot | None = None,
 ) -> UserAdminOut:
-    snapshot = await authz.snapshot(user.id)
+    if snapshot is None:
+        snapshot = await authz.snapshot(user.id)
     return UserAdminOut(
         id=user.id,
         email=user.email,
@@ -79,7 +84,12 @@ async def list_users(
             select(User).order_by(User.created_at.desc()).limit(limit).offset(offset)
         )
     )
-    return [await _user_admin_out(session, user, authz) for user in users]
+    # 批量计算权限快照，避免逐用户 N+1 查询（原来每个用户约 7 次查询）。
+    snapshots = await authz.snapshot_many([user.id for user in users])
+    return [
+        await _user_admin_out(session, user, authz, snapshot=snapshots.get(str(user.id)))
+        for user in users
+    ]
 
 
 @router.get("/users/{user_id}", response_model=UserAdminOut, summary="查看用户详情与有效权限")

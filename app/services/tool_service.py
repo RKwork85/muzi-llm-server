@@ -49,7 +49,10 @@ class ToolService:
         *,
         allowed: frozenset[str] | None = None,
     ) -> list[dict[str, str]]:
-        if not calls or len(calls) > 5:
+        # 只拒绝空调用。一轮里并行多少次由每个工具的 max_calls_per_run 与
+        # max_tool_rounds 决定：超出的那几条走「调用次数上限」的软提示，不能因为
+        # 数量多就把整条回答判成坏响应。
+        if not calls:
             raise InvalidModelResponseError()
         validated = []
         for call in calls:

@@ -11,14 +11,17 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Annotated, Any
 
 import httpx
 from fastapi import APIRouter, Depends, Response
 from pydantic import BaseModel, Field
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import get_authenticated_user
 from app.core.config import get_settings
+from app.core.database.deps import DbSession
 from app.core.exceptions import (
     ComfyJobConflictError,
     ComfyJobNotFoundError,
@@ -27,9 +30,12 @@ from app.core.exceptions import (
     UpstreamError,
     UpstreamRateLimitError,
 )
+from app.models.assets import GeneratedAsset
 from app.models.tables import User
 
 router = APIRouter(prefix="/comfy", tags=["comfy"])
+
+logger = logging.getLogger(__name__)
 
 
 class SubmitComfyJobRequest(BaseModel):
@@ -54,6 +60,8 @@ class ComfyJobStatusResponse(BaseModel):
     queue_position: int | None = None
     result: dict[str, Any] | None = None
     error: str | None = None
+    # 提交时的参数（含 prompt 等），用于落库生成资产。
+    params: dict[str, Any] | None = None
 
 
 class ComfyWorkflowItem(BaseModel):
@@ -87,6 +95,53 @@ def _upstream_detail(resp: httpx.Response, fallback: str) -> str:
     except ValueError:
         pass
     return fallback
+
+
+async def _persist_assets(session: Any, user_id: Any, job: ComfyJobStatusResponse) -> None:
+    """任务成功时把产物幂等写入生成资产表（按 job_id + filename 去重）。
+
+    前端轮询查询接口是主服务唯一能确定感知「任务成功」的入口；网关不访问
+    PostgreSQL，所以落库只能由主服务在查询到 succeeded 时补做。
+    """
+    result = job.result or {}
+    outputs = result.get("outputs") or []
+    if not outputs:
+        return
+
+    prompt = None
+    if isinstance(job.params, dict):
+        p = job.params.get("prompt")
+        if isinstance(p, str) and p.strip():
+            prompt = p.strip()
+
+    rows: list[dict[str, Any]] = []
+    for o in outputs:
+        if not isinstance(o, dict):
+            continue
+        filename = o.get("filename")
+        if not filename:
+            continue
+        kind = o.get("kind")
+        if kind not in ("image", "video"):
+            kind = "image"
+        rows.append({
+            "user_id": user_id,
+            "source": "comfy",
+            "kind": kind,
+            "workflow_id": job.workflow_id or None,
+            "job_id": job.job_id or None,
+            "prompt": prompt,
+            "filename": filename,
+            "subfolder": o.get("subfolder") or "",
+            "type": o.get("type") or "output",
+            "url": o.get("url"),
+        })
+
+    if not rows:
+        return
+    stmt = pg_insert(GeneratedAsset).values(rows)
+    stmt = stmt.on_conflict_do_nothing(index_elements=["job_id", "filename"])
+    await session.execute(stmt)
 
 
 @router.post("/jobs", response_model=SubmitComfyJobResponse, summary="提交图像/视频生成任务（登录态）")
@@ -125,6 +180,7 @@ async def submit_comfy_job(
 async def get_comfy_job(
     job_id: str,
     user: Annotated[User, Depends(get_authenticated_user)],
+    session: DbSession,
 ) -> ComfyJobStatusResponse:
     _require_enabled()
     url = f"{_base_url()}/jobs/{job_id}"
@@ -143,7 +199,15 @@ async def get_comfy_job(
     if resp.status_code != 200:
         raise UpstreamError(_upstream_detail(resp, "图像生成服务返回异常"))
 
-    return ComfyJobStatusResponse(**resp.json())
+    job = ComfyJobStatusResponse(**resp.json())
+    # 任务成功时把产物落库到生成资产表，供资产页展示。幂等，轮询重复命中不重复写入。
+    # 落库失败（如表尚未建、数据库抖动）只记日志，不阻断查询响应，避免前端轮询被连带打挂。
+    if job.status == "succeeded":
+        try:
+            await _persist_assets(session, user.id, job)
+        except Exception:  # noqa: BLE001 —— 资产落库是旁路增强，失败不阻断主流程
+            logger.exception("生成资产落库失败 job_id=%s", job.job_id)
+    return job
 
 
 @router.delete("/jobs/{job_id}", summary="取消排队中的生成任务（登录态）")

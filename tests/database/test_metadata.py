@@ -63,6 +63,7 @@ EXPECTED_TABLES = {
     "doc_articles",
     "content_tasks",
     "plan_todos",
+    "generated_assets",
 }
 
 ON_DELETE = {
@@ -110,6 +111,7 @@ ON_DELETE = {
     ("access_audit_logs", "actor_id"): "SET NULL",
     ("access_audit_logs", "subject_id"): "SET NULL",
     ("usage_quotas", "user_id"): "CASCADE",
+    ("generated_assets", "user_id"): "CASCADE",
     ("usage_quotas", "adjusted_by"): "SET NULL",
     ("quota_adjustments", "user_id"): "CASCADE",
     ("quota_adjustments", "actor_id"): "SET NULL",

@@ -36,9 +36,8 @@ from app.schemas.chat import (
     ToolCallRequest,
 )
 from app.schemas.common import Usage
-from app.data.context import CURRENT_DATA_STORE, CURRENT_OSS_CLIENT, CURRENT_TASK_ID
+from app.data.context import CURRENT_DATA_STORE, CURRENT_OSS_CLIENT, CURRENT_TASK_ID, CURRENT_USER_ID
 from app.services.prompt_service import PromptService
-from app.core.exceptions import PromptNotFoundError
 from app.mcp.service import overlay_tools
 from app.services.tool_service import ToolService
 from app.tools.registry import ToolRegistry, ToolSpec
@@ -343,7 +342,6 @@ class ChatService:
         extra = _mode_prompt(
             mode,
             plugin_names,
-            self._plan_instructions(),
             can_write=bool({"write_docx", "write_text_file"}.intersection(names)),
         )
         if self.skill_runtime is not None and "discover_skills" in names and body.skill_mode != "explicit":
@@ -552,6 +550,12 @@ class ChatService:
                 },
             )
         except AppError as exc:
+            logger.warning(
+                "stream aborted request_id=%s code=%s detail=%s",
+                prepared.request_id,
+                exc.code,
+                " ".join(str(exc.message).split())[:200],
+            )
             if last_usage is not None:
                 yield self._usage_frame(
                     prepared,
@@ -562,7 +566,7 @@ class ChatService:
                 )
             yield _sse_error(prepared.request_id, exc)
         except Exception:
-            logger.error("stream failed request_id=%s", prepared.request_id)
+            logger.error("stream failed request_id=%s", prepared.request_id, exc_info=True)
             if last_usage is not None:
                 yield self._usage_frame(
                     prepared,
@@ -593,6 +597,7 @@ class ChatService:
             ledger_text or "ask",
             prepared.request_id,
             workspace_scope,
+            prepared.principal_id,
         )
         from app.tools.stdio_access import CURRENT_MCP_USER
 
@@ -657,7 +662,7 @@ class ChatService:
                                     round_usage,
                                     messages=messages,
                                     output_text="".join(parts),
-                                    tool_calls=_calls_from_slots(slots) if saw_tools else [],
+                                    tool_calls=_best_effort_calls(slots) if saw_tools else [],
                                     status="cancelled",
                                 )
                             return
@@ -754,26 +759,38 @@ class ChatService:
                         if delta:
                             yield format_sse("delta", {"request_id": prepared.request_id, **delta})
                 except AppError as exc:
+                    logger.warning(
+                        "stream round aborted request_id=%s round=%s code=%s detail=%s",
+                        prepared.request_id,
+                        rounds + 1,
+                        exc.code,
+                        " ".join(str(exc.message).split())[:200],
+                    )
                     if round_usage is not None:
                         yield self._usage_frame(
                             prepared,
                             round_usage,
                             messages=messages,
                             output_text="".join(parts),
-                            tool_calls=_calls_from_slots(slots) if saw_tools else [],
+                            tool_calls=_best_effort_calls(slots) if saw_tools else [],
                             status="failed",
                         )
                     yield _sse_error(prepared.request_id, exc)
                     return
                 except Exception:
-                    logger.error("stream failed request_id=%s", prepared.request_id)
+                    logger.error(
+                        "stream failed request_id=%s round=%s",
+                        prepared.request_id,
+                        rounds + 1,
+                        exc_info=True,
+                    )
                     if round_usage is not None:
                         yield self._usage_frame(
                             prepared,
                             round_usage,
                             messages=messages,
                             output_text="".join(parts),
-                            tool_calls=_calls_from_slots(slots) if saw_tools else [],
+                            tool_calls=_best_effort_calls(slots) if saw_tools else [],
                             status="failed",
                         )
                     yield _sse_error(prepared.request_id, InternalError())
@@ -943,9 +960,17 @@ class ChatService:
                     {"request_id": prepared.request_id, "phase": "answering"},
                 )
         except AppError as exc:
+            # 带上 code，否则日志里只有「stream failed」，无法区分是坏响应、
+            # 参数无效还是工具不可用，排查只能靠猜。
+            logger.warning(
+                "ask stream aborted request_id=%s code=%s detail=%s",
+                prepared.request_id,
+                exc.code,
+                " ".join(str(exc.message).split())[:200],
+            )
             yield _sse_error(prepared.request_id, exc)
         except Exception:
-            logger.error("ask stream failed request_id=%s", prepared.request_id)
+            logger.error("ask stream failed request_id=%s", prepared.request_id, exc_info=True)
             yield _sse_error(prepared.request_id, InternalError())
         finally:
             for var, token in reversed(tokens):
@@ -972,16 +997,6 @@ class ChatService:
             owned_scopes=owned_scopes,
         )
 
-    def _plan_instructions(self) -> str:
-        """Plan 模式的行为说明来自 app/prompts/system/plan_mode.md。
-
-        文件缺失或为空时返回空字符串，由 _mode_prompt 退回内置的精简说明。
-        """
-        try:
-            return self.prompts.render("plan_mode").strip()
-        except PromptNotFoundError:
-            return ""
-
     def _ask_needs_untrusted(self, names: tuple[str, ...]) -> bool:
         if self.ask_tools is None:
             return False
@@ -996,6 +1011,7 @@ class ChatService:
         message: str,
         request_id: str,
         workspace_scope: str | None = None,
+        user_id: str | None = None,
     ) -> list[tuple[Any, Any]]:
         tokens: list[tuple[Any, Any]] = [
             (CURRENT_SETTINGS, CURRENT_SETTINGS.set(self.settings)),
@@ -1013,6 +1029,8 @@ class ChatService:
             tokens.append((CURRENT_TASK_ID, CURRENT_TASK_ID.set(request_id)))
         if self.oss_client is not None:
             tokens.append((CURRENT_OSS_CLIENT, CURRENT_OSS_CLIENT.set(self.oss_client)))
+            # 上传按用户分层：users/{user_id}/...，与资产管理同一维度
+            tokens.append((CURRENT_USER_ID, CURRENT_USER_ID.set(user_id)))
         return tokens
 
     def _prepare_workspace(self, request_id: str, workspace_scope: str) -> None:
@@ -1207,29 +1225,19 @@ def _download_payload(content: Any) -> dict[str, Any] | None:
     }
 
 
-_DEFAULT_PLAN_PROMPT = (
-    "你处于 Plan 模式。像专业顾问一样正常对话：用户提问就回答，需要澄清时用交互卡片收集信息。"
-    "只在用户要一份计划时，才输出目标与有顺序的步骤。"
-    "不要写文件，不要声称已经修改了外部应用。"
-    "需要写入、发送文件或调用外部应用时，写明交给 Agent 执行。"
-)
-
-
 def _mode_prompt(
     mode: str,
     skill_names: list[str],
-    plan_instructions: str = "",
     *,
     can_write: bool = True,
 ) -> str:
+    # Plan 模式已收敛到交互式规划子系统（app/planning），对话通道不再注入 plan 提示词；
+    # plan_mode.md 只由规划引擎消费，成为唯一事实源。
     if mode == "plan":
-        note = skill_notes(skill_names, execute=False, can_write=can_write)
-        # 优先使用 app/prompts/system/plan_mode.md 的完整说明
-        text = (plan_instructions or "").strip() or _DEFAULT_PLAN_PROMPT
-        return f"{text}\n\n{note}" if note else text
+        return ""
     if mode == "agent":
         return skill_notes(skill_names, execute=True, can_write=can_write)
-    # ask：不加载 SKILL.md、不给技能脚本，但 `/` 选中的插件是内置能力说明，必须注入，
+    # ask（以及任何未知模式）：不加载 SKILL.md、不给技能脚本，但 `/` 选中的插件是内置能力说明，必须注入，
     # 否则前端选完 pdf/word 后端静默丢弃，用户看到的是「选了没用」。
     return skill_notes(skill_names, execute=None, can_write=can_write)
 
@@ -1671,15 +1679,36 @@ def _absorb_tool_parts(
 
 
 def _calls_from_slots(slots: dict[int, dict[str, str]]) -> list[ToolCall]:
+    """把流式累积的槽位收成 ToolCall 列表。
+
+    这里只校验**结构完整性**（每个调用必须同时有 id 和 name），不判断「并发调用是否
+    过多」。模型一轮里并行发多个工具调用是合法行为，超出预算应由
+    `max_calls_per_run` / `max_tool_rounds` 逐条拦截并回一条错误结果给模型，
+    绝不能把整条回答判成坏响应——那会让用户看到「模型返回了无法解析的响应」，
+    而真正原因只是「一次问得太多」。
+    """
     calls: list[ToolCall] = []
     for index in sorted(slots):
         slot = slots[index]
         if not slot["id"] or not slot["name"]:
             raise InvalidModelResponseError()
         calls.append(ToolCall(id=slot["id"], name=slot["name"], arguments=slot["arguments"]))
-    if not calls or len(calls) > 5:
+    if not calls:
         raise InvalidModelResponseError()
     return calls
+
+
+def _best_effort_calls(slots: dict[int, dict[str, str]]) -> list[ToolCall]:
+    """失败/取消路径上的槽位收集：结构不全时返回空，不要二次抛错。
+
+    这些调用点都在 `except` 分支里，此时再用严格版 `_calls_from_slots`，
+    半截的工具调用会让「统计一条失败用量」变成「再抛一个异常」，
+    把真正的错误原因盖掉。
+    """
+    try:
+        return _calls_from_slots(slots)
+    except AppError:
+        return []
 
 
 def _tool_limit_message(call: ToolCall) -> dict[str, str]:

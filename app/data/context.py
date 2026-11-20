@@ -12,3 +12,6 @@ if TYPE_CHECKING:
 CURRENT_TASK_ID: ContextVar[str | None] = ContextVar("agent_data_task", default=None)
 CURRENT_DATA_STORE: ContextVar["DataStore | None"] = ContextVar("agent_data_store", default=None)
 CURRENT_OSS_CLIENT: ContextVar["OssUploadClient | None"] = ContextVar("agent_oss_client", default=None)
+# 上传路径要按用户分层（users/{user_id}/...）。工具里拿不到请求上下文，
+# 所以和 task_id 一样用 ContextVar 传递；缺失时调用方会回退旧布局。
+CURRENT_USER_ID: ContextVar[str | None] = ContextVar("agent_oss_user", default=None)

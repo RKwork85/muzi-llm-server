@@ -300,9 +300,8 @@ def test_ask_stream_calls_allowlisted_tool(provider: FakeProvider) -> None:
     ) as response:
         assert response.status_code == 200
         response.read()
-    plan_offered = [item["function"]["name"] for item in provider.calls[-1].tools]
-    assert "write_text_file" not in plan_offered
-    assert "mcp__fake__echo" not in plan_offered
+    # Plan 已收敛到交互式规划子系统：对话通道不再挂载任何工具（含 MCP）。
+    assert provider.calls[-1].tools is None
     assert mcp_is_available() is False
 
 

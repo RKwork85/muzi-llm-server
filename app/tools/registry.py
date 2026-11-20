@@ -393,7 +393,7 @@ def build_agent_registry(search_calls: int = 5, fetch_calls: int = 5) -> ToolReg
             access="sandbox_exec",
             idempotent=False,
             toolset="code",
-            max_calls_per_run=3,
+            max_calls_per_run=8,
             # 沙盒自身最多 60 秒，这里留出依赖安装与启动余量。
             timeout_s=90,
         )

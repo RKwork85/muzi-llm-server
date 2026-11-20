@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import logging
 import json
 import uuid
+from collections.abc import AsyncIterator
 from typing import Annotated
 
 from fastapi import APIRouter, Body, Depends, Request
@@ -75,6 +78,52 @@ def _stream_event(frame: str) -> tuple[str, dict[str, object]] | None:
     except (TypeError, ValueError):
         return None
     return event_name, value if isinstance(value, dict) else {}
+
+
+_STREAM_HEARTBEAT_SECONDS = 15.0
+
+
+async def _with_heartbeat(
+    frames: AsyncIterator[str],
+    interval: float = _STREAM_HEARTBEAT_SECONDS,
+) -> AsyncIterator[str]:
+    """空闲超过 interval 秒就补一条 SSE 注释帧保活。
+
+    长思考阶段上游可能几十秒不出分片，nginx 默认 ``proxy_read_timeout 60s`` 会把连接掐掉，
+    浏览器侧表现为 ``TypeError: network error``。不能用 ``wait_for(gen.__anext__())`` 实现：
+    超时会取消生成器，后续再也取不到分片。这里把生产侧放进独立任务，消费侧只等队列。
+    """
+    queue: asyncio.Queue[tuple[str, str | BaseException | None]] = asyncio.Queue()
+
+    async def pump() -> None:
+        try:
+            async for frame in frames:
+                await queue.put(("frame", frame))
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - 原样抛回响应体，交给上层收尾
+            await queue.put(("error", exc))
+        else:
+            await queue.put(("end", None))
+
+    task = asyncio.create_task(pump())
+    try:
+        while True:
+            try:
+                kind, payload = await asyncio.wait_for(queue.get(), interval)
+            except TimeoutError:
+                yield ": ping\n\n"
+                continue
+            if kind == "frame":
+                yield str(payload)
+                continue
+            if kind == "error":
+                raise payload if isinstance(payload, BaseException) else RuntimeError("stream failed")
+            return
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 async def _begin_persisted_ask(session, owner: User, conversation_id: str, prepared, external_id: str, external_type: str):
@@ -160,7 +209,11 @@ async def _persisted_stream(
         if not applied:
             terminal_sealed = True
             return False
-        if terminal_type == PlanningEventType.CHAT_DONE and (assistant_text or reasoning_text):
+        # 正常完成与客户端中断（切换页面/停止）都落库已生成的正文，
+        # 避免用户切走页面后这一轮回答在服务端彻底丢失。
+        if terminal_type in (PlanningEventType.CHAT_DONE, PlanningEventType.CHAT_CANCELLED) and (
+            assistant_text or reasoning_text
+        ):
             session.add(
                 ConversationMessage(
                     session_id=conversation.id,
@@ -284,7 +337,23 @@ async def _persisted_stream(
         if not terminal_sealed:
             await seal_terminal()
     except BaseException:
-        await session.rollback()
+        # 客户端断开（切页面/刷新/停止）会以 CancelledError 或断开异常打断流式。
+        # 此时把已生成的部分回答落库（seal 为 cancelled），避免这一轮回答在服务端彻底丢失。
+        if not terminal_sealed:
+            terminal_type = PlanningEventType.CHAT_CANCELLED
+            terminal_payload = {"run_id": run_id, "reason": "client_disconnected"}
+            try:
+                await seal_terminal()
+            except BaseException:
+                await session.rollback()
+                logger.warning(
+                    "seal cancelled transcript failed conversation_id=%s run_id=%s",
+                    conversation_id,
+                    run_id,
+                    exc_info=True,
+                )
+        else:
+            await session.rollback()
         raise
     finally:
         if usage_total > settled_total:
@@ -640,15 +709,17 @@ async def stream_completion(
                 await chat_run_registry.register(external_id, str(owner.id))
             try:
                 async for frame in _with_execution(
-                    _persisted_stream(
-                        service,
-                        prepared,
-                        request,
-                        scope_dirname(request.headers.get("x-workspace-key")),
-                        session,
-                        owner,
-                        body.conversation_id,
-                        server_run_id,
+                    _with_heartbeat(
+                        _persisted_stream(
+                            service,
+                            prepared,
+                            request,
+                            scope_dirname(request.headers.get("x-workspace-key")),
+                            session,
+                            owner,
+                            body.conversation_id,
+                            server_run_id,
+                        )
                     )
                 ):
                     yield frame
@@ -668,10 +739,12 @@ async def stream_completion(
 
         try:
             async for frame in _with_execution(
-                service.iter_sse(
-                    prepared,
-                    request.is_disconnected,
-                    scope_dirname(request.headers.get("x-workspace-key")),
+                _with_heartbeat(
+                    service.iter_sse(
+                        prepared,
+                        request.is_disconnected,
+                        scope_dirname(request.headers.get("x-workspace-key")),
+                    )
                 )
             ):
                 parsed = _stream_event(frame)

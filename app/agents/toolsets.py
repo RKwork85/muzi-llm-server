@@ -91,7 +91,9 @@ def chat_mode_tool_names(
 ) -> tuple[str, ...]:
     """对话通道按模式取工具。权限快照由调用方传入，缺省时读执行上下文。"""
     if mode == "plan":
-        return plan_tool_names(registry, settings, permissions=permissions)
+        # Plan 模式已收敛到交互式规划子系统（app/planning）：对话通道不再挂载工具。
+        # 保留枚举只为兼容旧客户端，返回空名单，避免任何写工具被误注入。
+        return ()
     if mode == "agent":
         return agent_chat_tool_names(
             registry,

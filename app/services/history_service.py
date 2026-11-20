@@ -40,6 +40,7 @@ _PLANNING_KEYS = (
     "gen_image_meta",
     "gen_image_started_at",
     "gen_image_duration_sec",
+    "answer_error",
     "interaction",
     "plan",
     "run",
@@ -90,8 +91,17 @@ def _rewrite_urls(node: Any, mapping: dict[str, str]) -> None:
                 _rewrite_urls(value, mapping)
 
 
-async def persist_ark_images(snapshot: dict[str, Any], oss_client: OssUploadClient | None, chat_id: str = "") -> None:
-    """把快照里的方舟临时图片下载并转存 OSS，替换为永久 URL（尽力而为）。"""
+async def persist_ark_images(
+    snapshot: dict[str, Any],
+    oss_client: OssUploadClient | None,
+    chat_id: str = "",
+    user_id: str = "",
+) -> None:
+    """把快照里的方舟临时图片下载并转存 OSS，替换为永久 URL（尽力而为）。
+
+    布局：给了 user_id 时走 `users/{uid}/chat/{chat_id}/{YYYY-MM}/...`，
+    与资产管理和其他产物按同一用户维度归拢；没有 user_id 时回退旧前缀。
+    """
     if not isinstance(snapshot, dict) or oss_client is None:
         return
     urls: list[str] = []
@@ -100,7 +110,9 @@ async def persist_ark_images(snapshot: dict[str, Any], oss_client: OssUploadClie
     if not unique:
         return
 
-    upload_path = oss_client.upload_path_for(f"chat-history/{chat_id}" if chat_id else "chat-history")
+    legacy_path = oss_client.upload_path_for(f"chat-history/{chat_id}" if chat_id else "chat-history")
+    # chat_id 只允许字母数字和 -_，避免把任意字符串拼进对象键（网关侧也会再校验一次）。
+    scope = re.sub(r"[^A-Za-z0-9_-]", "", chat_id)[:64]
     mapping: dict[str, str] = {}
     transport = httpx.AsyncHTTPTransport()
     async with httpx.AsyncClient(transport=transport, timeout=httpx.Timeout(15.0), follow_redirects=True) as client:
@@ -114,7 +126,10 @@ async def persist_ark_images(snapshot: dict[str, Any], oss_client: OssUploadClie
                 )
                 uploaded = await oss_client.upload_files(
                     [(f"chat_image_{uuid4().hex[:12]}{suffix}", response.content)],
-                    upload_path,
+                    legacy_path,
+                    user_id=user_id or None,
+                    category="chat",
+                    scope=scope,
                 )
                 if uploaded and uploaded[0]:
                     mapping[url] = uploaded[0]
@@ -452,7 +467,7 @@ class HistoryService:
             await self.delete(owner_id, chat_id)
             return {"chat_id": chat_id, "deleted": True}
 
-        await persist_ark_images(snapshot, oss_client, chat_id)
+        await persist_ark_images(snapshot, oss_client, chat_id, str(owner_id))
         # 图片转存会改 content/generated_images，重新拆解一次以落最新 URL
         messages = _split_messages(snapshot)
 

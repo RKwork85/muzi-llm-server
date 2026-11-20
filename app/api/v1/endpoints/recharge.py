@@ -41,6 +41,9 @@ class RechargeCreateResponse(BaseModel):
     tokens: int
     payee_name: str = ""
     qrcode_url: str = ""
+    # 内联二维码（data:image/png;base64,...），由支付服务生成后原样透传。
+    # 前端优先用它：`qrcode_url` 依赖支付服务的对外地址，跨设备/外网时容易裂图。
+    qrcode_data_url: str = ""
 
 
 class RechargeOrderStatus(BaseModel):
