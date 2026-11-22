@@ -16,16 +16,18 @@ from uuid import UUID
 from fastapi import APIRouter, Query
 from sqlalchemy import func, select
 
-from app.authorization.domain.pages import PAGE_CATALOG
+from app.authorization.application.authorization_service import AuthorizationService
+from app.authorization.domain.pages import PAGE_ACCESS_CODES, PAGE_CATALOG
 from app.core.database.deps import DbSession
 from app.core.exceptions import DocArticleNotFoundError
+from app.models.rbac import Role
 from app.models.tables import DocArticle, User
 from app.schemas.docs import (
     PublicDocDetailResponse,
     PublicDocListItem,
     PublicDocListResponse,
 )
-from app.schemas.rbac import PageCatalogOut, PageOut
+from app.schemas.rbac import AnonymousAccessOut, PageCatalogOut, PageOut
 from app.services.doc_text import author_name, excerpt
 
 router = APIRouter(prefix="/public", tags=["public"])
@@ -50,6 +52,30 @@ async def get_page_catalog() -> PageCatalogOut:
             for spec in PAGE_CATALOG
         ]
     )
+
+
+@router.get(
+    "/anonymous-access",
+    response_model=AnonymousAccessOut,
+    summary="匿名访客的页面浏览权限",
+)
+async def get_anonymous_access(session: DbSession) -> AnonymousAccessOut:
+    """未登录访问者的页面准入依据：数据库里 ``anonymous`` 角色的浏览权限。
+
+    前端路由守卫在「未检测到角色信息」（未登录）时读这份快照，据此判定
+    该路由是放行还是跳登录——匿名访客不再写死，而是由后台对该角色的勾选决定。
+    角色不存在或停用时返回空权限，前端只放行 ``meta.public`` 路由。
+
+    只暴露页面浏览码（``*.access``），不携带任何账号私有数据。
+    """
+    role = await session.scalar(select(Role).where(Role.code == "anonymous"))
+    if role is None:
+        return AnonymousAccessOut(active=False, permissions=[])
+    if role.status != "active":
+        return AnonymousAccessOut(role_name=role.name, active=False, permissions=[])
+    granted = await AuthorizationService(session).role_permissions("anonymous")
+    page_perms = sorted(PAGE_ACCESS_CODES & granted)
+    return AnonymousAccessOut(role_name=role.name, active=True, permissions=page_perms)
 
 
 @router.get("/docs", response_model=PublicDocListResponse, summary="列出所有已出版的文档")

@@ -199,6 +199,20 @@ class PageCatalogOut(BaseModel):
     pages: list[PageOut] = Field(default_factory=list)
 
 
+class AnonymousAccessOut(BaseModel):
+    """匿名访客（未登录）的页面浏览权限快照。
+
+    未登录访问者不属于任何账号，前端路由守卫没有「角色信息」可查；
+    这里把数据库里 ``anonymous`` 角色的页面浏览权限下发，作为未登录时的
+    准入依据。角色不存在或停用则 permissions 为空，前端只放行 meta.public 路由。
+    """
+
+    role_code: str = "anonymous"
+    role_name: str = "匿名用户"
+    active: bool = False
+    permissions: list[str] = Field(default_factory=list)
+
+
 class ModeCapabilitiesOut(BaseModel):
     """某个模式下实际可用的工具、工具集与 `/` 插件面板。"""
 
