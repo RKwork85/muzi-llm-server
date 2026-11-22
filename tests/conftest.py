@@ -17,6 +17,9 @@ def make_settings(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "deepseek_api_key": "sk-test-not-real",
         "deepseek_base_url": "https://api.deepseek.com",
+        # 显式留空：本机 .env 里的真实密钥会经 load_dotenv 进入 os.environ，
+        # 不写死这一项，「未配密钥」用例会真的出网调用方舟，变成环境相关失败。
+        "ark_api_key": "",
         "deepseek_model": "deepseek-flash",
         "deepseek_model_allowlist": "deepseek-flash,deepseek-v4-pro",
         "deepseek_timeout_seconds": 5,
@@ -43,6 +46,23 @@ def make_settings(**overrides: object) -> Settings:
 @pytest.fixture
 def settings() -> Settings:
     return make_settings()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_prompt_settings(tmp_path):
+    """提示词开关是落盘的全局状态，用例必须自带一份空开关。
+
+    否则本机 / CI 上有人把面板里的提示词全关掉后，所有人设、插件说明和工具
+    schema 都会消失，一批与开关无关的用例会莫名其妙地红。
+    """
+    from app.prompts import settings as prompt_settings
+
+    original = prompt_settings._PATH
+    prompt_settings.reset_for_tests(tmp_path / "prompt_settings.json")
+    try:
+        yield
+    finally:
+        prompt_settings.reset_for_tests(original)
 
 
 @pytest.fixture
