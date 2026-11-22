@@ -198,6 +198,239 @@ async def generate_images(
     return payload
 
 
+# 文生视频只开放画布节点用到的这一档，避免把方舟视频接口变成任意模型代理。
+VIDEO_MODEL_ID = "doubao-seedance-2-5-flash-261115"
+VIDEO_RATIOS = {"adaptive", "16:9", "4:3", "1:1", "3:4", "9:16", "21:9"}
+VIDEO_RESOLUTIONS = {"480p", "720p"}
+VIDEO_DURATION_RANGE = (4, 15)
+# 图生视频（带参考图）在画布上最长 6 秒；方舟 Flash 最短 4 秒。
+VIDEO_I2V_DURATION_RANGE = (4, 6)
+_TASK_ID = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+
+
+def _video_task_id(task_id: str) -> str:
+    text = (task_id or "").strip()
+    if not _TASK_ID.fullmatch(text):
+        raise InvalidRequestError("视频任务 ID 无效")
+    return text
+
+
+def _video_url(payload: dict[str, Any]) -> str:
+    content = payload.get("content")
+    if isinstance(content, dict):
+        url = content.get("video_url")
+        if isinstance(url, str) and url.strip():
+            return url.strip()
+        if isinstance(url, dict) and isinstance(url.get("url"), str):
+            return url["url"].strip()
+    if isinstance(content, list):
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            url = item.get("video_url")
+            if isinstance(url, str) and url.strip():
+                return url.strip()
+            if isinstance(url, dict) and isinstance(url.get("url"), str):
+                return url["url"].strip()
+    return ""
+
+
+def _video_tokens(payload: dict[str, Any]) -> int:
+    usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+    total = int(usage.get("total_tokens") or 0)
+    if total <= 0:
+        total = int(usage.get("completion_tokens") or 0)
+    return max(0, total)
+
+
+def _ark_error_message(payload: Any, fallback: str) -> str:
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict) and error.get("message"):
+            return str(error["message"])
+        if isinstance(error, str) and error.strip():
+            return error.strip()
+    return fallback
+
+
+def _build_video_body(body: dict[str, Any]) -> dict[str, Any]:
+    """把画布参数收成 Seedance 视频请求。
+
+    文生视频不传 resolution，交给模型默认。
+    图生视频带参考图时提交 resolution（480p / 720p），时长限制在 4–6 秒。
+    自动尺寸走首帧（ratio=adaptive）；指定尺寸走参考图，方舟才会采纳 ratio。
+    首尾帧同时传 image 与 last_image，比例固定 adaptive，角色为首帧和尾帧。
+    """
+    model = str(body.get("model") or "").strip()
+    if model != VIDEO_MODEL_ID:
+        raise InvalidRequestError("当前只支持 Doubao-Seedance-2.5-flash")
+    prompt = body.get("prompt")
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise InvalidRequestError("缺少视频提示词")
+
+    ratio = str(body.get("ratio") or "adaptive").strip() or "adaptive"
+    if ratio not in VIDEO_RATIOS:
+        raise InvalidRequestError("画幅不在方舟支持的范围内")
+
+    image = body.get("image")
+    last_image = body.get("last_image")
+    has_image = isinstance(image, str) and bool(image.strip()) and not image.strip().startswith("blob:")
+    has_last = isinstance(last_image, str) and bool(last_image.strip()) and not last_image.strip().startswith("blob:")
+    low, high = VIDEO_I2V_DURATION_RANGE if has_image or has_last else VIDEO_DURATION_RANGE
+    try:
+        duration = int(body.get("duration"))
+    except (TypeError, ValueError):
+        duration = 5
+    duration = max(low, min(high, duration))
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt.strip()}]
+    payload: dict[str, Any] = {
+        "model": model,
+        "content": content,
+        "ratio": ratio,
+        "duration": duration,
+        "watermark": False,
+    }
+    if has_last:
+        # Seedance 2.5 首尾帧只接受 adaptive，具体画幅跟随首帧。
+        payload["ratio"] = "adaptive"
+        if has_image:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image.strip()},
+                    "role": "first_frame",
+                }
+            )
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": last_image.strip()},
+                "role": "last_frame",
+            }
+        )
+    elif has_image:
+        image_url = image.strip()
+        if ratio == "adaptive":
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                    "role": "first_frame",
+                }
+            )
+        else:
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": image_url},
+                    "role": "reference_image",
+                }
+            )
+            payload["omni_reference_task_type"] = "reference"
+    resolution = str(body.get("resolution") or "").strip().lower()
+    if resolution:
+        if resolution not in VIDEO_RESOLUTIONS:
+            raise InvalidRequestError("分辨率只支持 480p 或 720p")
+        payload["resolution"] = resolution
+    seed = body.get("seed")
+    if seed is not None and seed != "":
+        try:
+            payload["seed"] = max(0, min(int(seed), 2**32 - 1))
+        except (TypeError, ValueError):
+            pass
+    return payload
+
+
+async def _ark_json(settings, method: str, path: str, *, json_body: dict[str, Any] | None = None) -> dict[str, Any]:
+    url = f"{settings.ark_base_url.rstrip('/')}/{path.lstrip('/')}"
+    try:
+        async with httpx.AsyncClient(timeout=settings.ark_timeout_seconds) as client:
+            response = await client.request(
+                method,
+                url,
+                headers=_auth_headers(settings, json_body=json_body is not None),
+                json=json_body,
+            )
+    except httpx.HTTPError as exc:
+        raise UpstreamError("方舟视频生成失败") from exc
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise UpstreamError("方舟视频响应无法解析") from exc
+    if response.status_code >= 400:
+        raise UpstreamError(_ark_error_message(payload, "方舟视频生成失败"))
+    if not isinstance(payload, dict):
+        raise UpstreamError("方舟视频响应无法解析")
+    return payload
+
+
+@router.post("/videos/generations", summary="创建 Seedance 文生视频任务")
+async def create_video(
+    request: Request,
+    session: DbSession,
+    user: Annotated[User, Depends(get_authenticated_user)],
+) -> dict[str, Any]:
+    settings = _settings(request)
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise InvalidRequestError("视频请求不是合法 JSON") from exc
+    if not isinstance(body, dict):
+        raise InvalidRequestError("视频请求格式无效")
+    payload = _build_video_body(body)
+    await QuotaService(session).authorize(user.id)
+    await session.commit()
+    created = await _ark_json(settings, "POST", "contents/generations/tasks", json_body=payload)
+    task_id = str(created.get("id") or "").strip()
+    if not task_id:
+        raise UpstreamError("方舟没有返回视频任务 ID")
+    return created
+
+
+@router.get("/videos/generations/{task_id}", summary="查询 Seedance 文生视频任务")
+async def get_video(
+    task_id: str,
+    request: Request,
+    user: Annotated[User, Depends(get_authenticated_user)],
+) -> dict[str, Any]:
+    settings = _settings(request)
+    safe_id = _video_task_id(task_id)
+    payload = await _ark_json(settings, "GET", f"contents/generations/tasks/{safe_id}")
+    url = _video_url(payload)
+    if url:
+        payload["video_url"] = url
+    status = str(payload.get("status") or "")
+    if status == "succeeded":
+        tokens = _video_tokens(payload)
+        await settle_in_new_session(
+            user.id,
+            source="video",
+            settlement_key=f"ark-video:{safe_id}",
+            amount=tokens,
+            kind="video",
+            model=str(payload.get("model") or VIDEO_MODEL_ID),
+            completion_tokens=tokens,
+            trace_id=get_request_id(),
+        )
+    return payload
+
+
+@router.delete("/videos/generations/{task_id}", summary="取消 Seedance 文生视频任务")
+async def cancel_video(
+    task_id: str,
+    request: Request,
+    _user: Annotated[User, Depends(get_authenticated_user)],
+) -> dict[str, Any]:
+    settings = _settings(request)
+    safe_id = _video_task_id(task_id)
+    try:
+        return await _ark_json(settings, "DELETE", f"contents/generations/tasks/{safe_id}")
+    except UpstreamError:
+        # 已经开始执行或任务不存在时，前端轮询会拿到终态，取消失败不打断本地停止
+        return {"id": safe_id, "status": "canceled"}
+
+
 @router.post("/chat/stream", summary="经服务端转发方舟流式对话并结算额度")
 async def stream_chat(
     request: Request,

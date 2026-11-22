@@ -153,6 +153,15 @@ class Settings(BaseSettings):
     oss_upload_timeout_seconds: float = Field(default=20, gt=0, le=30)
     # 网关开了 API_TOKEN 时必须一致，否则写接口 401。
     oss_upload_token: str = ""
+    # 画布上传图的孤儿回收：引用计数归零且超过宽限期的图会被删（行 + OSS 对象）。
+    flow_image_gc_enabled: bool = True
+    flow_image_gc_interval_seconds: int = Field(default=3600, ge=60, le=86400)
+    flow_image_gc_grace_seconds: int = Field(default=86400, ge=0, le=2_592_000)
+    # qs-datacapture 直调采集服务（改造后封装成常驻 HTTP 服务）。留空则不启用采集。
+    qs_datacapture_base_url: str = ""
+    qs_datacapture_username: str = "admin"
+    qs_datacapture_password: str = "admin123"
+    qs_datacapture_timeout_seconds: float = Field(default=600, gt=0, le=1800)
     mcp_enabled: bool = False
     mcp_server_name: str = "server"
     mcp_command: str = ""
@@ -188,6 +197,12 @@ class Settings(BaseSettings):
     redis_password: str = Field(default="", repr=False)
     # Taskiq broker 独立 Redis db：db0 业务键、db1 muzi-comfy-service、db2 主服务任务队列。
     taskiq_redis_db: int = Field(default=2, ge=0, le=15)
+    # 内容任务队列是否在服务进程内直接消费（默认开启，无需独立 worker 进程）。
+    # 生产如需水平扩展（多进程/多机消费）可关闭，改回独立 ``python -m app.content.worker``。
+    content_worker_inprocess: bool = True
+    # 进程内消费时同时执行的任务数。采集是重活（全浏览器 Playwright），
+    # 并发太高会同时开多个浏览器窗口，默认串行最稳妥。
+    content_worker_max_async_tasks: int = Field(default=1, ge=1, le=8)
     database_startup_required: bool = False
     db_pool_size: int = Field(default=5, ge=1, le=20)
     db_max_overflow: int = Field(default=10, ge=0, le=40)
@@ -213,6 +228,32 @@ class Settings(BaseSettings):
     sms_mns_endpoint: str = "https://1943695596114318.mns.cn-hangzhou.aliyuncs.com"
     sms_mns_queue_name: str = ""
     sms_mns_message_type: str = "SmsReport"
+    # 邮箱验证码登录（SMTP）。只走标准 SMTP 协议，换供应商只改这里，业务代码不动。
+    # QQ 邮箱：MAIL_HOST=smtp.qq.com、MAIL_PORT=465、MAIL_USE_SSL=true，
+    # MAIL_PASSWORD 填控制台生成的 16 位授权码（不是 QQ 登录密码），
+    # 且 MAIL_FROM 必须与 MAIL_USERNAME 完全一致。
+    mail_enabled: bool = False
+    mail_host: str = ""
+    mail_port: int = Field(default=465, ge=1, le=65535)
+    mail_username: str = ""
+    mail_password: str = Field(default="", repr=False)
+    mail_from: str = ""
+    mail_from_name: str = "MUZI WORLD"
+    mail_use_ssl: bool = True
+    mail_start_tls: bool = False
+    mail_timeout_seconds: float = Field(default=10, gt=0, le=60)
+    mail_code_ttl_seconds: int = Field(default=600, ge=60, le=1800)
+    mail_cooldown_seconds: int = Field(default=60, ge=30, le=600)
+    mail_code_length: int = Field(default=6, ge=4, le=8)
+    # 防滥用：同一邮箱/同一 IP 每小时上限，以及全局每日上限（防止被当成邮件轰炸机）。
+    mail_hourly_limit_per_email: int = Field(default=5, ge=1, le=50)
+    mail_hourly_limit_per_ip: int = Field(default=20, ge=1, le=200)
+    mail_daily_limit: int = Field(default=200, ge=1, le=10000)
+    # 禁止发信与登录的内部占位域名（手机号账号的 email 形如 <phone>@phone.local）。
+    mail_blocked_domains: str = "phone.local"
+    mail_subject: str = "MUZI WORLD 登录验证码"
+    # 验证码摘要的 pepper。留空时依次回落到 MAIL_PASSWORD、MAIL_HOST，保证非空。
+    mail_code_pepper: str = Field(default="", repr=False)
     # 内部服务间调用鉴权（独立支付服务调加额度接口）。留空则拒绝一切内部调用。
     internal_api_token: str = Field(default="", repr=False)
     # 独立支付服务地址（主服务代理下单时调用）。
@@ -250,6 +291,17 @@ class Settings(BaseSettings):
         parsed = urlparse(cleaned)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("SHARE_PUBLIC_BASE_URL 必须是 http(s) 地址")
+        return cleaned
+
+    @field_validator("qs_datacapture_base_url")
+    @classmethod
+    def _normalize_qs_base_url(cls, value: str) -> str:
+        cleaned = value.strip().rstrip("/")
+        if not cleaned:
+            return ""
+        parsed = urlparse(cleaned)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.path:
+            raise ValueError("QS_DATACAPTURE_BASE_URL 必须是不带路径和账号的 http(s) 地址")
         return cleaned
 
     @field_validator("oss_upload_prefix")
@@ -305,6 +357,29 @@ class Settings(BaseSettings):
     def _strip_sms_queue(cls, value: str) -> str:
         return value.strip()
 
+    @field_validator(
+        "mail_host",
+        "mail_username",
+        "mail_password",
+        "mail_from_name",
+        "mail_blocked_domains",
+        "mail_subject",
+        "mail_code_pepper",
+    )
+    @classmethod
+    def _strip_mail_field(cls, value: str) -> str:
+        return value.strip()
+
+    @field_validator("mail_from")
+    @classmethod
+    def _check_mail_from(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            return ""
+        if " " in cleaned or cleaned.count("@") != 1 or cleaned.startswith("@") or cleaned.endswith("@"):
+            raise ValueError("MAIL_FROM 必须是有效的发信邮箱地址")
+        return cleaned
+
     @field_validator("log_level")
     @classmethod
     def _normalize_log_level(cls, value: str) -> str:
@@ -344,7 +419,19 @@ class Settings(BaseSettings):
                 raise ValueError("POSTGRES_PASSWORD 未配置或过短")
             if len(self.redis_password) < 12:
                 raise ValueError("REDIS_PASSWORD 未配置或过短")
+        if self.mail_enabled and (not self.mail_host or not self.mail_from):
+            raise ValueError("开启邮箱登录时 MAIL_HOST 与 MAIL_FROM 必须配置")
+        if self.mail_use_ssl and self.mail_start_tls:
+            raise ValueError("MAIL_USE_SSL 与 MAIL_START_TLS 只能开启一个")
         return self
+
+    def mail_blocked_domain_set(self) -> set[str]:
+        """内部占位域名集合，小写比较。"""
+        return {
+            item.strip().lower()
+            for item in self.mail_blocked_domains.split(",")
+            if item.strip()
+        }
 
     def model_allowlist(self) -> list[str]:
         seen: list[str] = []

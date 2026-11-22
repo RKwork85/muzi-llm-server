@@ -44,11 +44,31 @@ class PhoneLoginRequest(BaseModel):
 
 
 class PhoneSendCodeResponse(BaseModel):
-    """发送验证码成功后的占位响应。"""
+    """发送验证码成功后的响应。短信与邮箱共用。"""
 
     ok: bool = True
     cooldown_seconds: int = 60
+    expires_in: int | None = None
     message: str = "验证码已发送"
+
+
+class EmailSendCodeRequest(BaseModel):
+    """发送邮箱验证码。scene 决定邮件正文里的用途文案。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(max_length=320, description="接收验证码的邮箱地址")
+    scene: Literal["login", "bind", "reset_password"] = "login"
+
+
+class EmailLoginRequest(BaseModel):
+    """邮箱 + 验证码登录。仅对已注册邮箱有效。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(max_length=320, description="已注册的邮箱地址")
+    code: str = Field(min_length=4, max_length=8, description="邮箱验证码")
+
 
 
 class ChangePasswordRequest(BaseModel):

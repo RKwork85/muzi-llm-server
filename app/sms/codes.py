@@ -1,68 +1,38 @@
-"""验证码只以摘要形式放在 Redis，并限制发送间隔和错误次数。"""
+"""短信验证码存储。键与摘要格式保持历史行为，逻辑委托给通用实现。"""
 
 from __future__ import annotations
 
-import hashlib
-import hmac
-import secrets
+from app.verification.codes import VerificationCodeStore, code_digest as _code_digest
+from app.verification.codes import new_code
 
-from app.core.exceptions import AuthFailedError, DatabaseUnavailableError, SmsRateLimitError
-
-_MAX_ATTEMPTS = 5
-
-
-def new_code(length: int) -> str:
-    return "".join(str(secrets.randbelow(10)) for _ in range(length))
+__all__ = ["SmsCodeStore", "code_digest", "new_code"]
 
 
 def code_digest(phone: str, code: str, pepper: str) -> str:
-    return hmac.new(pepper.encode(), f"{phone}:{code}".encode(), hashlib.sha256).hexdigest()
+    """短信摘要输入为 ``{phone}:{code}``，与通用实现的空前缀分支一致。"""
+    return _code_digest(phone, code, pepper)
 
 
 class SmsCodeStore:
     def __init__(self, redis, *, ttl_seconds: int, cooldown_seconds: int, pepper: str) -> None:
-        if redis is None:
-            raise DatabaseUnavailableError("验证码服务暂不可用")
+        # namespace=sms、无摘要前缀：键仍是 sms:code:... ，旧验证码继续有效。
+        self._store = VerificationCodeStore(
+            redis,
+            namespace="sms",
+            ttl_seconds=ttl_seconds,
+            cooldown_seconds=cooldown_seconds,
+            pepper=pepper,
+        )
         self.redis = redis
-        self.ttl_seconds = ttl_seconds
-        self.cooldown_seconds = cooldown_seconds
-        self.pepper = pepper
 
     async def reserve(self, scene: str, phone: str) -> None:
-        ok = await self.redis.set(self._cooldown_key(scene, phone), "1", nx=True, ex=self.cooldown_seconds)
-        if not ok:
-            raise SmsRateLimitError()
+        await self._store.reserve(scene, phone)
 
     async def save(self, scene: str, phone: str, code: str) -> None:
-        digest = code_digest(phone, code, self.pepper)
-        await self.redis.set(self._code_key(scene, phone), digest, ex=self.ttl_seconds)
-        await self.redis.delete(self._attempt_key(scene, phone))
+        await self._store.save(scene, phone, code)
 
     async def rollback(self, scene: str, phone: str) -> None:
-        await self.redis.delete(self._cooldown_key(scene, phone), self._code_key(scene, phone))
+        await self._store.rollback(scene, phone)
 
     async def verify(self, scene: str, phone: str, code: str) -> None:
-        stored = await self.redis.get(self._code_key(scene, phone))
-        if not stored:
-            raise AuthFailedError("验证码错误或已失效")
-        attempts = int(await self.redis.incr(self._attempt_key(scene, phone)))
-        await self.redis.expire(self._attempt_key(scene, phone), self.ttl_seconds)
-        if attempts > _MAX_ATTEMPTS:
-            await self.redis.delete(self._code_key(scene, phone), self._attempt_key(scene, phone))
-            raise AuthFailedError("验证码错误次数过多，请重新获取")
-        expected = code_digest(phone, code, self.pepper)
-        if not hmac.compare_digest(str(stored), expected):
-            raise AuthFailedError("验证码错误或已失效")
-        await self.redis.delete(self._code_key(scene, phone), self._attempt_key(scene, phone))
-
-    @staticmethod
-    def _code_key(scene: str, phone: str) -> str:
-        return f"sms:code:{scene}:{phone}"
-
-    @staticmethod
-    def _cooldown_key(scene: str, phone: str) -> str:
-        return f"sms:cooldown:{scene}:{phone}"
-
-    @staticmethod
-    def _attempt_key(scene: str, phone: str) -> str:
-        return f"sms:attempts:{scene}:{phone}"
+        await self._store.verify(scene, phone, code)

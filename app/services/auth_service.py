@@ -11,18 +11,22 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.config import get_settings
+from app.core.config import Settings, get_settings
 from app.core.database.redis import get_redis_or_none
 from app.core.exceptions import (
     AccountDisabledError,
     AccountExistsError,
     AuthFailedError,
+    CodeRateLimitError,
     DatabaseUnavailableError,
+    EmailNotRegisteredError,
     FeatureNotReadyError,
     InvalidRequestError,
 )
-from app.sms.codes import SmsCodeStore, new_code
+from app.mail.sender import mail_configured, send_verification_code as send_mail_code
+from app.sms.codes import SmsCodeStore
 from app.sms.sender import send_verification_code, sms_configured
+from app.verification.codes import VerificationCodeStore, new_code
 from app.core.security import generate_refresh_token, hash_password, hash_refresh_token, verify_password
 from app.authorization.domain.catalog import MEMBER_ROLE_CODE
 from app.models.mixins import utcnow
@@ -31,10 +35,13 @@ from app.models.tables import RefreshToken, User, UserCredential
 
 _USERNAME = re.compile(r"^[^\W\d_]\w{1,31}$")
 _PHONE = re.compile(r"^1[3-9]\d{9}$")
-_SMS_CODE = re.compile(r"^\d{4,8}$")
+_CODE = re.compile(r"^\d{4,8}$")
 _TOKEN_TTL = timedelta(days=30)
 _DUMMY_HASH: str | None = None
 _PHONE_EMAIL_DOMAIN = "phone.local"
+_EMAIL_SCENES = ("login", "bind", "reset_password")
+_HOUR_WINDOW_SECONDS = 3600
+_DAY_WINDOW_SECONDS = 86400
 
 
 @dataclass
@@ -97,11 +104,16 @@ def normalize_phone(value: str) -> str:
     return phone
 
 
-def normalize_sms_code(value: str) -> str:
+def normalize_code(value: str) -> str:
+    """验证码只接受 4-8 位数字。短信与邮箱共用同一套格式规则。"""
     code = value.strip()
-    if _SMS_CODE.fullmatch(code) is None:
+    if _CODE.fullmatch(code) is None:
         raise InvalidRequestError("验证码格式不正确")
     return code
+
+
+# 兼容旧名字。
+normalize_sms_code = normalize_code
 
 
 def phone_account_fields(phone: str) -> tuple[str, str, str]:
@@ -335,6 +347,7 @@ class AuthService:
         return {
             "ok": True,
             "cooldown_seconds": settings.sms_cooldown_seconds,
+            "expires_in": settings.sms_code_ttl_seconds,
             "message": "验证码已发送",
         }
 
@@ -391,3 +404,139 @@ class AuthService:
             )
         )
         return IssuedLogin(user=user, token=raw, expires_at=expires_at)
+
+    # ------------------------------------------------------------------
+    # 邮箱验证码登录
+    # ------------------------------------------------------------------
+
+    def _email_store(self, settings: Settings | None = None) -> VerificationCodeStore:
+        settings = settings or get_settings()
+        if not mail_configured(settings):
+            raise FeatureNotReadyError("邮件服务尚未配置")
+        redis = get_redis_or_none()
+        if redis is None:
+            raise DatabaseUnavailableError("验证码服务暂不可用")
+        # pepper 必须稳定且非空：优先专用配置，其次复用 SMTP 授权码/主机。
+        pepper = (
+            getattr(settings, "mail_code_pepper", "")
+            or getattr(settings, "mail_password", "")
+            or settings.mail_host
+        )
+        return VerificationCodeStore(
+            redis,
+            namespace="email",
+            ttl_seconds=settings.mail_code_ttl_seconds,
+            cooldown_seconds=settings.mail_cooldown_seconds,
+            pepper=pepper,
+            digest_prefix="email:",
+        )
+
+    @staticmethod
+    def _ensure_email_allowed(settings: Settings, email: str) -> None:
+        """拒绝内部占位域名（手机号账号的 email 形如 <phone>@phone.local）。"""
+        domain = email.rsplit("@", 1)[-1].lower()
+        if domain in settings.mail_blocked_domain_set():
+            raise InvalidRequestError("该邮箱域不支持验证码登录")
+
+    async def _email_owner(self, email: str) -> User | None:
+        return await self.session.scalar(select(User).where(User.email == email))
+
+    @staticmethod
+    async def _consume_window(redis, key: str, limit: int, window_seconds: int) -> None:
+        """固定窗口计数。第一次写入时挂 TTL，超限即拒绝。"""
+        try:
+            current = int(await redis.incr(key))
+            if current == 1:
+                await redis.expire(key, window_seconds)
+        except Exception:
+            raise DatabaseUnavailableError("验证码服务暂不可用") from None
+        if current > limit:
+            raise CodeRateLimitError()
+
+    @staticmethod
+    async def _refund_window(redis, key: str) -> None:
+        """发信失败时退回额度，避免用户因为一次 SMTP 故障被锁住。"""
+        try:
+            await redis.decr(key)
+        except Exception:
+            return
+
+    async def send_email_code(
+        self,
+        email: str,
+        scene: str = "login",
+        *,
+        client_ip: str | None = None,
+    ) -> dict[str, object]:
+        """给已注册邮箱下发一次性验证码。
+
+        顺序刻意如此：IP 限额在查库之前，让「批量探测邮箱是否注册」有成本；
+        冷却与额度都占成功后，再把失败回滚掉。
+        """
+        email = normalize_email(email)
+        if scene not in _EMAIL_SCENES:
+            raise InvalidRequestError("不支持的验证码场景")
+        settings = get_settings()
+        if not mail_configured(settings):
+            raise FeatureNotReadyError("邮件服务尚未配置")
+        self._ensure_email_allowed(settings, email)
+        store = self._email_store(settings)
+        redis = store.redis
+        if client_ip:
+            await self._consume_window(
+                redis,
+                f"email:limit:ip:{client_ip}",
+                settings.mail_hourly_limit_per_ip,
+                _HOUR_WINDOW_SECONDS,
+            )
+        if await self._email_owner(email) is None:
+            raise EmailNotRegisteredError()
+        await store.reserve(scene, email)
+        await self._consume_window(
+            redis,
+            f"email:limit:addr:{email}",
+            settings.mail_hourly_limit_per_email,
+            _HOUR_WINDOW_SECONDS,
+        )
+        await self._consume_window(
+            redis,
+            "email:limit:global",
+            settings.mail_daily_limit,
+            _DAY_WINDOW_SECONDS,
+        )
+        code = new_code(settings.mail_code_length)
+        try:
+            await store.save(scene, email, code)
+            # SMTP 是阻塞 IO，交给线程池，避免卡住事件循环。
+            await asyncio.to_thread(send_mail_code, settings, email, code, scene)
+        except Exception:
+            await store.rollback(scene, email)
+            await self._refund_window(redis, f"email:limit:addr:{email}")
+            await self._refund_window(redis, "email:limit:global")
+            raise
+        return {
+            "ok": True,
+            "cooldown_seconds": settings.mail_cooldown_seconds,
+            "expires_in": settings.mail_code_ttl_seconds,
+            "message": "验证码已发送",
+        }
+
+    async def login_with_email(self, email: str, code: str) -> IssuedLogin:
+        """邮箱 + 验证码登录。仅对已注册邮箱有效，不自动建号。"""
+        email = normalize_email(email)
+        code = normalize_code(code)
+        settings = get_settings()
+        self._ensure_email_allowed(settings, email)
+        await self._email_store(settings).verify("login", email, code)
+        user = await self._email_owner(email)
+        if user is None:
+            raise EmailNotRegisteredError()
+        if user.status != "active":
+            raise AccountDisabledError()
+        if getattr(user, "email_verified_at", None) is None:
+            # 收到验证码即证明邮箱归属，顺手补上验证时间。
+            user.email_verified_at = utcnow()
+        issued = await self._issue(user)
+        await self.session.flush()
+        await self._grant_default_quota(user.id)
+        return issued

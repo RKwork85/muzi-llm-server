@@ -170,6 +170,14 @@ class InvalidRequestError(AppError):
     default_message = "请求参数无效"
 
 
+class FlowRevisionConflictError(AppError):
+    """画布 revision 不匹配：另一个窗口 / 设备已经写过这份画布。"""
+
+    code = "FLOW_REVISION_CONFLICT"
+    status_code = 409
+    default_message = "画布已在其他窗口更新，请重新载入后再保存"
+
+
 class AuthFailedError(AppError):
     code = "AUTH_FAILED"
     status_code = 401
@@ -194,16 +202,39 @@ class FeatureNotReadyError(AppError):
     default_message = "功能尚未开放"
 
 
-class SmsRateLimitError(AppError):
-    code = "SMS_RATE_LIMIT"
+class CodeRateLimitError(AppError):
+    """验证码发送过于频繁。短信与邮箱共用，文案本身与渠道无关。"""
+
+    code = "CODE_RATE_LIMIT"
     status_code = 429
     default_message = "验证码发送过于频繁，请稍后再试"
+
+
+# 兼容旧名字：短信通道的历史调用点继续可用。
+SmsRateLimitError = CodeRateLimitError
 
 
 class SmsDeliveryError(AppError):
     code = "SMS_DELIVERY_FAILED"
     status_code = 502
     default_message = "短信发送失败，请稍后再试"
+
+
+class MailDeliveryError(AppError):
+    """SMTP 拒绝或超时。不能把上游原始错误回显给客户端。"""
+
+    code = "MAIL_DELIVERY_FAILED"
+    status_code = 502
+    default_message = "邮件发送失败，请稍后再试"
+
+
+class EmailNotRegisteredError(AppError):
+    """仅已注册邮箱可登录。前端据此引导用户去注册。"""
+
+    code = "EMAIL_NOT_REGISTERED"
+    status_code = 404
+    default_message = "该邮箱尚未注册，请先注册"
+
 
 
 class LoginRequiredError(AppError):

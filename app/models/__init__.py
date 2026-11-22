@@ -5,6 +5,7 @@ from app.models.ask_run import AskRun
 from app.models.assets import GeneratedAsset
 from app.models.base import Base
 from app.models.content import ContentTask
+from app.models.flow import FlowApp, FlowCanvas, FlowDocument, FlowImage, FlowSession
 from app.models.planning import (
     PersistentInteraction,
     PersistentInteractionSubmission,
@@ -86,6 +87,11 @@ __all__ = [
     "ContentTask",
     "DocArticle",
     "ExecutionEvent",
+    "FlowDocument",
+    "FlowApp",
+    "FlowSession",
+    "FlowCanvas",
+    "FlowImage",
     "GeneratedAsset",
     "PluginInstallation",
     "ProfileEdit",

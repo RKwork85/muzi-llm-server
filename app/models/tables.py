@@ -82,6 +82,10 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # 裁剪后的头像。以 data URL 形式存储，避免引入外部对象存储依赖。
     avatar: Mapped[str | None] = mapped_column(Text)
     avatar_updated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 邮箱归属验证时间：验证码登录成功即视为已验证。NULL 表示从未证明过邮箱归属。
+    email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # 邮箱归属验证时间：验证码登录成功即视为已验证。NULL 表示从未证明过邮箱归属。
+    email_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     credentials: Mapped[list[UserCredential]] = relationship(
         back_populates="user",

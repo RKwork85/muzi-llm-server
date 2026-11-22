@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from app.api.deps import get_authenticated_user
@@ -13,6 +13,8 @@ from app.models.tables import User
 from app.schemas.auth import (
     AuthResponse,
     ChangePasswordRequest,
+    EmailLoginRequest,
+    EmailSendCodeRequest,
     LoginRequest,
     PhoneLoginRequest,
     PhoneSendCodeRequest,
@@ -115,6 +117,68 @@ async def send_phone_code(body: PhoneSendCodeRequest, session: DbSession) -> Pho
 async def login_with_phone(body: PhoneLoginRequest, session: DbSession) -> AuthResponse:
     """手机号 + 验证码登录。未注册时自动创建账户。"""
     issued = await AuthService(session).login_with_phone(body.phone, body.code)
+    return _response(issued)
+
+
+def _client_ip(request: Request) -> str | None:
+    """取调用方 IP 用于限流。
+
+    部署在 nginx 之后时直连地址恒为代理 IP，必须读 X-Forwarded-For 的第一段，
+    否则全站共用一个限额。该头可被客户端伪造，但每邮箱限额仍然独立生效，
+    两者叠加足以约束滥用。
+    """
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        candidate = forwarded.split(",", 1)[0].strip()
+        if candidate:
+            return candidate
+    client = request.client
+    return client.host if client is not None else None
+
+
+@router.post(
+    "/email/send-code",
+    response_model=PhoneSendCodeResponse,
+    responses={
+        404: {"model": ErrorResponse, "description": "该邮箱尚未注册"},
+        422: {"model": ErrorResponse, "description": "邮箱或场景无效"},
+        429: {"model": ErrorResponse, "description": "发送过于频繁"},
+        501: {"model": ErrorResponse, "description": "邮件服务尚未配置"},
+        502: {"model": ErrorResponse, "description": "邮件发送失败"},
+        503: {"model": ErrorResponse, "description": "验证码服务暂不可用"},
+    },
+    summary="发送邮箱验证码",
+)
+async def send_email_code(
+    body: EmailSendCodeRequest,
+    request: Request,
+    session: DbSession,
+) -> PhoneSendCodeResponse:
+    """校验邮箱已注册后，经 SMTP 下发一次性验证码。"""
+    result = await AuthService(session).send_email_code(
+        body.email,
+        body.scene,
+        client_ip=_client_ip(request),
+    )
+    return PhoneSendCodeResponse(**result)
+
+
+@router.post(
+    "/email/login",
+    response_model=AuthResponse,
+    responses={
+        401: {"model": ErrorResponse, "description": "验证码错误或已失效"},
+        403: {"model": ErrorResponse, "description": "账户已停用"},
+        404: {"model": ErrorResponse, "description": "该邮箱尚未注册"},
+        422: {"model": ErrorResponse, "description": "邮箱或验证码无效"},
+        501: {"model": ErrorResponse, "description": "邮件服务尚未配置"},
+        503: {"model": ErrorResponse, "description": "验证码服务暂不可用"},
+    },
+    summary="邮箱验证码登录",
+)
+async def login_with_email(body: EmailLoginRequest, session: DbSession) -> AuthResponse:
+    """邮箱 + 验证码登录。仅已注册邮箱可用，未注册返回 404 供前端引导注册。"""
+    issued = await AuthService(session).login_with_email(body.email, body.code)
     return _response(issued)
 
 

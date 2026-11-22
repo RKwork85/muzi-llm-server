@@ -24,6 +24,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.content.broker import broker
+from app.content.qs_client import qs_client_from_settings
 from app.content.service import ContentService
 from app.content.states import TaskStage, TaskStatus, is_terminal
 from app.core.config import load_settings
@@ -31,7 +32,7 @@ from app.core.database.redis import init_redis
 from app.core.database.session import get_session_factory, init_engine
 from app.models.content import ContentTask
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("muzi_llm")
 
 # 与前端 creation.config.js 的 WORKFLOW_NODES 对齐（占位，仅用于骨架演示）。
 _WORKFLOW_STEPS: list[tuple[str, str]] = [
@@ -45,17 +46,101 @@ _WORKFLOW_STEPS: list[tuple[str, str]] = [
 ]
 
 
+def _looks_like_preview(value: Any) -> bool:
+    """判断节点是否是 qs 的 preview_data（而非其中某条 note）。"""
+    if not isinstance(value, dict):
+        return False
+    notes = value.get("notes")
+    if not isinstance(notes, list) or not notes:
+        return False
+    # preview 的 notes 是笔记对象列表；note 自身不会有 notes 字段。
+    return any(isinstance(n, dict) for n in notes[:3]) and any(
+        key in value for key in ("batch", "author", "platform")
+    )
+
+
+def _extract_preview(result: dict[str, Any]) -> dict[str, Any] | None:
+    """从 qs 采集返回里提取 preview_data。
+
+    qs 的 ``POST /api/collect/run`` 返回形如
+    ``{ platform, urls, results: [{ kind, result: { ..., preview } }] }``，
+    preview 位于 ``results[].result.preview``（note_batch 分支）。
+
+    这里用「广度优先 + 结构识别」而不是写死层级：上游只要把 preview 放在任意
+    嵌套层（顶层 / results[].result / results[].preview …）都能取到，避免结构
+    微调后又出现「采集成功但未返回 preview_data」的假失败。
+    """
+    queue: list[Any] = [result]
+    seen: set[int] = set()
+    while queue:
+        node = queue.pop(0)
+        if id(node) in seen:
+            continue
+        seen.add(id(node))
+        if _looks_like_preview(node):
+            return node
+        if isinstance(node, dict):
+            # preview 优先，其次是常见的包裹层；其余值一并入队兜底。
+            for key in ("preview", "results", "result", "data"):
+                if key in node:
+                    queue.append(node[key])
+            if not any(key in node for key in ("preview", "results", "result", "data")):
+                queue.extend(node.values())
+        elif isinstance(node, list):
+            queue.extend(node)
+
+    # 提取失败时记录返回结构骨架，便于定位根因（不打印媒体直链等大字段）。
+    logger.warning("采集结果未提取到 preview_data，返回结构: %s", _shape_of(result))
+    return None
+
+
+def _shape_of(value: Any, depth: int = 0) -> Any:
+    """把返回值压成「类型/键名」骨架，日志里一眼看出 preview 挂在哪一层。"""
+    if depth >= 4:
+        return "…"
+    if isinstance(value, dict):
+        return {k: _shape_of(v, depth + 1) for k, v in list(value.items())[:12]}
+    if isinstance(value, list):
+        head = _shape_of(value[0], depth + 1) if value else None
+        return [f"list[{len(value)}]", head]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return type(value).__name__
+    return type(value).__name__
+
+
 async def run_collect(session: AsyncSession, task: ContentTask) -> None:
-    """采集任务：queued → running → draft。"""
+    """采集任务：queued → running → draft（直调 qs-datacapture 采集服务）。
+
+    后端作为调度中心，把 user_id / task_id 透传给采集服务；采集服务内部完成
+    Playwright 采集 + 媒体直传 muzi-oss，返回 preview_data（含 OSS 公网 url）。
+    第一期仅支持小红书笔记直采，按 platform 过滤出 xhs 链接后走 xhs.crawl_batch。
+    """
     service = ContentService()
     await service.transition(session, task, status=TaskStatus.RUNNING)
-    # TODO(第二阶段): 按 task.source_links 逐平台抓取 + 解析正文，产出 preview_data。
-    await asyncio.sleep(0)  # 占位：真实实现为网络抓取
-    preview = {
-        "title": "（占位）采集到的原文标题",
-        "summary": "（占位）采集到的正文摘要",
-        "platforms": [link.get("platform") for link in (task.source_links or [])],
-    }
+
+    client = qs_client_from_settings(load_settings())
+    if client is None:
+        raise RuntimeError("QS_DATACAPTURE_BASE_URL 未配置，无法执行采集")
+
+    xhs_urls = [
+        str(link.get("url") or "").strip()
+        for link in (task.source_links or [])
+        if str(link.get("platform") or "").lower() == "xhs"
+        and str(link.get("url") or "").strip()
+    ]
+    if not xhs_urls:
+        raise RuntimeError("暂无支持的采集链接（第一期仅支持小红书）")
+
+    result = await client.collect(
+        type_="xhs.crawl_batch",
+        params={"urls": xhs_urls},
+        user_id=str(task.user_id),
+        task_id=str(task.id),
+    )
+    preview = _extract_preview(result)
+    if not isinstance(preview, dict):
+        raise RuntimeError("采集服务未返回 preview_data")
+
     await service.transition(
         session, task, status=TaskStatus.DRAFT, preview_data=preview
     )

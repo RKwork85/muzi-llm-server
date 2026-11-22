@@ -44,6 +44,37 @@ class OssUploadClient:
         """旧布局前缀。新代码优先用 user_id + category，这里只作兜底。"""
         return f"{self.prefix}/{task_id}"
 
+    def _key_of(self, url: str) -> str:
+        """公网地址 → 对象键。网关的读路径固定是 ``/files/<key>``。"""
+        parsed = urlparse(url)
+        marker = "/files/"
+        index = parsed.path.find(marker)
+        if index < 0:
+            raise OssUploadError("OSS_UPLOAD_FAILED", "图片地址不是本服务签发的")
+        key = parsed.path[index + len(marker) :].strip("/")
+        if not key or ".." in key:
+            raise OssUploadError("OSS_UPLOAD_FAILED", "图片地址无效")
+        return key
+
+    async def delete_url(self, url: str) -> bool:
+        """删除一张已上传的图。对象不存在也视为成功（回收任务要幂等）。"""
+        key = self._key_of(url)
+        headers = {"X-Internal-Token": self.token} if self.token else {}
+        try:
+            async with httpx.AsyncClient(
+                transport=self._transport, timeout=self.timeout, trust_env=False
+            ) as client:
+                response = await client.delete(
+                    f"{self.base_url}/files/{key}", headers=headers
+                )
+        except httpx.TimeoutException as exc:
+            raise OssUploadError("OSS_UPLOAD_FAILED", "删除服务超时") from exc
+        except httpx.HTTPError as exc:
+            raise OssUploadError("OSS_UNAVAILABLE", "删除服务不可用") from exc
+        if response.status_code in (200, 204, 404):
+            return True
+        raise OssUploadError("OSS_UPLOAD_FAILED", "删除图片失败")
+
     async def upload_files(
         self,
         files: list[tuple[str, bytes]],

@@ -177,6 +177,31 @@ def create_app(
 
                 sms_task = asyncio.create_task(run_receipt_loop(runtime_settings, sms_stop))
             app.state.sms_receipt_task = sms_task
+            # 画布上传图的孤儿回收：引用计数归零且过了宽限期就删行 + OSS 对象。
+            flow_gc_stop = asyncio.Event()
+            flow_gc_task: asyncio.Task[None] | None = None
+            if runtime_settings.flow_image_gc_enabled and ready:
+                from app.services.flow_gc import run_flow_image_gc_loop
+
+                flow_gc_task = asyncio.create_task(
+                    run_flow_image_gc_loop(
+                        runtime_settings,
+                        app.state.chat_service.oss_client,
+                        flow_gc_stop,
+                    )
+                )
+            app.state.flow_gc_task = flow_gc_task
+            # 内容任务队列在服务进程内直接消费：启动后端即启动任务消费，
+            # 生命周期随 lifespan 管理，无需独立 worker 进程。
+            content_worker = None
+            if runtime_settings.content_worker_inprocess and ready:
+                from app.content.inprocess import InProcessWorker
+
+                content_worker = InProcessWorker(
+                    max_async_tasks=runtime_settings.content_worker_max_async_tasks
+                )
+                await content_worker.start()
+                app.state.content_worker = content_worker
             yield
         finally:
             # 先打断所有 SSE 长连接：否则 uvicorn 的优雅关闭会一直等它们结束，
@@ -186,11 +211,23 @@ def create_app(
 
             close_recharge_events()
             close_content_events()
+            content_worker = getattr(app.state, "content_worker", None)
+            if content_worker is not None:
+                await content_worker.stop()
+                app.state.content_worker = None
             sms_task = getattr(app.state, "sms_receipt_task", None)
             if sms_task is not None:
                 sms_task.cancel()
                 try:
                     await sms_task
+                except asyncio.CancelledError:
+                    pass
+            flow_gc_task = getattr(app.state, "flow_gc_task", None)
+            if flow_gc_task is not None:
+                flow_gc_stop.set()
+                flow_gc_task.cancel()
+                try:
+                    await flow_gc_task
                 except asyncio.CancelledError:
                     pass
             bind_grants(None)

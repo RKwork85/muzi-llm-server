@@ -62,6 +62,14 @@ class ComfyJobStatusResponse(BaseModel):
     error: str | None = None
     # 提交时的参数（含 prompt 等），用于落库生成资产。
     params: dict[str, Any] | None = None
+    # 时间戳为 Unix 秒，elapsed_ms 为网关实际执行耗时（不含排队）。
+    # 前端画布节点用它展示「执行时间」，这里只做透明透传。
+    created_at: float | None = None
+    started_at: float | None = None
+    finished_at: float | None = None
+    elapsed_ms: int | None = None
+    # 本次任务消耗的额度（token），当前固定 2000，由网关下发、前端展示。
+    quota: int | None = None
 
 
 class ComfyWorkflowItem(BaseModel):
