@@ -35,7 +35,7 @@ from app.models.flow import (
 from app.models.mixins import utcnow
 from app.services.flow_service import externalize_data_urls
 
-logger = logging.getLogger("muzi_llm.flow")
+logger = logging.getLogger("muzi_llm")
 
 _KEY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _MIME_EXT = {

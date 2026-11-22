@@ -17,7 +17,7 @@ from app.data.oss_client import OssUploadClient, OssUploadError
 from app.models.flow import FLOW_DOCUMENT_KINDS, FlowDocument
 from app.models.mixins import utcnow
 
-logger = logging.getLogger("muzi_llm.flow")
+logger = logging.getLogger("muzi_llm")
 
 _DOC_KEY = re.compile(r"^(apps|sessions|canvas):[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+){0,3}$")
 _DATA_URL = re.compile(

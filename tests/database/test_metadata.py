@@ -65,6 +65,14 @@ EXPECTED_TABLES = {
     "plan_todos",
     "generated_assets",
     "flow_documents",
+    # 工作流画布：从当初单表整份快照拆成了行表（应用/会话/画布/节点/连线/图片）。
+    "flow_apps",
+    "flow_sessions",
+    "flow_canvases",
+    "flow_canvas_nodes",
+    "flow_canvas_edges",
+    "flow_images",
+    "flow_image_refs",
 }
 
 ON_DELETE = {
@@ -114,6 +122,18 @@ ON_DELETE = {
     ("usage_quotas", "user_id"): "CASCADE",
     ("generated_assets", "user_id"): "CASCADE",
     ("flow_documents", "user_id"): "CASCADE",
+    # 工作流画布：账号删除即清空，会话/画布/节点/连线/图片逐级 CASCADE。
+    # 图片的 session_id 例外用 SET NULL——会话没了图还留在账号下，不会变成孤儿。
+    ("flow_apps", "user_id"): "CASCADE",
+    ("flow_sessions", "user_id"): "CASCADE",
+    ("flow_canvases", "user_id"): "CASCADE",
+    ("flow_canvases", "session_id"): "CASCADE",
+    ("flow_canvas_nodes", "canvas_id"): "CASCADE",
+    ("flow_canvas_edges", "canvas_id"): "CASCADE",
+    ("flow_images", "user_id"): "CASCADE",
+    ("flow_images", "session_id"): "SET NULL",
+    ("flow_image_refs", "image_id"): "CASCADE",
+    ("flow_image_refs", "canvas_id"): "CASCADE",
     ("usage_quotas", "adjusted_by"): "SET NULL",
     ("quota_adjustments", "user_id"): "CASCADE",
     ("quota_adjustments", "actor_id"): "SET NULL",

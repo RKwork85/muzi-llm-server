@@ -16,6 +16,8 @@ class RegisterRequest(BaseModel):
     username: str = Field(max_length=32)
     password: str = Field(max_length=128)
     display_name: str | None = Field(default=None, max_length=120)
+    # 邮箱验证码。邮件服务开启时必填，用来证明邮箱归属。
+    code: str | None = Field(default=None, min_length=4, max_length=8)
 
 
 class LoginRequest(BaseModel):
@@ -53,20 +55,22 @@ class PhoneSendCodeResponse(BaseModel):
 
 
 class EmailSendCodeRequest(BaseModel):
-    """发送邮箱验证码。scene 决定邮件正文里的用途文案。"""
+    """发送邮箱验证码。注册场景给未注册邮箱发，绑定/改密场景给已注册邮箱发。"""
 
     model_config = ConfigDict(extra="forbid")
 
     email: str = Field(max_length=320, description="接收验证码的邮箱地址")
-    scene: Literal["login", "bind", "reset_password"] = "login"
+    scene: Literal["register", "bind", "reset_password"] = "register"
 
 
-class EmailLoginRequest(BaseModel):
-    """邮箱 + 验证码登录。仅对已注册邮箱有效。"""
+class EmailRegisterRequest(BaseModel):
+    """邮箱 + 验证码注册。需要已经通过 /email/send-code 拿到验证码。"""
 
     model_config = ConfigDict(extra="forbid")
 
-    email: str = Field(max_length=320, description="已注册的邮箱地址")
+    email: str = Field(max_length=320, description="待注册的邮箱地址")
+    username: str = Field(max_length=32)
+    password: str = Field(max_length=128)
     code: str = Field(min_length=4, max_length=8, description="邮箱验证码")
 
 
@@ -75,6 +79,16 @@ class ChangePasswordRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     old_password: str = Field(max_length=128)
+    new_password: str = Field(max_length=128)
+
+
+class ResetPasswordRequest(BaseModel):
+    """凭邮箱验证码重置密码。不需要登录态，也不需要旧密码。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    email: str = Field(max_length=320, description="已注册的邮箱地址")
+    code: str = Field(min_length=4, max_length=8, description="邮箱验证码")
     new_password: str = Field(max_length=128)
 
 

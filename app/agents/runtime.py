@@ -29,6 +29,7 @@ from app.data.store import DataStore
 from app.core.exceptions import AgentPolicyRejectedError, AgentTaskLimitError, AgentTaskNotFoundError
 from app.providers.base import LLMProvider
 from app.services.prompt_service import PromptService
+from app.prompts.settings import is_enabled
 from app.tools.registry import ToolRegistry
 from app.tools.url_policy import UrlLedger
 from app.tools.web_client import DeepSeekWebClient
@@ -132,8 +133,18 @@ class AgentRuntime:
             )
         except PolicyError as exc:
             raise AgentPolicyRejectedError(exc.code) from None
-        prompt = self._prompts.render(request.prompt_name)
-        if self.skill_runtime is not None and "discover_skills" in granted and request.skill_mode != "explicit":
+        if self._prompts.exists(request.prompt_name):
+            prompt = self._prompts.render_first(
+                [request.prompt_name, "default", "assistant"]
+            )
+        else:
+            prompt = self._prompts.render(request.prompt_name)
+        if (
+            self.skill_runtime is not None
+            and "discover_skills" in granted
+            and request.skill_mode != "explicit"
+            and is_enabled("guard:skill_usage")
+        ):
             prompt = f"{prompt}\n\n{SKILL_USAGE_INSTRUCTION}"
         selected = set(request.toolsets or [])
         sensitive = {
@@ -146,7 +157,7 @@ class AgentRuntime:
             "write_docx",
             "delete_file",
         }
-        if selected & {"research", "workspace", "data", "weather"} or set(granted) & sensitive:
+        if (selected & {"research", "workspace", "data", "weather"} or set(granted) & sensitive) and is_enabled("guard:untrusted"):
             prompt = f"{prompt}\n\n{UNTRUSTED_PROMPT}"
         registry = overlay_tools(self._settings, self._registry, remote) if remote else self._registry
         # 并发准入：槽位满时排队等待，超时才拒绝，避免第 N+1 个用户瞬间失败。

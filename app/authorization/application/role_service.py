@@ -13,7 +13,11 @@ from app.authorization.domain.catalog import (
     permission_min_rank,
     role_grant_rank,
 )
-from app.core.exceptions import RoleNotFoundError, SuperAdminProtectedError
+from app.core.exceptions import (
+    InvalidRequestError,
+    RoleNotFoundError,
+    SuperAdminProtectedError,
+)
 from app.models.rbac import (
     Permission,
     Role,
@@ -89,14 +93,10 @@ class RoleService:
             raise SuperAdminProtectedError()
         unknown = codes - set(PERMISSION_BY_CODE)
         if unknown:
-            from app.core.exceptions import InvalidRequestError
-
             raise InvalidRequestError(f"未知权限: {', '.join(sorted(unknown))}")
         rank = role_grant_rank(role.code)
         too_high = sorted(c for c in codes if permission_min_rank(c) > rank)
         if too_high:
-            from app.core.exceptions import InvalidRequestError
-
             raise InvalidRequestError(f"权限超出角色等级: {', '.join(too_high)}")
         perms = list(
             await self.session.scalars(select(Permission).where(Permission.code.in_(codes)))
@@ -110,9 +110,13 @@ class RoleService:
         await self.session.flush()
         for perm in perms:
             self.session.add(RolePermission(role_id=role_id, permission_id=perm.id))
+        # 标记为「已手工配置」：启动时的 seed 之后不再为这个角色补默认权限，
+        # 否则管理员取消掉的勾选会在下次重启时被加回来。
+        role.permissions_customized = True
         await self.session.flush()
 
     async def assign_role_to_user(self, user_id: uuid.UUID | str, role_id: uuid.UUID | str) -> None:
+        role = await self.get_role(role_id)
         exists = await self.session.scalar(
             select(UserRole.id).where(UserRole.user_id == user_id, UserRole.role_id == role_id)
         )

@@ -238,7 +238,7 @@ class Settings(BaseSettings):
     mail_username: str = ""
     mail_password: str = Field(default="", repr=False)
     mail_from: str = ""
-    mail_from_name: str = "MUZI WORLD"
+    mail_from_name: str = "MUZI-让思想自由生长"
     mail_use_ssl: bool = True
     mail_start_tls: bool = False
     mail_timeout_seconds: float = Field(default=10, gt=0, le=60)
@@ -251,9 +251,22 @@ class Settings(BaseSettings):
     mail_daily_limit: int = Field(default=200, ge=1, le=10000)
     # 禁止发信与登录的内部占位域名（手机号账号的 email 形如 <phone>@phone.local）。
     mail_blocked_domains: str = "phone.local"
-    mail_subject: str = "MUZI WORLD 登录验证码"
+    mail_subject: str = "MUZI-让思想自由生长 注册验证码"
     # 验证码摘要的 pepper。留空时依次回落到 MAIL_PASSWORD、MAIL_HOST，保证非空。
     mail_code_pepper: str = Field(default="", repr=False)
+    # 备用发信账号：主账号连接/认证失败时自动切换。留空表示不启用。
+    # 必须是另一个能独立登录的邮箱。用同一个账号填两遍没有意义——
+    # 授权码失效或域名被封会同时命中两份配置。
+    mail_backup_host: str = ""
+    mail_backup_port: int = Field(default=465, ge=1, le=65535)
+    mail_backup_username: str = ""
+    mail_backup_password: str = Field(default="", repr=False)
+    # 留空时回落到 MAIL_BACKUP_USERNAME：QQ 邮箱要求 From 与登录账号完全一致。
+    mail_backup_from: str = ""
+    mail_backup_use_ssl: bool = True
+    mail_backup_start_tls: bool = False
+    # 主账号失败后被跳过的时间。0 表示每次都按顺序重试，不记忆故障。
+    mail_failover_cooldown_seconds: int = Field(default=120, ge=0, le=3600)
     # 内部服务间调用鉴权（独立支付服务调加额度接口）。留空则拒绝一切内部调用。
     internal_api_token: str = Field(default="", repr=False)
     # 独立支付服务地址（主服务代理下单时调用）。
@@ -365,12 +378,15 @@ class Settings(BaseSettings):
         "mail_blocked_domains",
         "mail_subject",
         "mail_code_pepper",
+        "mail_backup_host",
+        "mail_backup_username",
+        "mail_backup_password",
     )
     @classmethod
     def _strip_mail_field(cls, value: str) -> str:
         return value.strip()
 
-    @field_validator("mail_from")
+    @field_validator("mail_from", "mail_backup_from")
     @classmethod
     def _check_mail_from(cls, value: str) -> str:
         cleaned = value.strip()
@@ -419,11 +435,20 @@ class Settings(BaseSettings):
                 raise ValueError("POSTGRES_PASSWORD 未配置或过短")
             if len(self.redis_password) < 12:
                 raise ValueError("REDIS_PASSWORD 未配置或过短")
-        if self.mail_enabled and (not self.mail_host or not self.mail_from):
-            raise ValueError("开启邮箱登录时 MAIL_HOST 与 MAIL_FROM 必须配置")
+        if self.mail_enabled and not (self.mail_primary_ready() or self.mail_backup_ready()):
+            raise ValueError("开启邮箱登录时至少需要一个可用的发信账号（MAIL_HOST/MAIL_FROM 或 MAIL_BACKUP_*）")
         if self.mail_use_ssl and self.mail_start_tls:
             raise ValueError("MAIL_USE_SSL 与 MAIL_START_TLS 只能开启一个")
+        if self.mail_backup_use_ssl and self.mail_backup_start_tls:
+            raise ValueError("MAIL_BACKUP_USE_SSL 与 MAIL_BACKUP_START_TLS 只能开启一个")
         return self
+
+    def mail_primary_ready(self) -> bool:
+        return bool(self.mail_host and self.mail_from)
+
+    def mail_backup_ready(self) -> bool:
+        """备用账号是否完整。From 留空时用登录账号兜底。"""
+        return bool(self.mail_backup_host and (self.mail_backup_from or self.mail_backup_username))
 
     def mail_blocked_domain_set(self) -> set[str]:
         """内部占位域名集合，小写比较。"""

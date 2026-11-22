@@ -14,6 +14,8 @@ import threading
 import tomllib
 from pathlib import Path
 
+from app.prompts.settings import is_enabled
+
 _PATH = Path(__file__).resolve().parents[1] / "prompts" / "tools.toml"
 
 _lock = threading.Lock()
@@ -54,4 +56,21 @@ def tool_prompt(name: str) -> str:
     text = _prompts().get(name)
     if not text:
         raise ValueError(f"缺少工具提示词: {name}")
+    # 文案本身不因开关变化：开关决定的是「这条工具定义是否下发给模型」，
+    # 见 tool_exposed()。这样面板里看到的正文始终是真实文案。
     return text
+
+
+def tool_exposed(name: str) -> bool:
+    """这条工具定义当前是否允许发给模型。
+
+    关闭工具说明不能只是把描述换成中性名称：schema 里真正占 token 的是
+    parameters，留一条没有说明的 schema 既让模型猜参数，又照样烧上下文。
+    所以关闭即不下发整条工具定义（工具仍在注册表里，历史调用与内部调用不受影响）。
+    """
+    return is_enabled(f"tool:{name}")
+
+
+def all_tool_prompts() -> dict[str, str]:
+    """全部工具提示词快照，供提示词管理面板展示。"""
+    return dict(_prompts())

@@ -11,6 +11,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 
 from app.api.deps import get_authenticated_user, get_stream_user_id
+from app.authorization.dependencies import require_permission
 from app.authorization.application.authorization_service import AuthorizationService
 from app.authorization.application.visibility import visible_tools
 from app.core.database.deps import DbSession
@@ -413,7 +414,7 @@ async def get_avatar_status(
 @router.put("/avatar", response_model=AvatarStatusOut, summary="上传并保存裁剪后的头像")
 async def update_avatar(
     body: AvatarUpload,
-    user: Annotated[User, Depends(get_authenticated_user)],
+    user: Annotated[User, Depends(require_permission("profile.write"))],
     session: DbSession,
 ) -> AvatarStatusOut:
     service = AvatarService(session)
@@ -428,7 +429,7 @@ async def update_avatar(
 @router.put("/username", response_model=UserOut, summary="修改我的用户名")
 async def update_username(
     body: ChangeUsernameRequest,
-    user: Annotated[User, Depends(get_authenticated_user)],
+    user: Annotated[User, Depends(require_permission("profile.write"))],
     session: DbSession,
 ) -> UserOut:
     """修改用户名后回传最新的用户信息，前端据此同步本地 store。"""

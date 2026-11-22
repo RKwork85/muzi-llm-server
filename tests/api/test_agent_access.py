@@ -119,11 +119,11 @@ def test_other_user_cannot_read_cancel_or_subscribe_memory_task(client: TestClie
     assert client.get(f"/api/v1/agents/runs/{task_id}").status_code == 401
 
 
-def test_anonymous_and_database_down_cannot_create(client: TestClient, provider: FakeProvider, monkeypatch) -> None:
+def test_unauthenticated_and_database_down_cannot_create(client: TestClient, provider: FakeProvider, monkeypatch) -> None:
     provider.push(make_result("不应执行"))
-    anonymous = client.post("/api/v1/agents/runs", json={"message": "只回答", "prompt_name": "default"})
-    assert anonymous.status_code == 401
-    assert anonymous.json()["error"]["code"] == "LOGIN_REQUIRED"
+    unauthenticated = client.post("/api/v1/agents/runs", json={"message": "只回答", "prompt_name": "default"})
+    assert unauthenticated.status_code == 401
+    assert unauthenticated.json()["error"]["code"] == "LOGIN_REQUIRED"
     assert provider.calls == []
 
     def unavailable():

@@ -12,14 +12,16 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 
 from app.core.config import Settings
 from app.core.database.session import get_session_factory
+from app.core.logging import get_logger
 from app.data.oss_client import OssUploadClient
 from app.services.flow_store_service import FlowStoreService
 
-logger = logging.getLogger("muzi_llm.flow")
+# 日志名统一走工程名（muzi_llm）；曾经这里挂过 "muzi_llm.flow" 子名，
+# 导致按 LOGGER_NAME 配置的过滤器/级别对回收任务不生效。
+logger = get_logger()
 
 # 启动后先等一会再跑第一轮，避免和进程启动时的其它初始化抢数据库连接。
 _INITIAL_DELAY_SECONDS = 60

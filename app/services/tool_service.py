@@ -21,6 +21,7 @@ from app.core.exceptions import (
     ToolNotAllowedError,
 )
 from app.providers.base import ToolCall
+from app.tools.prompts import tool_exposed
 from app.tools.registry import ToolRegistry, ToolSpec
 from app.tools.web_client import WebCallError
 
@@ -41,7 +42,9 @@ class ToolService:
             for name in names:
                 spec = self._allowed(name)
                 specs.append(spec)
-        return [spec.openai_schema() for spec in specs]
+        # 管理面板关掉的工具说明不下发整条 schema：parameters 才是上下文大头，
+        # 只把描述换成中性名称等于「看不见但照样烧 token」。
+        return [spec.openai_schema() for spec in specs if tool_exposed(spec.name)]
 
     async def execute(
         self,

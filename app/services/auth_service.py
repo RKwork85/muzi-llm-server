@@ -19,6 +19,7 @@ from app.core.exceptions import (
     AuthFailedError,
     CodeRateLimitError,
     DatabaseUnavailableError,
+    EmailAlreadyRegisteredError,
     EmailNotRegisteredError,
     FeatureNotReadyError,
     InvalidRequestError,
@@ -39,7 +40,7 @@ _CODE = re.compile(r"^\d{4,8}$")
 _TOKEN_TTL = timedelta(days=30)
 _DUMMY_HASH: str | None = None
 _PHONE_EMAIL_DOMAIN = "phone.local"
-_EMAIL_SCENES = ("login", "bind", "reset_password")
+_EMAIL_SCENES = ("register", "bind", "reset_password")
 _HOUR_WINDOW_SECONDS = 3600
 _DAY_WINDOW_SECONDS = 86400
 
@@ -139,6 +140,7 @@ class AuthService:
         username: str,
         password: str,
         display_name: str | None = None,
+        code: str | None = None,
     ) -> IssuedLogin:
         email = normalize_email(email)
         username = normalize_username(username)
@@ -148,7 +150,21 @@ class AuthService:
             raise AccountExistsError("邮箱已被使用")
         if await self._username_taken(username):
             raise AccountExistsError("用户名已被使用")
-        user = User(email=email, username=username, display_name=display_name, status="active")
+        # 邮箱必须验证：邮件服务不可用时直接拒绝注册，不放行未验证账号。
+        settings = get_settings()
+        if not mail_configured(settings):
+            raise FeatureNotReadyError("邮件服务尚未配置，暂时无法注册")
+        if not code:
+            raise InvalidRequestError("请填写邮箱验证码")
+        await self._email_store(settings).verify("register", email, normalize_code(code))
+        email_verified_at = utcnow()
+        user = User(
+            email=email,
+            username=username,
+            display_name=display_name,
+            status="active",
+            email_verified_at=email_verified_at,
+        )
         self.session.add(user)
         try:
             await self.session.flush()
@@ -301,6 +317,41 @@ class AuthService:
         await self.session.execute(
             update(RefreshToken)
             .where(RefreshToken.user_id == user_id, RefreshToken.revoked_at.is_(None))
+            .values(revoked_at=utcnow())
+        )
+
+    async def reset_password(self, email: str, code: str, new_password: str) -> None:
+        """凭邮箱验证码重置密码。验证码一次性使用，成功后吊销全部登录凭证。
+
+        与 change_password 的区别：不校验旧密码，靠邮箱归属证明身份。
+        所以这里必须只对真实邮箱账号生效，并拒绝内部占位域名。
+        """
+        email = normalize_email(email)
+        code = normalize_code(code)
+        settings = get_settings()
+        if not mail_configured(settings):
+            raise FeatureNotReadyError("邮件服务尚未配置，暂时无法找回密码")
+        self._ensure_email_allowed(settings, email)
+        # 先验码再查库：顺序与 send-code 一致，避免无码探测邮箱是否存在。
+        await self._email_store(settings).verify("reset_password", email, code)
+        user = await self._email_owner(email)
+        if user is None:
+            raise EmailNotRegisteredError()
+        if user.status != "active":
+            raise AccountDisabledError()
+        credential = await self.session.scalar(
+            select(UserCredential).where(
+                UserCredential.user_id == user.id,
+                UserCredential.provider == "email_password",
+            )
+        )
+        if credential is None or not credential.password_hash:
+            raise InvalidRequestError("该账户未使用邮箱密码登录，无法重置密码")
+        credential.password_hash = hash_password(normalize_password(new_password))
+        # 密码被重置后，旧会话一律失效，防止他人用泄露的旧 token 继续访问。
+        await self.session.execute(
+            update(RefreshToken)
+            .where(RefreshToken.user_id == user.id, RefreshToken.revoked_at.is_(None))
             .values(revoked_at=utcnow())
         )
 
@@ -464,14 +515,15 @@ class AuthService:
     async def send_email_code(
         self,
         email: str,
-        scene: str = "login",
+        scene: str = "register",
         *,
         client_ip: str | None = None,
     ) -> dict[str, object]:
-        """给已注册邮箱下发一次性验证码。
+        """下发一次性验证码。
 
-        顺序刻意如此：IP 限额在查库之前，让「批量探测邮箱是否注册」有成本；
-        冷却与额度都占成功后，再把失败回滚掉。
+        scene=register 只发给**未注册**邮箱（用于注册）；bind / reset_password
+        只发给已注册邮箱。顺序刻意如此：IP 限额在查库之前，让「批量探测邮箱
+        是否存在」有成本；冷却与额度都占成功后，再把失败回滚掉。
         """
         email = normalize_email(email)
         if scene not in _EMAIL_SCENES:
@@ -489,7 +541,12 @@ class AuthService:
                 settings.mail_hourly_limit_per_ip,
                 _HOUR_WINDOW_SECONDS,
             )
-        if await self._email_owner(email) is None:
+        exists = await self._email_owner(email) is not None
+        if scene == "register":
+            # 已注册邮箱不需要验证码：他们用密码登录。
+            if exists:
+                raise EmailAlreadyRegisteredError()
+        elif not exists:
             raise EmailNotRegisteredError()
         await store.reserve(scene, email)
         await self._consume_window(
@@ -521,22 +578,3 @@ class AuthService:
             "message": "验证码已发送",
         }
 
-    async def login_with_email(self, email: str, code: str) -> IssuedLogin:
-        """邮箱 + 验证码登录。仅对已注册邮箱有效，不自动建号。"""
-        email = normalize_email(email)
-        code = normalize_code(code)
-        settings = get_settings()
-        self._ensure_email_allowed(settings, email)
-        await self._email_store(settings).verify("login", email, code)
-        user = await self._email_owner(email)
-        if user is None:
-            raise EmailNotRegisteredError()
-        if user.status != "active":
-            raise AccountDisabledError()
-        if getattr(user, "email_verified_at", None) is None:
-            # 收到验证码即证明邮箱归属，顺手补上验证时间。
-            user.email_verified_at = utcnow()
-        issued = await self._issue(user)
-        await self.session.flush()
-        await self._grant_default_quota(user.id)
-        return issued

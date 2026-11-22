@@ -8,12 +8,16 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import select
 
 from app.api.deps import get_authenticated_user
+from app.authorization.dependencies import require_permission
 from app.core.database.deps import DbSession
 from app.core.exceptions import InvalidRequestError
 from app.models.tables import PluginInstallation, User
 from app.plugins.catalog import all_plugins, plugin_ids
 
 router = APIRouter(prefix="/plugins", tags=["plugins"])
+
+# 安装/卸载是写操作；目录与安装状态读取不加校验。
+PluginWriter = Annotated[User, Depends(require_permission("plugin.write"))]
 
 
 def _entry(item) -> dict[str, object]:
@@ -57,7 +61,7 @@ async def list_plugins(
 @router.post("/{plugin_id}/install", summary="安装插件")
 async def install_plugin(
     plugin_id: str,
-    user: Annotated[User, Depends(get_authenticated_user)],
+    user: PluginWriter,
     session: DbSession,
 ) -> dict[str, object]:
     if plugin_id not in plugin_ids():
@@ -69,7 +73,7 @@ async def install_plugin(
 @router.delete("/{plugin_id}/uninstall", summary="卸载插件")
 async def uninstall_plugin(
     plugin_id: str,
-    user: Annotated[User, Depends(get_authenticated_user)],
+    user: PluginWriter,
     session: DbSession,
 ) -> dict[str, object]:
     if plugin_id not in plugin_ids():

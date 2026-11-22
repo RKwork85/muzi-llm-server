@@ -13,13 +13,13 @@ from app.models.tables import User
 from app.schemas.auth import (
     AuthResponse,
     ChangePasswordRequest,
-    EmailLoginRequest,
     EmailSendCodeRequest,
     LoginRequest,
     PhoneLoginRequest,
     PhoneSendCodeRequest,
     PhoneSendCodeResponse,
     RegisterRequest,
+    ResetPasswordRequest,
     UserOut,
 )
 from app.schemas.common import ErrorResponse
@@ -65,11 +65,13 @@ def _response(issued: IssuedLogin) -> AuthResponse:
     summary="邮箱注册",
 )
 async def register(body: RegisterRequest, session: DbSession) -> AuthResponse:
+    """邮箱注册。邮件服务开启时必须带上邮箱验证码。"""
     issued = await AuthService(session).register(
         body.email,
         body.username,
         body.password,
         body.display_name,
+        body.code,
     )
     return _response(issued)
 
@@ -140,7 +142,8 @@ def _client_ip(request: Request) -> str | None:
     "/email/send-code",
     response_model=PhoneSendCodeResponse,
     responses={
-        404: {"model": ErrorResponse, "description": "该邮箱尚未注册"},
+        404: {"model": ErrorResponse, "description": "该邮箱尚未注册（绑定/改密场景）"},
+        409: {"model": ErrorResponse, "description": "该邮箱已注册，请直接登录"},
         422: {"model": ErrorResponse, "description": "邮箱或场景无效"},
         429: {"model": ErrorResponse, "description": "发送过于频繁"},
         501: {"model": ErrorResponse, "description": "邮件服务尚未配置"},
@@ -154,7 +157,7 @@ async def send_email_code(
     request: Request,
     session: DbSession,
 ) -> PhoneSendCodeResponse:
-    """校验邮箱已注册后，经 SMTP 下发一次性验证码。"""
+    """注册场景给未注册邮箱发码；绑定/改密场景给已注册邮箱发码。"""
     result = await AuthService(session).send_email_code(
         body.email,
         body.scene,
@@ -164,22 +167,21 @@ async def send_email_code(
 
 
 @router.post(
-    "/email/login",
-    response_model=AuthResponse,
+    "/reset-password",
+    summary="凭邮箱验证码重置密码",
     responses={
         401: {"model": ErrorResponse, "description": "验证码错误或已失效"},
         403: {"model": ErrorResponse, "description": "账户已停用"},
         404: {"model": ErrorResponse, "description": "该邮箱尚未注册"},
-        422: {"model": ErrorResponse, "description": "邮箱或验证码无效"},
+        422: {"model": ErrorResponse, "description": "邮箱、验证码或新密码无效"},
         501: {"model": ErrorResponse, "description": "邮件服务尚未配置"},
         503: {"model": ErrorResponse, "description": "验证码服务暂不可用"},
     },
-    summary="邮箱验证码登录",
 )
-async def login_with_email(body: EmailLoginRequest, session: DbSession) -> AuthResponse:
-    """邮箱 + 验证码登录。仅已注册邮箱可用，未注册返回 404 供前端引导注册。"""
-    issued = await AuthService(session).login_with_email(body.email, body.code)
-    return _response(issued)
+async def reset_password(body: ResetPasswordRequest, session: DbSession) -> dict[str, Any]:
+    """不需要登录态：靠邮箱验证码证明归属后改密，并使旧会话全部失效。"""
+    await AuthService(session).reset_password(body.email, body.code, body.new_password)
+    return {"ok": True}
 
 
 @router.post("/logout", summary="退出登录")

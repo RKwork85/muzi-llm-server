@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from app.prompts.settings import is_enabled
+
 SKILL_INSTRUCTIONS: dict[str, str] = {
     "research": "深度研究：先检索再归纳，回答里标出出处。不要编造来源。",
     "polish": "文案润色：保留原意，统一语气，直接给出改写结果。",
@@ -38,7 +40,11 @@ def skill_notes(
     ``can_write`` 决定要不要承诺「需要写文件时用对应写入工具」。没有写工具的用户
     收到这句话只会让模型反复尝试一个不存在的工具，所以按实际工具名单收窄措辞。
     """
-    lines = [SKILL_INSTRUCTIONS[name] for name in names if name in SKILL_INSTRUCTIONS]
+    lines = [
+        SKILL_INSTRUCTIONS[name]
+        for name in names
+        if name in SKILL_INSTRUCTIONS and is_enabled(f"plugin:{name}")
+    ]
     if not lines:
         return ""
     if execute is True:

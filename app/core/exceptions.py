@@ -229,11 +229,19 @@ class MailDeliveryError(AppError):
 
 
 class EmailNotRegisteredError(AppError):
-    """仅已注册邮箱可登录。前端据此引导用户去注册。"""
+    """仅已注册邮箱可绑定/改密。前端据此引导用户去注册。"""
 
     code = "EMAIL_NOT_REGISTERED"
     status_code = 404
     default_message = "该邮箱尚未注册，请先注册"
+
+
+class EmailAlreadyRegisteredError(AppError):
+    """注册场景下已注册邮箱不需要验证码：他们用密码登录。"""
+
+    code = "EMAIL_ALREADY_REGISTERED"
+    status_code = 409
+    default_message = "该邮箱已注册，请直接登录"
 
 
 

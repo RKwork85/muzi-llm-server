@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 
 from app.core.database.session import get_session_factory
 from app.core.exceptions import InvalidRequestError, LoginRequiredError, McpUnavailableError
+from app.authorization.application.authorization_service import AuthorizationService
 from app.mcp.keys import KeyConfigurationError
 from app.mcp.pool import production_pool
 from app.mcp.service import McpService
@@ -109,6 +110,21 @@ async def required_mcp(request: Request) -> AsyncIterator[McpService]:
         yield service
 
 
+async def _require_connect(user_id: str) -> None:
+    """建立连接 / 写入凭据需要 `mcp.connect`。
+
+    后台「连接器」页面里这个开关如果只在前端生效，就等于装饰：拿到 token
+    直接调接口照样能连。因此写连接的动作统一在这里校验一次，省得每个
+    端点各写一遍、漏一个就漏一条路。
+    """
+    factory = get_session_factory()
+    session = factory()
+    try:
+        await AuthorizationService(session).require_permission(user_id, "mcp.connect")
+    finally:
+        await session.close()
+
+
 @router.get("/connectors", summary="远程服务目录和当前用户的连接状态")
 async def list_connectors(request: Request, service: McpService = Depends(required_mcp)) -> dict[str, object]:
     user_id = await service.user_id_from_request(request)
@@ -118,6 +134,7 @@ async def list_connectors(request: Request, service: McpService = Depends(requir
 @router.post("/connectors/{name}/connect", summary="开始授权")
 async def connect(name: str, request: Request, service: McpService = Depends(required_mcp)) -> dict[str, str]:
     user_id = await service.require_user(request)
+    await _require_connect(user_id)
     return {"authorization_url": await service.begin(user_id, name)}
 
 
@@ -183,6 +200,7 @@ async def put_auth(
 ) -> dict[str, object]:
     """社区目录里只认 `Authorization: Bearer <token>` 或 `X-API-Key` 这类自定义头的远程 MCP 走这条路。"""
     user_id = await service.require_user(request)
+    await _require_connect(user_id)
     tools = await service.connect_with_credentials(user_id, name, token=body.token, headers=body.headers)
     return {"status": "connected", "connector": name, "selected_tools": tools}
 
@@ -196,6 +214,7 @@ async def put_token(
 ) -> dict[str, object]:
     """等价于 `/auth` 的 `token` 字段，保留给旧调用方。"""
     user_id = await service.require_user(request)
+    await _require_connect(user_id)
     tools = await service.connect_with_token(user_id, name, body.token)
     return {"status": "connected", "connector": name, "selected_tools": tools}
 
@@ -214,6 +233,7 @@ async def put_credentials(
     service: McpService = Depends(required_mcp),
 ) -> dict[str, str]:
     user_id = await service.require_user(request)
+    await _require_connect(user_id)
     credentials = _validate_bridge_credentials(name, body)
     try:
         await service.configure_bridge(user_id, name, credentials)
@@ -257,6 +277,7 @@ async def community_install(
     授权无法发起时不留下「已安装但永远连不上」的目录项：本次新建的目录项回滚。
     """
     user_id = await service.require_user(request)
+    await _require_connect(user_id)
     if not body.qualified_name.strip() or not body.url.strip():
         raise InvalidRequestError("qualified_name 与 url 不能为空")
     installed = await service.install_community(

@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from app.agents.toolsets import chat_mode_tool_names
 from app.prompts.skills import skill_notes
+from app.prompts.settings import is_enabled
 from app.core.config import Settings
 from app.core.context import get_request_id
 from app.core.exceptions import (
@@ -344,9 +345,9 @@ class ChatService:
             plugin_names,
             can_write=bool({"write_docx", "write_text_file"}.intersection(names)),
         )
-        if self.skill_runtime is not None and "discover_skills" in names and body.skill_mode != "explicit":
+        if self.skill_runtime is not None and "discover_skills" in names and body.skill_mode != "explicit" and is_enabled("guard:skill_usage"):
             extra = f"{extra}\n\n{SKILL_USAGE_INSTRUCTION}" if extra else SKILL_USAGE_INSTRUCTION
-        if use_tools and (remote or self._ask_needs_untrusted(names)):
+        if use_tools and (remote or self._ask_needs_untrusted(names)) and is_enabled("guard:untrusted"):
             extra = f"{extra}\n\n{UNTRUSTED_PROMPT}" if extra else UNTRUSTED_PROMPT
         if extra:
             system["content"] = f"{system['content']}\n\n{extra}"
@@ -431,7 +432,14 @@ class ChatService:
         tool_choice: str | None = None,
     ) -> PreparedChat:
         model = self._resolve_model(body.model)
-        system_prompt = self.prompts.render(body.prompt_name, body.prompt_variables)
+        # 被管理员关掉的人设按顺序回退：请求的模板 -> default -> assistant。
+        # 但名字根本不存在时要保持原来的 404，不能把拼错的 prompt_name 静默改掉。
+        if self.prompts.exists(body.prompt_name):
+            system_prompt = self.prompts.render_first(
+                [body.prompt_name, "default", "assistant"], body.prompt_variables
+            )
+        else:
+            system_prompt = self.prompts.render(body.prompt_name, body.prompt_variables)
         messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
         for item in body.messages:
             if item.role not in {"user", "assistant"}:

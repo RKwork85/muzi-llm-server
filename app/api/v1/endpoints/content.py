@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 
 from app.api.deps import get_authenticated_user, get_stream_user_id
+from app.authorization.dependencies import require_permission
 from app.content import events
 from app.content.schemas import (
     CollectRequest,
@@ -41,11 +42,14 @@ from app.models.tables import User
 
 router = APIRouter(prefix="/content", tags=["content"])
 
+# 创作是写操作：进得了创作页不等于能发起任务。查询/SSE 不加校验（高频轮询）。
+ContentWriter = Annotated[User, Depends(require_permission("content.write"))]
+
 
 @router.post("/collect", response_model=CollectResponse, summary="采集收单（登录态）")
 async def collect(
     body: CollectRequest,
-    user: Annotated[User, Depends(get_authenticated_user)],
+    user: ContentWriter,
     session: DbSession,
 ) -> CollectResponse:
     """粘贴链接 → 新建采集任务（queued/collect），返回 task_id。"""
@@ -59,7 +63,7 @@ async def collect(
 @router.post("/submit", response_model=TaskOut, summary="提交任务节点（登录态）")
 async def submit(
     body: SubmitRequest,
-    user: Annotated[User, Depends(get_authenticated_user)],
+    user: ContentWriter,
     session: DbSession,
 ) -> TaskOut:
     """采集预览确认后：draft → queued/workflow，写入交付链路与配置。"""
@@ -103,7 +107,7 @@ async def get_task(
 @router.post("/tasks/{task_id}/cancel", response_model=TaskOut, summary="取消排队/运行中的任务")
 async def cancel_task(
     task_id: uuid.UUID,
-    user: Annotated[User, Depends(get_authenticated_user)],
+    user: ContentWriter,
     session: DbSession,
 ) -> TaskOut:
     task = await ContentService().cancel(session, user.id, task_id)
@@ -113,7 +117,7 @@ async def cancel_task(
 @router.post("/tasks/{task_id}/publish", response_model=TaskOut, summary="发起发布（登录态）")
 async def publish_task(
     task_id: uuid.UUID,
-    user: Annotated[User, Depends(get_authenticated_user)],
+    user: ContentWriter,
     session: DbSession,
 ) -> TaskOut:
     """succeeded → publishing，交由发布 worker 完成（骨架阶段为占位）。"""

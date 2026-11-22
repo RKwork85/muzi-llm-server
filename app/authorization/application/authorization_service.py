@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.authorization.domain.catalog import (
     ADMIN_ROLE_CODE,
     PERMISSION_BY_CODE,
+    ROLE_BY_CODE,
     SUPER_ADMIN_ROLE_CODE,
 )
 from app.core.exceptions import PermissionDeniedError
@@ -215,6 +216,27 @@ class AuthorizationService:
                 data_scope=data_scope,
             )
         return result
+
+    async def role_permissions(self, role_code: str) -> frozenset[str]:
+        """按角色 code 解析权限集合。所有「按角色取权限」的路径都走这里。
+
+        三种状态必须区分清楚，否则「管理员取消全部勾选」会被当成「没配置」：
+        - 角色行不存在（数据库还没跑 seed）→ 回退代码里的默认权限；
+        - 角色被停用 → 该角色不再授予任何权限；
+        - 角色存在且启用 → 用 role_permissions 里的真实配置（可能为空集）。
+        """
+        role = await self.session.scalar(select(Role).where(Role.code == role_code))
+        if role is None:
+            spec = ROLE_BY_CODE.get(role_code)
+            return spec.permissions if spec is not None else frozenset()
+        if role.status != "active":
+            return frozenset()
+        rows = await self.session.scalars(
+            select(Permission.code)
+            .join(RolePermission, RolePermission.permission_id == Permission.id)
+            .where(RolePermission.role_id == role.id)
+        )
+        return frozenset(rows)
 
     async def get_data_scope(self, user_id: uuid.UUID | str) -> str:
         if await self._is_super_admin(user_id):

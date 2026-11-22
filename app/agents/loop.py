@@ -18,6 +18,7 @@ from app.agents.provider_adapter import (
     complete_for_agent,
 )
 from app.providers.base import LLMProvider, ProviderChatRequest
+from app.tools.prompts import tool_exposed
 from app.tools.registry import ToolRegistry
 
 _CALL_ID = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -289,6 +290,9 @@ def _allowed_schemas(registry: ToolRegistry, names: tuple[str, ...]) -> list[dic
     for name in names:
         spec = registry.get(name)
         if spec is None or spec.risk_level != "low":
+            continue
+        # 工具说明被关闭 = 整条定义不下发，见 app.tools.prompts.tool_exposed。
+        if not tool_exposed(name):
             continue
         schemas.append(spec.openai_schema())
     return schemas

@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
 from app.api.deps import get_authenticated_user
+from app.authorization.dependencies import require_permission
 from app.authorization.application.audit_service import QuotaService
 from app.core.config import get_settings
 from app.core.database.deps import DbSession
@@ -60,7 +61,7 @@ class RechargeOrderStatus(BaseModel):
 @router.post("/create", response_model=RechargeCreateResponse, summary="创建充值订单（登录态）")
 async def create_recharge(
     body: RechargeCreateRequest,
-    user: Annotated[User, Depends(get_authenticated_user)],
+    user: Annotated[User, Depends(require_permission("recharge.write"))],
     session: DbSession,
 ) -> RechargeCreateResponse:
     settings = get_settings()

@@ -1,4 +1,4 @@
-"""邮箱验证码登录的端到端校验。需要本机 PostgreSQL + Redis，SMTP 用假实现替代。"""
+"""邮箱验证码注册的端到端校验。需要本机 PostgreSQL + Redis，SMTP 用假实现替代。"""
 
 from __future__ import annotations
 
@@ -37,14 +37,18 @@ async def _delete_user(user_id: uuid.UUID) -> None:
 
 async def _clear_email_keys(email: str) -> None:
     redis = get_redis()
-    keys = [f"email:code:login:{email}", f"email:cooldown:login:{email}",
-            f"email:attempts:login:{email}", f"email:limit:addr:{email}"]
+    keys = [
+        f"email:code:register:{email}",
+        f"email:cooldown:register:{email}",
+        f"email:attempts:register:{email}",
+        f"email:limit:addr:{email}",
+    ]
     keys = [key for key in keys if await redis.exists(key)]
     if keys:
         await redis.delete(*keys)
 
 
-async def test_email_code_login_flow(ready_database: Settings, monkeypatch) -> None:
+async def test_email_code_registration_flow(ready_database: Settings, monkeypatch) -> None:
     del ready_database
     email, username = _identity()
     password = "email-code-pass-1"
@@ -53,7 +57,6 @@ async def test_email_code_login_flow(ready_database: Settings, monkeypatch) -> N
     def fake_send(_settings, to_email: str, code: str, scene: str) -> None:
         captured.update(email=to_email, code=code, scene=scene)
 
-    # 用真实 Settings 覆盖，确保邮件字段齐全；发送被替换为纯内存实现。
     monkeypatch.setattr(
         "app.services.auth_service.get_settings",
         lambda: Settings(
@@ -70,62 +73,83 @@ async def test_email_code_login_flow(ready_database: Settings, monkeypatch) -> N
     user_id: uuid.UUID | None = None
     try:
         async with app.router.lifespan_context(app):
-            factory = get_session_factory()
-            async with factory() as session:
-                issued = await AuthService(session).register(email, username, password, None)
-                await session.commit()
-                user_id = issued.user.id
-
             transport = ASGITransport(app=app)
             async with AsyncClient(transport=transport, base_url="http://test") as client:
-                # 未注册邮箱：404，前端据此引导去注册。
-                missing = await client.post(
-                    "/api/v1/auth/email/send-code",
-                    json={"email": f"nobody-{uuid.uuid4().hex[:8]}@example.com"},
-                )
-                assert missing.status_code == 404, missing.text
-                assert missing.json()["error"]["code"] == "EMAIL_NOT_REGISTERED"
-
+                # 未注册邮箱：注册场景可以收码。
                 sent = await client.post(
                     "/api/v1/auth/email/send-code",
-                    json={"email": email, "scene": "login"},
+                    json={"email": email, "scene": "register"},
                 )
                 assert sent.status_code == 200, sent.text
                 assert sent.json()["expires_in"] == 600
                 assert captured["email"] == email
+                assert captured["scene"] == "register"
                 code = captured["code"]
 
                 # 冷却期内重复发送必须被拒。
                 again = await client.post(
                     "/api/v1/auth/email/send-code",
-                    json={"email": email, "scene": "login"},
+                    json={"email": email, "scene": "register"},
                 )
                 assert again.status_code == 429, again.text
 
+                # 验证码错误不能建号。
                 wrong = "000000" if code != "000000" else "111111"
                 rejected = await client.post(
-                    "/api/v1/auth/email/login",
-                    json={"email": email, "code": wrong},
+                    "/api/v1/auth/register",
+                    json={
+                        "email": email,
+                        "username": username,
+                        "password": password,
+                        "code": wrong,
+                    },
                 )
                 assert rejected.status_code == 401, rejected.text
 
-                logged = await client.post(
-                    "/api/v1/auth/email/login",
-                    json={"email": email, "code": code},
+                created = await client.post(
+                    "/api/v1/auth/register",
+                    json={
+                        "email": email,
+                        "username": username,
+                        "password": password,
+                        "code": code,
+                    },
                 )
-                assert logged.status_code == 200, logged.text
-                body = logged.json()
-                assert uuid.UUID(body["user"]["id"]) == user_id
+                assert created.status_code == 201, created.text
+                body = created.json()
+                user_id = uuid.UUID(body["user"]["id"])
+                assert body["user"]["email"] == email
                 assert body["token"]
 
-                # 验证码一次性：同一个码不能再次使用。
+                # 重复提交同一邮箱会被去重挡住（早于验证码校验，所以是 409 而不是 401）。
                 reused = await client.post(
-                    "/api/v1/auth/email/login",
-                    json={"email": email, "code": code},
+                    "/api/v1/auth/register",
+                    json={
+                        "email": email,
+                        "username": f"{username}b",
+                        "password": password,
+                        "code": code,
+                    },
                 )
-                assert reused.status_code == 401, reused.text
+                assert reused.status_code == 409, reused.text
+                assert reused.json()["error"]["code"] == "ACCOUNT_EXISTS"
 
-            async with factory() as session:
+                # 已注册邮箱不再需要验证码，直接被拒并引导去登录。
+                existing = await client.post(
+                    "/api/v1/auth/email/send-code",
+                    json={"email": email, "scene": "register"},
+                )
+                assert existing.status_code == 409, existing.text
+                assert existing.json()["error"]["code"] == "EMAIL_ALREADY_REGISTERED"
+
+                # 注册后可以用密码登录。
+                logged = await client.post(
+                    "/api/v1/auth/login",
+                    json={"email": email, "password": password},
+                )
+                assert logged.status_code == 200, logged.text
+
+            async with get_session_factory()() as session:
                 verified = await session.scalar(
                     text("SELECT email_verified_at FROM users WHERE id = :id"),
                     {"id": user_id},

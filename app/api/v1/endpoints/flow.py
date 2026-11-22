@@ -11,6 +11,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, File, Form, Query, Request, UploadFile
 
 from app.api.deps import get_authenticated_user
+from app.authorization.dependencies import require_permission
 from app.core.database.deps import DbSession
 from app.data.oss_client import OssUploadClient
 from app.models.flow import FlowApp, FlowSession
@@ -37,6 +38,8 @@ from app.services.flow_store_service import CanvasSnapshot, FlowStoreService
 router = APIRouter(prefix="/flow/documents", tags=["flow"])
 store_router = APIRouter(prefix="/flow", tags=["flow"])
 AuthenticatedUser = Annotated[User, Depends(get_authenticated_user)]
+# 画布的写操作（保存/删除/上传）统一走这一个依赖；读接口不加，避免每次轮询都查权限。
+FlowWriter = Annotated[User, Depends(require_permission("flow.write"))]
 
 
 def _oss_client(request: Request) -> OssUploadClient | None:
@@ -71,7 +74,7 @@ async def save_flow_document(
     body: FlowDocumentSaveRequest,
     request: Request,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: FlowWriter,
 ) -> FlowDocumentItem:
     row = await FlowService(session).upsert(user.id, doc_key, body.payload, _oss_client(request))
     return FlowDocumentItem(
@@ -86,7 +89,7 @@ async def save_flow_document(
 async def delete_flow_document(
     doc_key: str,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: FlowWriter,
 ) -> dict[str, object]:
     deleted = await FlowService(session).delete(user.id, doc_key)
     return {"doc_key": doc_key, "deleted": deleted}
@@ -127,7 +130,7 @@ async def list_flow_apps(
 async def save_flow_app(
     body: FlowAppSaveRequest,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: FlowWriter,
 ) -> FlowAppItem:
     row = await FlowStoreService(session).upsert_app(user.id, body.model_dump())
     return _app_item(row)
@@ -137,7 +140,7 @@ async def save_flow_app(
 async def delete_flow_app(
     app_key: str,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: FlowWriter,
     workspace_key: str = Query(...),
 ) -> dict[str, object]:
     deleted = await FlowStoreService(session).delete_app(user.id, workspace_key, app_key)
@@ -175,7 +178,7 @@ async def list_flow_sessions(
 async def save_flow_session(
     body: FlowSessionSaveRequest,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: FlowWriter,
 ) -> FlowSessionItem:
     row = await FlowStoreService(session).upsert_session(
         user.id,
@@ -192,7 +195,7 @@ async def rename_flow_session(
     session_key: str,
     body: FlowSessionRenameRequest,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: FlowWriter,
     workspace_key: str = Query(...),
     workflow_key: str = Query(...),
 ) -> FlowSessionItem:
@@ -211,7 +214,7 @@ async def rename_flow_session(
 async def delete_flow_session(
     session_key: str,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: FlowWriter,
     workspace_key: str = Query(...),
     workflow_key: str = Query(...),
 ) -> dict[str, object]:
@@ -303,7 +306,7 @@ async def save_flow_canvas(
     body: FlowCanvasSaveRequest,
     request: Request,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: FlowWriter,
     workspace_key: str = Query(...),
     workflow_key: str = Query(...),
 ) -> FlowCanvasItem:
@@ -341,7 +344,7 @@ async def upload_flow_image(
     session_key: str,
     request: Request,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: FlowWriter,
     file: Annotated[UploadFile, File()],
     workspace_key: Annotated[str, Form()],
     workflow_key: Annotated[str, Form()],

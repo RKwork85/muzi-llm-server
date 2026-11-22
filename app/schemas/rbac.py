@@ -25,10 +25,15 @@ class PermissionOut(BaseModel):
 
     @model_validator(mode="after")
     def _derive(self) -> "PermissionOut":
+        # 只对真正的工具执行权限推导模式。
+        # 不能只看 code 的首段：`agent.access` 是功能权限（能否使用 Agent），
+        # 首段恰好叫 agent，若按前缀推导会被误当成「Agent 模式下的内置工具」，
+        # 于是在角色权限页的工具分组里露出来。
         if not self.mode:
-            prefix = self.code.split(".")[0]
-            if prefix in {"ask", "plan", "agent"}:
-                self.mode = prefix
+            from app.authorization.domain.catalog import TOOL_PERMISSION_RESOURCES
+
+            if self.resource in TOOL_PERMISSION_RESOURCES:
+                self.mode = self.code.split(".")[0]
         if not self.min_rank:
             from app.authorization.domain.catalog import permission_min_rank
 
@@ -49,9 +54,9 @@ class RoleOut(BaseModel):
 
     @model_validator(mode="after")
     def _derive_rank(self) -> "RoleOut":
-        if not self.rank:
-            from app.authorization.domain.catalog import role_grant_rank
+        from app.authorization.domain.catalog import role_grant_rank
 
+        if not self.rank:
             self.rank = role_grant_rank(self.code)
         return self
 
@@ -170,6 +175,28 @@ class MeResponse(BaseModel):
     roles: list[str] = Field(default_factory=list)
     permissions: list[str] = Field(default_factory=list)
     data_scope: str = "self"
+
+
+class PageOut(BaseModel):
+    """一个页面的准入定义。
+
+    后台「页面授权」面板与前端路由守卫都吃这一份数据，
+    因此它包含：怎么进（access）、进去能做什么（features）。
+    """
+
+    key: str
+    name: str
+    path: str
+    # 进入该页面需要的权限码；None 表示登录即可。
+    access: str | None = None
+    # 该页面下的功能 / 写操作权限码。
+    features: list[str] = Field(default_factory=list)
+
+
+class PageCatalogOut(BaseModel):
+    """整份页面清单。前端启动时读取一次，用于路由准入与后台分组。"""
+
+    pages: list[PageOut] = Field(default_factory=list)
 
 
 class ModeCapabilitiesOut(BaseModel):

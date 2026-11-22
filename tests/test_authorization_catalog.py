@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 from app.authorization.domain.catalog import (
+    ADMIN_ROLE_CODE,
     BUILTIN_ROLES,
+    DEVELOPER_ROLE_CODE,
+    GUEST_ROLE_CODE,
     MEMBER_ROLE_CODE,
     PERMISSION_CATALOG,
     ROLE_BY_CODE,
     SUPER_ADMIN_ROLE_CODE,
+    TOOL_PERMISSION_RESOURCES,
     permission_min_rank,
     role_grant_rank,
 )
@@ -67,7 +71,61 @@ def test_member_has_basic_permissions_not_admin() -> None:
 
 
 def test_guest_is_restricted() -> None:
-    assert ROLE_BY_CODE["guest"].permissions == frozenset({"chat.access"})
+    guest = ROLE_BY_CODE["guest"].permissions
+    # 访客是「只读 / 受限」场景的现成载体：只有对话页与发言权，
+    # 外加媒体创作画布（该板块一直对游客开放体验）。
+    assert guest == frozenset({"chat.access", "chat.write", "flow.access"})
+    # 其余页面一律不可浏览
+    assert not guest & {
+        "history.access",
+        "assets.access",
+        "creation.access",
+        "docs.access",
+        "plugin.access",
+        "mcp.access",
+    }
+    # 除发言外不得有任何写操作
+    assert not guest & {
+        "history.write",
+        "content.write",
+        "flow.write",
+        "docs.write",
+        "profile.write",
+        "recharge.write",
+    }
+
+
+def test_page_and_write_permissions_are_grantable_to_guest() -> None:
+    """页面浏览与功能使用两类权限必须能授予最低等级角色。
+
+    这两类权限的用途就是把角色收窄成「只读 / 受限」，而收窄对象通常正是访客。
+    若沿用默认门槛 40，管理员给 guest 勾任何一项都会 400，功能无法成立。
+    """
+    for code in (
+        "history.access",
+        "assets.access",
+        "creation.access",
+        "flow.access",
+        "docs.access",
+        "chat.write",
+        "history.write",
+        "content.write",
+        "flow.write",
+        "docs.write",
+        "profile.write",
+        "recharge.write",
+    ):
+        assert code in {spec.code for spec in PERMISSION_CATALOG}, code
+        assert permission_min_rank(code) == role_grant_rank("guest"), code
+
+
+def test_functional_codes_never_look_like_tool_permissions() -> None:
+    """功能权限不能带模式前缀，否则会被工具分组当成内置工具展示。"""
+    for spec in PERMISSION_CATALOG:
+        if spec.mode:
+            assert spec.resource in TOOL_PERMISSION_RESOURCES, spec.code
+        else:
+            assert spec.code == f"{spec.resource}.{spec.action}", spec.code
 
 
 def test_developer_has_advanced_permissions() -> None:

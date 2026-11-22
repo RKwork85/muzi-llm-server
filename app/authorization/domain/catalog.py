@@ -19,6 +19,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+# 页面清单是「页面 → 浏览权限 / 该页功能」的唯一事实来源；这里再导出，
+# 让 `from ...catalog import PAGE_ACCESS_CODES` 的老调用点继续成立。
+from app.authorization.domain.pages import (  # noqa: F401  (再导出)
+    PAGE_ACCESS_CODES,
+    PAGE_CATALOG,
+    PAGE_FEATURE_CODES,
+    PAGE_BY_KEY,
+    PageSpec,
+)
+
 # ---------------------------------------------------------------------------
 # 内置角色
 # ---------------------------------------------------------------------------
@@ -70,6 +80,13 @@ _TOOL_ACTIONS: tuple[tuple[str, str, str], ...] = (
     ("file", "deliver", "交付文件（生成外发链接）"),
 )
 
+# 工具执行权限的 resource 集合。只有这些资源下的码才按模式（ask/plan/agent）展开，
+# 供 API 层区分「工具执行权限」与「功能权限」——`agent.access` 属于后者，
+# 不能因为首段恰好叫 agent 就被当成 Agent 模式下的内置工具。
+TOOL_PERMISSION_RESOURCES: frozenset[str] = frozenset(
+    resource for resource, _, _ in _TOOL_ACTIONS
+)
+
 
 def _tool_permission_specs() -> list[PermissionSpec]:
     specs: list[PermissionSpec] = []
@@ -105,6 +122,35 @@ PERMISSION_CATALOG: tuple[PermissionSpec, ...] = (
     PermissionSpec("model.access", "使用模型", "model", "access", "调用大模型"),
     PermissionSpec("knowledge.access", "使用知识库", "knowledge", "access", "查询知识库"),
     PermissionSpec("admin.access", "进入管理后台", "admin", "access", "访问管理后台"),
+    # ------------------------------------------------------------------
+    # 页面浏览权限
+    #
+    # 与上面的 *.access 同一语义：决定「能不能进这个页面」。
+    # 只在前端路由与导航层使用，不作为接口的安全边界——页面是前端产物，
+    # 真正的数据安全由各接口的 user_id 隔离与写操作权限保证。
+    #
+    # 命名约束：首段不能用 ask/plan/agent，否则会被误认成工具执行权限。
+    # ------------------------------------------------------------------
+    PermissionSpec("history.access", "浏览历史记录", "history", "access", "进入历史记录页面"),
+    PermissionSpec("assets.access", "浏览资产", "assets", "access", "进入资产中心页面"),
+    PermissionSpec("creation.access", "浏览创作", "creation", "access", "进入创作板块与生成工作台"),
+    PermissionSpec("flow.access", "浏览画布", "flow", "access", "进入创作画布工作台"),
+    PermissionSpec("docs.access", "浏览文档空间", "docs", "access", "进入文档空间"),
+    # ------------------------------------------------------------------
+    # 功能使用权限（写操作）
+    #
+    # 全局资源维度，不与页面对应：同一个码可能被多个页面共用
+    # （例如 flow.write 同时覆盖画布保存、删除与会话管理）。
+    # 后台只按「影响哪些页面」展示，授权本身只有一个开关，避免按页面拆分导致权限放大。
+    # ------------------------------------------------------------------
+    PermissionSpec("chat.write", "对话写操作", "chat", "write", "发送消息、上传附件"),
+    PermissionSpec("history.write", "历史写操作", "history", "write", "保存、重命名与删除历史记录"),
+    PermissionSpec("content.write", "创作写操作", "content", "write", "发起采集、生成、发布与取消任务"),
+    PermissionSpec("flow.write", "画布写操作", "flow", "write", "保存、删除画布与上传素材"),
+    PermissionSpec("docs.write", "文档写操作", "docs", "write", "新建、编辑、删除文档与上传图片"),
+    PermissionSpec("plugin.write", "插件安装", "plugin", "write", "安装与卸载插件"),
+    PermissionSpec("profile.write", "资料写操作", "profile", "write", "修改用户名与头像"),
+    PermissionSpec("recharge.write", "充值写操作", "recharge", "write", "创建充值订单"),
     # 用户管理
     PermissionSpec("user.read", "查看用户", "user", "read", "查看用户列表与详情"),
     PermissionSpec("user.create", "创建用户", "user", "create", "管理员创建用户"),
@@ -144,6 +190,13 @@ def _p(*codes: str) -> frozenset[str]:
     return frozenset(codes)
 
 
+# 专用「页面浏览」权限：只为页面准入而存在，不承担任何接口授权。
+#
+# 清单在 pages.py（页面 → 浏览权限 + 该页功能），这里只做再导出。
+# 不要在这里手写第二份页面清单或权限码：新增页面只改 pages.py 一处，
+# 后台面板与路由守卫都会自动跟上。
+
+
 # ---------------------------------------------------------------------------
 # 内置角色权限矩阵
 #
@@ -171,6 +224,23 @@ _BASE_MEMBER = _p(
     "plugin.access",
     "task.read",
     "task.cancel",
+    # 页面浏览：登录用户的默认可见范围。除访客外的角色默认都能浏览全部页面，
+    # 保持与「引入页面授权之前」完全一致的行为；要收窄某个角色，由管理员在后台取消勾选。
+    "history.access",
+    "assets.access",
+    "creation.access",
+    "flow.access",
+    "docs.access",
+    # 功能使用（写操作）：默认全部放开，理由同上——先保证行为不变。
+    # 收窄同样靠后台取消勾选，不需要改代码。
+    "chat.write",
+    "history.write",
+    "content.write",
+    "flow.write",
+    "docs.write",
+    "plugin.write",
+    "profile.write",
+    "recharge.write",
 )
 
 # ---------------------------------------------------------------------------
@@ -274,13 +344,31 @@ BUILTIN_ROLES: tuple[RoleSpec, ...] = (
     ),
     RoleSpec(
         code=GUEST_ROLE_CODE,
-        name="受限访客",
-        description="受限用户，仅开放基础对话功能。",
-        permissions=_p("chat.access"),
+        name="受限用户",
+        description="受限账号：只能进入对话与画布，其余页面与写操作需管理员另行开放。",
+        # guest 是一个能挂在已登录账号上的最低档位（等级 20），
+        # 用于试用、降级或人工收窄的账号；code 保留 guest 是为了不动数据库主键。
+        permissions=_p("chat.access", "chat.write", "flow.access"),
     ),
 )
 
 ROLE_BY_CODE: dict[str, RoleSpec] = {spec.code: spec for spec in BUILTIN_ROLES}
+
+# 页面浏览权限的后缀约定：`<resource>.access` 只回答「能不能进这个页面」。
+PAGE_PERMISSION_SUFFIX = ".access"
+
+
+def is_page_permission(code: str) -> bool:
+    """是否页面浏览权限（`*.access`）。"""
+    return code.endswith(PAGE_PERMISSION_SUFFIX)
+
+
+# 内置角色用过的旧展示名。seed 只在「当前名字仍是旧默认值」时才改写，
+# 避免把管理员在后台改过的名字又刷回去（PATCH /admin/roles/{id} 允许改系统角色的
+# name，和 permissions_customized 保护的是同一类问题）。
+LEGACY_ROLE_NAMES: dict[str, frozenset[str]] = {
+    GUEST_ROLE_CODE: frozenset({"受限访客"}),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +410,6 @@ def role_grant_rank(role_code: str) -> int:
 # 未显式列出的权限默认门槛为 member 等级（40）。
 PERMISSION_MIN_RANK: dict[str, int] = {
     # 仅管理员（80）可配置的管理类权限
-    "admin.access": 80,
     "user.read": 80,
     "user.create": 80,
     "user.update": 80,
@@ -348,7 +435,9 @@ PERMISSION_MIN_RANK: dict[str, int] = {
     # 不是管理动作，所以 member 就能配置给自定义角色。
     "mcp.execute": 40,
     # `/` 插件面板与普通对话同级：member 也能使用，由插件自身的工具依赖继续收窄。
-    "plugin.access": 40,
+    # 同时它也是「应用」页面的浏览码，门槛必须压到访客等级，否则后台会出现
+    # 「能勾功能却勾不了页面」的残缺分组（见 tests/test_page_catalog.py）。
+    "plugin.access": 20,
     "ask.workspace.delete": 60,
     "ask.command.execute": 60,
     "agent.workspace.write": 60,
@@ -356,6 +445,36 @@ PERMISSION_MIN_RANK: dict[str, int] = {
     "agent.command.execute": 60,
     # 访客（20）即可配置的基础对话
     "chat.access": 20,
+    # ------------------------------------------------------------------
+    # 页面浏览与功能使用：全部设为访客等级（20）
+    #
+    # 这两组权限的用途就是「把某些角色收窄成只读 / 受限」，而收窄的对象
+    # 通常正是访客或按访客等级创建的自定义角色。若沿用默认门槛 40，
+    # 管理员给 guest 勾任何一项都会 400，功能无法成立。
+    # 它们都不是管理动作，放开给最低等级不会造成权限放大。
+    # ------------------------------------------------------------------
+    "history.access": 20,
+    "assets.access": 20,
+    "creation.access": 20,
+    "flow.access": 20,
+    "docs.access": 20,
+    # admin.access 也是「页面浏览」权限（进入管理后台页面），与其它页面浏览
+    # 一样对所有角色开放配置。它只决定「能不能进这个页面」：就算低等级角色
+    # 被勾上，进去后管理接口仍由 user.read / role.manage 等 80 级权限把关，
+    # 看不到也调不动任何数据——页面准入与页面内功能是两条独立的边界。
+    "admin.access": 20,
+    # plugin / mcp 的 .access 既是页面浏览码（应用 / 连接器），也是功能码。
+    # 页面浏览一律按访客等级放开，理由同上：否则分组里的浏览开关被 min_rank
+    # 过滤掉，只剩下一个不完整的页面。
+    "mcp.access": 20,
+    "chat.write": 20,
+    "history.write": 20,
+    "content.write": 20,
+    "flow.write": 20,
+    "docs.write": 20,
+    "plugin.write": 20,
+    "profile.write": 20,
+    "recharge.write": 20,
 }
 
 DEFAULT_PERMISSION_MIN_RANK = ROLE_RANK[MEMBER_ROLE_CODE]

@@ -292,13 +292,45 @@ async def delete_user_quota(
 # 角色管理
 # ---------------------------------------------------------------------------
 
+async def _roles_out(session: DbSession) -> list[RoleOut]:
+    """角色列表输出。每个角色走同一套推导：rank 来自代码目录。"""
+    roles = await RoleService(session).list_roles()
+    return [RoleOut.model_validate(role) for role in roles]
+
+
 @router.get("/roles", response_model=list[RoleOut], summary="列出角色")
 async def list_roles(
     session: DbSession,
     _: Annotated[User, Depends(require_permission("role.read"))],
 ) -> list[RoleOut]:
-    roles = await RoleService(session).list_roles()
-    return [RoleOut.model_validate(role) for role in roles]
+    return await _roles_out(session)
+
+
+@router.post(
+    "/roles/sync-builtin",
+    response_model=list[RoleOut],
+    summary="同步内置角色",
+)
+async def sync_builtin_roles(
+    session: DbSession,
+    actor: Annotated[User, Depends(require_permission("role.manage"))],
+) -> list[RoleOut]:
+    """把内置角色对齐到当前代码版本，返回同步后的完整角色列表。
+
+    为什么需要这个端点：内置角色的补齐写在启动钩子里（main.py 的 lifespan），
+    所以「后端升级后新增/改名了内置角色」这件事只有在重启后才生效。上线时忘了重启、
+    或 seed 因为一次数据库抖动失败，后台就会缺角色、名字还是旧的——而管理员在页面上
+    完全看不出是「没同步」还是「本来就没有」，只能去查库。
+
+    幂等：内部复用 seed_authorization，只补缺失项、只同步仍是旧默认值的文案，
+    不会覆盖管理员改过的名字，也不会把取消掉的勾选加回来。
+    """
+    from app.authorization.seed import seed_authorization
+
+    await seed_authorization(session)
+    await AuditService(session).record(actor.id, "role_sync_builtin", outcome="success")
+    await session.flush()
+    return await _roles_out(session)
 
 
 @router.post("/roles", response_model=RoleOut, status_code=201, summary="创建角色")

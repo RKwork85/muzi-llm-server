@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, Request
 
 from app.api.deps import get_authenticated_user
+from app.authorization.dependencies import require_permission
 from app.core.database.deps import DbSession
 from app.data.oss_client import OssUploadClient
 from app.models.tables import User
@@ -15,6 +16,8 @@ from app.services.history_service import HistoryService
 
 router = APIRouter(prefix="/history", tags=["history"])
 AuthenticatedUser = Annotated[User, Depends(get_authenticated_user)]
+# 写操作单独校验：历史页能进不代表能删改。
+HistoryWriter = Annotated[User, Depends(require_permission("history.write"))]
 
 
 def _oss_client(request: Request) -> OssUploadClient | None:
@@ -36,7 +39,7 @@ async def save_history(
     body: HistorySaveRequest,
     request: Request,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: HistoryWriter,
 ) -> dict[str, object]:
     return await HistoryService(session).upsert(
         user.id,
@@ -51,7 +54,7 @@ async def save_history(
 async def delete_history(
     chat_id: str,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: HistoryWriter,
 ) -> dict[str, object]:
     deleted = await HistoryService(session).delete(user.id, chat_id)
     return {"chat_id": chat_id, "deleted": deleted}

@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.agent_access import require_agent_operator
 from app.authorization.application.execution_guard import CURRENT_EXECUTION, load_execution_context
+from app.authorization.application.authorization_service import AuthorizationService
 from app.api.deps import get_authenticated_user, get_chat_service
 from app.api.v1.endpoints.mcp import optional_mcp
 from app.mcp.service import McpService
@@ -475,6 +476,9 @@ async def _authorize_model_user(
         owner = await AuthService(session).user_for_token(credentials.credentials)
         if owner is None:
             raise LoginRequiredError()
+        # 「对话写操作」是全站唯一一个只在前端生效的写权限：后台界面有开关，
+        # 接口却照旧放行，等于勾了没用。这里补上服务端校验，让面板的勾选有意义。
+        await AuthorizationService(session).require_permission(owner.id, "chat.write")
         await QuotaService(session).authorize(owner.id)
         await session.commit()
         return owner

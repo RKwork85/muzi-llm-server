@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from typing import Annotated
 from uuid import UUID
 
@@ -10,6 +9,7 @@ from fastapi import APIRouter, Depends, File, Query, UploadFile
 from sqlalchemy import delete, func, select
 
 from app.api.deps import get_authenticated_user, get_settings_dep
+from app.authorization.dependencies import require_permission
 from app.core.config import Settings
 from app.core.database.deps import DbSession
 from app.core.exceptions import DocArticleNotFoundError, InvalidRequestError, UpstreamError
@@ -24,9 +24,13 @@ from app.schemas.docs import (
     DocListResponse,
     DocUpdateRequest,
 )
+from app.services.doc_text import excerpt
 
 router = APIRouter(prefix="/docs", tags=["docs"])
 AuthenticatedUser = Annotated[User, Depends(get_authenticated_user)]
+# 写操作单独一个依赖：页面能进不代表能改，前端把按钮置灰只是体验层，
+# 真正的门禁在这里。读接口不加——已有 user_id 隔离，且高频读不值得多查几次库。
+DocsWriter = Annotated[User, Depends(require_permission("docs.write"))]
 AppSettings = Annotated[Settings, Depends(get_settings_dep)]
 
 # 正文插图：粘贴的多是截图，8MB 足够，也挡住误传的超大原图。
@@ -51,18 +55,6 @@ def _detect_image(content: bytes) -> tuple[str, str] | None:
         return ".webp", "image/webp"
     return None
 
-
-def _excerpt(content: str, limit: int = 120) -> str:
-    """从 markdown 正文提取无格式摘要，用于列表展示。"""
-    text = content or ""
-    text = re.sub(r"```[\s\S]*?```", " ", text)
-    text = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", text)
-    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
-    text = re.sub(r"[#>*_`~\-|]", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > limit:
-        return text[:limit] + "…"
-    return text
 
 
 def _to_detail(row: DocArticle) -> DocDetailResponse:
@@ -119,7 +111,7 @@ async def list_docs(
             id=row.id,
             title=row.title or "无标题文档",
             status=row.status,
-            excerpt=_excerpt(row.excerpt_src or ""),
+            excerpt=excerpt(row.excerpt_src or ""),
             created_at=row.created_at,
             updated_at=row.updated_at,
         )
@@ -132,7 +124,7 @@ async def list_docs(
 async def create_doc(
     body: DocCreateRequest,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: DocsWriter,
 ) -> DocCreatedResponse:
     row = DocArticle(
         user_id=user.id,
@@ -151,7 +143,7 @@ async def create_doc(
     summary="上传正文插图",
 )
 async def upload_doc_image(
-    user: AuthenticatedUser,
+    user: DocsWriter,
     settings: AppSettings,
     file: UploadFile = File(...),
 ) -> DocImageUploadResponse:
@@ -208,7 +200,7 @@ async def update_doc(
     article_id: UUID,
     body: DocUpdateRequest,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: DocsWriter,
 ) -> DocDetailResponse:
     row = await _get_owned(session, user, article_id)
     if body.title is not None:
@@ -225,7 +217,7 @@ async def update_doc(
 async def delete_doc(
     article_id: UUID,
     session: DbSession,
-    user: AuthenticatedUser,
+    user: DocsWriter,
 ) -> dict[str, object]:
     result = await session.execute(
         delete(DocArticle).where(

@@ -54,6 +54,14 @@ class Role(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     status: Mapped[str] = mapped_column(
         String(32), nullable=False, default="active", server_default=text("'active'")
     )
+    # 管理员是否在后台手工改过该角色的权限。
+    #
+    # 启动时的 seed 会按 BUILTIN_ROLES 给内置角色补齐缺失的权限（幂等，只增不减），
+    # 这会把管理员刚取消掉的勾选在下次重启时又加回来。置 true 后 seed 跳过该角色，
+    # 使「出厂默认值」与「管理员配置」能区分开。
+    permissions_customized: Mapped[bool] = mapped_column(
+        nullable=False, default=False, server_default=text("false")
+    )
 
 
 class Permission(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):

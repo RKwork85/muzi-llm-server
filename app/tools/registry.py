@@ -112,7 +112,13 @@ class ToolSpec:
                 text = ""
             if text and text.strip():
                 return text.strip()
-        return self.description
+            return self.description
+        # 文案可能被管理面板改写（tools.toml 热加载）。注册时冻住第一次读到的
+        # 内容会让「开关 / 改文案」必须重启进程才生效，这里按文件指纹实时取。
+        try:
+            return tool_prompt(self.name)
+        except ValueError:
+            return self.description
 
     def openai_schema(self) -> dict[str, Any]:
         if self.parameters is not None:
