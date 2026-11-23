@@ -10,11 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.authorization.domain.catalog import (
     PERMISSION_BY_CODE,
     SUPER_ADMIN_ROLE_CODE,
-    permission_min_rank,
     role_grant_rank,
 )
 from app.core.exceptions import (
+    HierarchyDeniedError,
     InvalidRequestError,
+    PermissionDeniedError,
     RoleNotFoundError,
     SuperAdminProtectedError,
 )
@@ -87,24 +88,51 @@ class RoleService:
         )
         return set(rows)
 
-    async def set_role_permissions(self, role_id: uuid.UUID | str, codes: set[str]) -> None:
+    async def set_role_permissions(
+        self,
+        role_id: uuid.UUID | str,
+        codes: set[str],
+        *,
+        grantable: frozenset[str] | None = None,
+        actor_rank: int | None = None,
+    ) -> None:
+        """覆盖角色权限。
+
+        ``grantable`` / ``actor_rank`` 是「谁在改」的上下文，接口层必须传：
+
+        - ``actor_rank``：操作者的最高角色等级。不允许改动等级高于自己的角色，
+          否则 admin 可以给自己的上级（或平级）扩权，分级控制形同虚设。
+        - ``grantable``：操作者**可以转授**的权限码集合（见
+          ``AuthorizationService.get_delegatable_permissions``）。被授权者只能享受
+          授权，不能把它再下放；super_admin 的集合是全部权限。
+
+        保留项：角色上已经存在、但当前操作者不可转授的权限允许「原样保留」，
+        这样上级授予的权限不会因为下级管理员保存一次表单就被静默删除；要收回
+        只能由可转授的人（或 super_admin）操作。
+        """
         role = await self.get_role(role_id)
         if role.code == SUPER_ADMIN_ROLE_CODE:
             raise SuperAdminProtectedError()
         unknown = codes - set(PERMISSION_BY_CODE)
         if unknown:
             raise InvalidRequestError(f"未知权限: {', '.join(sorted(unknown))}")
-        rank = role_grant_rank(role.code)
-        too_high = sorted(c for c in codes if permission_min_rank(c) > rank)
-        if too_high:
-            raise InvalidRequestError(f"权限超出角色等级: {', '.join(too_high)}")
+        if actor_rank is not None and role_grant_rank(role.code) > actor_rank:
+            raise HierarchyDeniedError()
+        if grantable is not None:
+            existing = await self.get_role_permissions(role_id)
+            over = sorted(codes - set(grantable) - existing)
+            if over:
+                raise PermissionDeniedError(
+                    "以下权限不在你的可转授范围内，需要更高权限的管理员分配: "
+                    + ", ".join(over)
+                )
         perms = list(
             await self.session.scalars(select(Permission).where(Permission.code.in_(codes)))
         )
-        existing = list(
+        existing_rows = list(
             await self.session.scalars(select(RolePermission).where(RolePermission.role_id == role_id))
         )
-        for row in existing:
+        for row in existing_rows:
             await self.session.delete(row)
         # 先落库删除，再插入，避免同 key 的 INSERT 先于 DELETE 触发唯一约束冲突。
         await self.session.flush()
@@ -173,7 +201,15 @@ class UserPermissionService:
         user_id: uuid.UUID | str,
         code: str,
         grant_type: str,
+        *,
+        grantable: frozenset[str] | None = None,
     ) -> None:
+        """给单个用户直接允许 / 拒绝某个权限。
+
+        ``grantable`` 与角色配置同一条转授权边界：操作者只能新授予自己可转授的
+        权限；已经存在的直接授权可以改判（allow ↔ deny），否则下级管理员连收回
+        自己给过的授权都做不到。
+        """
         if code not in PERMISSION_BY_CODE:
             from app.core.exceptions import InvalidRequestError
 
@@ -188,6 +224,12 @@ class UserPermissionService:
                 UserPermission.user_id == user_id, UserPermission.permission_id == perm.id
             )
         )
+        if row is None and grantable is not None and code not in grantable:
+            from app.core.exceptions import PermissionDeniedError
+
+            raise PermissionDeniedError(
+                f"没有转授 {code} 的权限，需要更高权限的管理员分配"
+            )
         if row is None:
             self.session.add(
                 UserPermission(user_id=user_id, permission_id=perm.id, grant_type=grant_type)

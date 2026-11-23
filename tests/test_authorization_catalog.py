@@ -12,6 +12,7 @@ from app.authorization.domain.catalog import (
     ROLE_BY_CODE,
     SUPER_ADMIN_ROLE_CODE,
     TOOL_PERMISSION_RESOURCES,
+    builtin_role_permissions,
     permission_min_rank,
     role_grant_rank,
 )
@@ -73,8 +74,21 @@ def test_member_has_basic_permissions_not_admin() -> None:
 def test_guest_is_restricted() -> None:
     guest = ROLE_BY_CODE["guest"].permissions
     # 访客是「只读 / 受限」场景的现成载体：只有对话页与发言权，
-    # 外加媒体创作画布（该板块一直对游客开放体验）。
-    assert guest == frozenset({"chat.access", "chat.write", "flow.access"})
+    # 外加媒体创作画布（该板块一直对游客开放体验），以及登录账号必备的个人中心。
+    # 侧边栏只保留它自己进得去的那几个入口——受限账号看到的导航也必须受限。
+    assert guest == frozenset(
+        {
+            "chat.access",
+            "chat.write",
+            "flow.access",
+            "me.access",
+            "sidebar.show",
+            "sidebar.entry.home",
+            "sidebar.entry.chat",
+            "sidebar.entry.flow",
+            "sidebar.entry.me",
+        }
+    )
     # 其余页面一律不可浏览
     assert not guest & {
         "history.access",
@@ -83,6 +97,17 @@ def test_guest_is_restricted() -> None:
         "docs.access",
         "plugin.access",
         "mcp.access",
+        "brand.access",
+        "read.access",
+    }
+    # 进不去的页面也不该有侧边栏入口
+    assert not guest & {
+        "sidebar.entry.history",
+        "sidebar.entry.apps",
+        "sidebar.entry.creation",
+        "sidebar.entry.assets",
+        "sidebar.entry.brand",
+        "sidebar.entry.admin",
     }
     # 除发言外不得有任何写操作
     assert not guest & {
@@ -107,6 +132,9 @@ def test_page_and_write_permissions_are_grantable_to_guest() -> None:
         "creation.access",
         "flow.access",
         "docs.access",
+        "me.access",
+        "brand.access",
+        "read.access",
         "chat.write",
         "history.write",
         "content.write",
@@ -117,6 +145,42 @@ def test_page_and_write_permissions_are_grantable_to_guest() -> None:
     ):
         assert code in {spec.code for spec in PERMISSION_CATALOG}, code
         assert permission_min_rank(code) == role_grant_rank("guest"), code
+
+
+def test_sidebar_permissions_are_grantable_and_distinct_from_pages() -> None:
+    """侧边栏开关必须能授予最低等级角色，且不能冒充页面浏览权限。
+
+    入口显隐是纯展示开关：不涉及数据访问，门槛应与页面浏览同级（20），否则
+    「只给某个角色留两个入口」这种收窄在后台根本做不到。同时它不能以 `.access`
+    结尾——那会被当成页面浏览码混进页面清单/匿名访客快照里。
+    """
+    from app.authorization.domain.catalog import (
+        SIDEBAR_ENTRY_CODES,
+        SIDEBAR_PERMISSION_CODES,
+        SIDEBAR_SHOW_CODE,
+        is_page_permission,
+    )
+
+    catalog = {spec.code for spec in PERMISSION_CATALOG}
+    assert SIDEBAR_PERMISSION_CODES <= catalog
+    assert SIDEBAR_SHOW_CODE in SIDEBAR_PERMISSION_CODES
+    assert SIDEBAR_ENTRY_CODES, "入口清单不能为空"
+    for code in SIDEBAR_PERMISSION_CODES:
+        assert permission_min_rank(code) == role_grant_rank("guest"), code
+        assert not is_page_permission(code), f"{code} 不能长得像页面浏览码"
+    # 每个入口都是独立开关，否则「少露一个图标」无法表达
+    assert len(set(SIDEBAR_ENTRY_CODES)) == len(SIDEBAR_ENTRY_CODES)
+
+
+def test_member_and_above_see_full_sidebar_by_default() -> None:
+    """升级不能改变既有行为：内置角色的侧边栏默认全开。"""
+    from app.authorization.domain.catalog import SIDEBAR_ENTRY_CODES, SIDEBAR_SHOW_CODE
+
+    for role_code in (MEMBER_ROLE_CODE, DEVELOPER_ROLE_CODE, ADMIN_ROLE_CODE):
+        perms = builtin_role_permissions(role_code)
+        assert SIDEBAR_SHOW_CODE in perms, role_code
+        missing = [c for c in SIDEBAR_ENTRY_CODES if c not in perms]
+        assert not missing, f"{role_code} 缺少侧边栏入口 {missing}"
 
 
 def test_functional_codes_never_look_like_tool_permissions() -> None:
@@ -174,3 +238,19 @@ def test_builtin_role_permissions_respect_min_rank() -> None:
         rank = role_grant_rank(role.code)
         for code in role.permissions:
             assert permission_min_rank(code) <= rank, f"{role.code} 拥有超门槛权限 {code}"
+
+
+def test_builtin_role_permissions_is_the_delegation_boundary() -> None:
+    """转授权边界只看「出厂清单」，自定义角色一律为空。
+
+    这条约束决定了「被授权者能不能再往下授」：管理员后来手工加上的码不在清单里，
+    持有者就只能享受、不能下放。因此清单必须是纯代码事实，不能被数据库配置影响。
+    """
+    assert builtin_role_permissions("admin") is ROLE_BY_CODE["admin"].permissions
+    assert "prompt.manage" in builtin_role_permissions("admin")
+    # 开发者没有管理权限，拿到也只可能是别人授予的，naturally 不可转授
+    assert "prompt.manage" not in builtin_role_permissions("developer")
+    # 自定义角色没有出厂清单
+    assert builtin_role_permissions("analyst") == frozenset()
+    # super_admin 隐式全部权限，清单本身为空，由授权服务特判
+    assert builtin_role_permissions("super_admin") == frozenset()

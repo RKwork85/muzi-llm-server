@@ -204,6 +204,9 @@ class Settings(BaseSettings):
     # 并发太高会同时开多个浏览器窗口，默认串行最稳妥。
     content_worker_max_async_tasks: int = Field(default=1, ge=1, le=8)
     database_startup_required: bool = False
+    # 启动时检测到数据库 schema 落后时，是否自动执行 ``alembic upgrade head``。
+    # 默认开：本地/单实例开发避免「忘跑迁移 → 请求 500」；生产建议设为 false 走独立迁移流水线。
+    auto_migrate: bool = True
     db_pool_size: int = Field(default=5, ge=1, le=20)
     db_max_overflow: int = Field(default=10, ge=0, le=40)
     db_pool_timeout_seconds: float = Field(default=30, gt=0, le=120)

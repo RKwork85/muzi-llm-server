@@ -103,6 +103,27 @@ class ChangeUsernameRequest(BaseModel):
     )
 
 
+class DemoAccountRequest(BaseModel):
+    """随机演示账号（登录页图标彩蛋，仅开发环境）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    role: Literal["member", "developer"] = Field(
+        default="member",
+        description="member：与普通用户权限一致；developer：开发者角色",
+    )
+
+
+class DemoAccountOut(BaseModel):
+    """演示账号凭据。密码为一次性明文回传，仅用于前端自动填充登录表单。"""
+
+    email: str
+    username: str
+    password: str
+    role: str
+    role_name: str
+
+
 class UserOut(BaseModel):
     id: UUID
     email: str

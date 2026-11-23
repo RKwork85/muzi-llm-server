@@ -42,4 +42,18 @@ def test_guest_is_a_restricted_account_not_a_visitor() -> None:
     """guest 是已登录的受限账号：只有最低限度的页面权限，不含任何管理动作。"""
     guest = ROLE_BY_CODE["guest"]
     assert guest.name == "受限用户"
-    assert guest.permissions == frozenset({"chat.access", "chat.write", "flow.access"})
+    # 个人中心是登录账号的必备附属页（改密码 / 看额度），其内部写操作仍受控。
+    # 侧边栏只给它进得去的那几个入口，避免受限账号看到一堆点不开的图标。
+    assert guest.permissions == frozenset(
+        {
+            "chat.access",
+            "chat.write",
+            "flow.access",
+            "me.access",
+            "sidebar.show",
+            "sidebar.entry.home",
+            "sidebar.entry.chat",
+            "sidebar.entry.flow",
+            "sidebar.entry.me",
+        }
+    )

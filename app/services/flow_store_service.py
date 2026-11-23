@@ -30,6 +30,7 @@ from app.models.flow import (
     FlowCanvasNode,
     FlowImage,
     FlowImageRef,
+    FlowOfficialWorkflow,
     FlowSession,
 )
 from app.models.mixins import utcnow
@@ -898,3 +899,102 @@ class FlowStoreService:
         self._session.add(row)
         await self._session.flush()
         return row
+
+    # ------------------------------------------------------------------
+    # 官方工作流案例（平台级，超管管理）
+    # ------------------------------------------------------------------
+
+    async def list_official_workflows(
+        self, workspace_key: str | None = None
+    ) -> list[FlowOfficialWorkflow]:
+        stmt = select(FlowOfficialWorkflow).where(
+            FlowOfficialWorkflow.deleted_at.is_(None)
+        )
+        if workspace_key:
+            stmt = stmt.where(FlowOfficialWorkflow.workspace_key == _key(workspace_key, "板块 key"))
+        stmt = stmt.order_by(FlowOfficialWorkflow.sort_order.asc(), FlowOfficialWorkflow.created_at.asc())
+        return list(await self._session.scalars(stmt))
+
+    async def upsert_official_workflow(self, data: dict[str, Any]) -> FlowOfficialWorkflow:
+        workspace_key = _key(str(data.get("workspace_key") or ""), "板块 key")
+        workflow_key = _key(str(data.get("workflow_key") or ""), "案例 key")
+        row = await self._session.scalar(
+            select(FlowOfficialWorkflow).where(
+                FlowOfficialWorkflow.workspace_key == workspace_key,
+                FlowOfficialWorkflow.workflow_key == workflow_key,
+            )
+        )
+        if row is None:
+            row = FlowOfficialWorkflow(
+                workspace_key=workspace_key,
+                workflow_key=workflow_key,
+                name="",
+            )
+            self._session.add(row)
+            # 新建且未显式指定排序：排到当前板块末尾，避免和内置案例的 sort_order 冲突。
+            if not isinstance(data.get("sort_order"), int):
+                max_order = await self._session.scalar(
+                    select(func.max(FlowOfficialWorkflow.sort_order)).where(
+                        FlowOfficialWorkflow.workspace_key == workspace_key,
+                        FlowOfficialWorkflow.deleted_at.is_(None),
+                    )
+                )
+                row.sort_order = (max_order if max_order is not None else -1) + 1
+        row.name = str(data.get("name") or "").strip()[:200] or "未命名官方案例"
+        row.icon = str(data.get("icon") or "✧")[:16]
+        row.accent = str(data.get("accent") or "#6366f1")[:32]
+        row.description = str(data.get("description") or "")[:2000]
+        row.tags = _clean_tags(data.get("tags"))
+        row.status = str(data.get("status") or "ready")[:16] or "ready"
+        row.demo = str(data.get("demo") or "blank")[:64]
+        if isinstance(data.get("sort_order"), int):
+            row.sort_order = max(0, data["sort_order"])
+        snapshot = data.get("snapshot")
+        if isinstance(snapshot, dict):
+            row.snapshot = snapshot
+        elif row.snapshot is None:
+            row.snapshot = {}
+        row.deleted_at = None
+        await self._session.flush()
+        return row
+
+    async def delete_official_workflow(self, workspace_key: str, workflow_key: str) -> bool:
+        workspace = _key(workspace_key, "板块 key")
+        workflow = _key(workflow_key, "案例 key")
+        row = await self._session.scalar(
+            select(FlowOfficialWorkflow).where(
+                FlowOfficialWorkflow.workspace_key == workspace,
+                FlowOfficialWorkflow.workflow_key == workflow,
+                FlowOfficialWorkflow.deleted_at.is_(None),
+            )
+        )
+        if row is None:
+            return False
+        row.deleted_at = utcnow()
+        await self._session.flush()
+        return True
+
+    async def reorder_official_workflows(
+        self, workspace_key: str, workflow_keys: list[str]
+    ) -> int:
+        workspace = _key(workspace_key, "板块 key")
+        keys = [str(key).strip() for key in workflow_keys if str(key).strip()]
+        if not keys:
+            raise InvalidRequestError("排序列表不能为空")
+        # 只更新本表已存在的案例：排序数组可能含前端静态内置案例的 key，
+        # 它们不落本表，跳过即可。
+        updated = 0
+        for order, key in enumerate(keys):
+            row = await self._session.scalar(
+                select(FlowOfficialWorkflow).where(
+                    FlowOfficialWorkflow.workspace_key == workspace,
+                    FlowOfficialWorkflow.workflow_key == key,
+                    FlowOfficialWorkflow.deleted_at.is_(None),
+                )
+            )
+            if row is None or row.sort_order == order:
+                continue
+            row.sort_order = order
+            updated += 1
+        await self._session.flush()
+        return updated

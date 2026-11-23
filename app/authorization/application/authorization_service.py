@@ -28,6 +28,8 @@ from app.authorization.domain.catalog import (
     PERMISSION_BY_CODE,
     ROLE_BY_CODE,
     SUPER_ADMIN_ROLE_CODE,
+    builtin_role_permissions,
+    max_role_rank,
 )
 from app.core.exceptions import PermissionDeniedError
 from app.models.mixins import utcnow
@@ -111,6 +113,29 @@ class AuthorizationService:
             .order_by(Role.code)
         )
         return list(rows)
+
+    async def get_delegatable_permissions(self, user_id: uuid.UUID | str) -> set[str]:
+        """当前用户可以「继续授予别人」的权限码（转授权边界）。
+
+        规则：只能下放自己角色出厂清单里就有的权限。
+
+        - 管理员后来手工加到角色上的码、user_permissions 直接给的码 → 只可自用，
+          不可再转授，避免一次授权沿等级链无限扩散、无人能追溯来源；
+        - super_admin 隐式拥有全部权限，也就可以下放全部权限（它本来就是授权源）；
+        - 自定义角色没有出厂清单，因此持有者无法把任何权限再下放。
+        """
+        roles = await self.get_user_roles(user_id)
+        if SUPER_ADMIN_ROLE_CODE in roles:
+            return set(PERMISSION_BY_CODE)
+        granted = await self.get_effective_permissions(user_id)
+        delegatable: set[str] = set()
+        for code in roles:
+            delegatable |= builtin_role_permissions(code) & granted
+        return delegatable
+
+    async def get_max_role_rank(self, user_id: uuid.UUID | str) -> int:
+        """当前用户的最高角色等级，用于「不能操作等级更高的角色」。"""
+        return max_role_rank(await self.get_user_roles(user_id))
 
     async def snapshot(self, user_id: uuid.UUID | str) -> PermissionSnapshot:
         """单个用户的有效权限快照。

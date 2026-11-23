@@ -136,6 +136,33 @@ PERMISSION_CATALOG: tuple[PermissionSpec, ...] = (
     PermissionSpec("creation.access", "浏览创作", "creation", "access", "进入创作板块与生成工作台"),
     PermissionSpec("flow.access", "浏览画布", "flow", "access", "进入创作画布工作台"),
     PermissionSpec("docs.access", "浏览文档空间", "docs", "access", "进入文档空间"),
+    PermissionSpec("me.access", "浏览个人中心", "me", "access", "进入个人中心、用量与充值页面"),
+    # 对外公开页面的浏览码：未登录访问仍由路由 meta.public 放行；登录后按本码
+    # 判定，因此「登录用户能不能看官网 / 资讯」也变成了可配置项。
+    PermissionSpec("brand.access", "浏览品牌首页", "brand", "access", "进入品牌官网首页"),
+    PermissionSpec("read.access", "浏览资讯", "read", "access", "进入平台资讯页面"),
+    # ------------------------------------------------------------------
+    # 侧边栏展示权限
+    #
+    # 与页面浏览刻意分成两组：页面浏览回答「能不能进」，这一组回答「侧边栏里
+    # 要不要露出那个入口」。两者正交，才能表达常见的运营诉求——页面照旧可以
+    # 用地址直接打开（收藏、分享链接、引导流程），但入口从导航里收起来，避免
+    # 把还在试运行的功能摆在所有人眼前。
+    #
+    # 入口码是「显式开放」语义：没勾就不显示。升级时 seed 会把这些新码补发给
+    # 所有已有角色（含自定义角色），保证升级前后侧边栏表现一致。
+    # ------------------------------------------------------------------
+    PermissionSpec("sidebar.show", "显示侧边栏", "sidebar", "show", "显示左侧悬浮导航栏"),
+    PermissionSpec("sidebar.entry.home", "侧边栏入口：首页", "sidebar", "entry.home", "显示首页头像入口"),
+    PermissionSpec("sidebar.entry.chat", "侧边栏入口：对话", "sidebar", "entry.chat", "显示新建对话入口"),
+    PermissionSpec("sidebar.entry.history", "侧边栏入口：历史记录", "sidebar", "entry.history", "显示历史记录入口"),
+    PermissionSpec("sidebar.entry.apps", "侧边栏入口：应用", "sidebar", "entry.apps", "显示应用入口"),
+    PermissionSpec("sidebar.entry.creation", "侧边栏入口：创作", "sidebar", "entry.creation", "显示创作入口"),
+    PermissionSpec("sidebar.entry.flow", "侧边栏入口：画布", "sidebar", "entry.flow", "显示画布入口"),
+    PermissionSpec("sidebar.entry.assets", "侧边栏入口：资产", "sidebar", "entry.assets", "显示资产入口"),
+    PermissionSpec("sidebar.entry.brand", "侧边栏入口：品牌", "sidebar", "entry.brand", "显示品牌首页入口"),
+    PermissionSpec("sidebar.entry.me", "侧边栏入口：我的", "sidebar", "entry.me", "显示个人中心入口"),
+    PermissionSpec("sidebar.entry.admin", "侧边栏入口：管理后台", "sidebar", "entry.admin", "显示管理后台入口"),
     # ------------------------------------------------------------------
     # 功能使用权限（写操作）
     #
@@ -147,6 +174,7 @@ PERMISSION_CATALOG: tuple[PermissionSpec, ...] = (
     PermissionSpec("history.write", "历史写操作", "history", "write", "保存、重命名与删除历史记录"),
     PermissionSpec("content.write", "创作写操作", "content", "write", "发起采集、生成、发布与取消任务"),
     PermissionSpec("flow.write", "画布写操作", "flow", "write", "保存、删除画布与上传素材"),
+    PermissionSpec("flow.manage", "管理官方案例", "flow", "manage", "创建、删除、排序与导入官方工作流案例"),
     PermissionSpec("docs.write", "文档写操作", "docs", "write", "新建、编辑、删除文档与上传图片"),
     PermissionSpec("plugin.write", "插件安装", "plugin", "write", "安装与卸载插件"),
     PermissionSpec("profile.write", "资料写操作", "profile", "write", "修改用户名与头像"),
@@ -162,6 +190,9 @@ PERMISSION_CATALOG: tuple[PermissionSpec, ...] = (
     PermissionSpec("role.manage", "管理角色", "role", "manage", "创建、修改、删除角色"),
     PermissionSpec("permission.read", "查看权限", "permission", "read", "查看权限字典"),
     PermissionSpec("permission.manage", "管理权限", "permission", "manage", "管理权限字典与授权策略"),
+    # 系统配置：内置提示词是平台级的对话行为，改动会影响所有人的每一轮请求，
+    # 所以单独给一个 80 级管理码，不借用「进入管理后台」的页面浏览码。
+    PermissionSpec("prompt.manage", "管理系统提示词", "prompt", "manage", "启用或关闭后端内置提示词"),
     # 任务与审计
     PermissionSpec("task.read", "查看任务", "task", "read", "查看任务记录"),
     PermissionSpec("task.cancel", "取消任务", "task", "cancel", "取消运行中的任务"),
@@ -198,6 +229,54 @@ def _p(*codes: str) -> frozenset[str]:
 
 
 # ---------------------------------------------------------------------------
+# 侧边栏展示权限
+# ---------------------------------------------------------------------------
+# 与页面浏览正交的第二层开关：页面决定「能不能进」，这里决定「入口露不露」。
+# 前端 AppSidebar 只用这份清单判断显隐，后台角色面板按同一份清单渲染分组。
+# 定义必须早于下面的角色矩阵——内置角色要引用这些码作默认值。
+SIDEBAR_PERMISSION_RESOURCE = "sidebar"
+#: 整个侧边栏的总开关。关掉后导航栏整体消失，页面仍可用地址直接访问。
+SIDEBAR_SHOW_CODE = "sidebar.show"
+#: 各个入口的显隐开关，顺序即侧边栏中的排列顺序。
+SIDEBAR_ENTRY_CODES: tuple[str, ...] = (
+    "sidebar.entry.home",
+    "sidebar.entry.chat",
+    "sidebar.entry.history",
+    "sidebar.entry.apps",
+    "sidebar.entry.creation",
+    "sidebar.entry.flow",
+    "sidebar.entry.assets",
+    "sidebar.entry.brand",
+    "sidebar.entry.me",
+    "sidebar.entry.admin",
+)
+SIDEBAR_PERMISSION_CODES: frozenset[str] = frozenset(
+    {SIDEBAR_SHOW_CODE, *SIDEBAR_ENTRY_CODES}
+)
+
+#: 入口 → 它所属的页面 key（与前端 `constants/sidebar.js` 一一对应）。
+#: 用来在补发权限时判断「这个角色连页面都进不去，就不该得到入口」。
+SIDEBAR_ENTRY_PAGES: dict[str, str] = {
+    "sidebar.entry.home": "chat",
+    "sidebar.entry.chat": "chat",
+    "sidebar.entry.history": "history",
+    "sidebar.entry.apps": "apps",
+    "sidebar.entry.creation": "creation",
+    "sidebar.entry.flow": "flow",
+    "sidebar.entry.assets": "assets",
+    "sidebar.entry.brand": "brand",
+    "sidebar.entry.me": "me",
+    "sidebar.entry.admin": "admin",
+}
+
+
+def sidebar_entry_page_access(code: str) -> str | None:
+    """入口码对应的页面浏览码；不是入口码或页面不需要权限时返回 None。"""
+    page_key = SIDEBAR_ENTRY_PAGES.get(code)
+    spec = PAGE_BY_KEY.get(page_key) if page_key else None
+    return spec.access if spec else None
+
+# ---------------------------------------------------------------------------
 # 内置角色权限矩阵
 #
 # super_admin 不在 role_permissions 里显式列出，授权服务对其隐式放行全部权限，
@@ -231,6 +310,13 @@ _BASE_MEMBER = _p(
     "creation.access",
     "flow.access",
     "docs.access",
+    "me.access",
+    "brand.access",
+    "read.access",
+    # 侧边栏展示：默认全开，行为与「引入侧边栏权限之前」完全一致。
+    # 要收窄某个角色，由管理员在后台逐项取消——入口码是显式开放语义。
+    "sidebar.show",
+    *SIDEBAR_ENTRY_CODES,
     # 功能使用（写操作）：默认全部放开，理由同上——先保证行为不变。
     # 收窄同样靠后台取消勾选，不需要改代码。
     "chat.write",
@@ -321,6 +407,7 @@ BUILTIN_ROLES: tuple[RoleSpec, ...] = (
             "audit.read",
             "quota.read",
             "quota.manage",
+            "prompt.manage",
         ),
     ),
     RoleSpec(
@@ -348,11 +435,42 @@ BUILTIN_ROLES: tuple[RoleSpec, ...] = (
         description="受限账号：只能进入对话与画布，其余页面与写操作需管理员另行开放。",
         # guest 是一个能挂在已登录账号上的最低档位（等级 20），
         # 用于试用、降级或人工收窄的账号；code 保留 guest 是为了不动数据库主键。
-        permissions=_p("chat.access", "chat.write", "flow.access"),
+        # me.access 给上：个人中心是登录账号改密码/看额度的基本附属页，
+        # 里面的 profile.write / recharge.write 仍受控，不构成权限放大。
+        # 侧边栏只给它自己那几页的入口：受限账号看到的导航也必须受限。
+        permissions=_p(
+            "chat.access",
+            "chat.write",
+            "flow.access",
+            "me.access",
+            "sidebar.show",
+            "sidebar.entry.home",
+            "sidebar.entry.chat",
+            "sidebar.entry.flow",
+            "sidebar.entry.me",
+        ),
     ),
 )
 
 ROLE_BY_CODE: dict[str, RoleSpec] = {spec.code: spec for spec in BUILTIN_ROLES}
+
+# 自定义角色（后台新建的）没有出厂清单，等价于空集：它的每一项权限都是管理员
+# 额外授予的，因此持有者只能享受，不能再往下转授。
+_CUSTOM_ROLE_PERMISSIONS: frozenset[str] = frozenset()
+
+
+def builtin_role_permissions(role_code: str) -> frozenset[str]:
+    """角色的「出厂默认」权限码。
+
+    转授权边界靠这份清单判定：出厂清单里的码代表系统级信任，持有者可以继续
+    授予比自己等级低的角色；清单之外的码（管理员后来手工加到角色上的、或通过
+    user_permissions 直接给的）只能自己用，不能再下放。否则一次授权会沿着等级
+    链无限扩散，最终没人说得清某个权限是谁给的。
+    """
+    spec = ROLE_BY_CODE.get(role_code)
+    if spec is None:
+        return _CUSTOM_ROLE_PERMISSIONS
+    return spec.permissions
 
 # 页面浏览权限的后缀约定：`<resource>.access` 只回答「能不能进这个页面」。
 PAGE_PERMISSION_SUFFIX = ".access"
@@ -422,6 +540,9 @@ PERMISSION_MIN_RANK: dict[str, int] = {
     "audit.read": 80,
     "quota.read": 80,
     "quota.manage": 80,
+    # 内置提示词是平台级配置：能改就等于能改变所有人的系统人设与安全约束，
+    # 与 user/role 同属管理动作，门槛必须是 admin（80），不能下放到页面浏览。
+    "prompt.manage": 80,
     # plan 模式默认只读；写/删/执行仅管理员可开放给自定义角色
     "plan.workspace.write": 80,
     "plan.workspace.delete": 80,
@@ -458,6 +579,13 @@ PERMISSION_MIN_RANK: dict[str, int] = {
     "creation.access": 20,
     "flow.access": 20,
     "docs.access": 20,
+    "me.access": 20,
+    "brand.access": 20,
+    "read.access": 20,
+    # 侧边栏展示与入口显隐：纯展示开关，不涉及数据访问，按访客等级放开；
+    # 否则「把某个角色收窄成只有一两个入口」这件事在后台就做不到。
+    "sidebar.show": 20,
+    **{code: 20 for code in SIDEBAR_ENTRY_CODES},
     # admin.access 也是「页面浏览」权限（进入管理后台页面），与其它页面浏览
     # 一样对所有角色开放配置。它只决定「能不能进这个页面」：就算低等级角色
     # 被勾上，进去后管理接口仍由 user.read / role.manage 等 80 级权限把关，
@@ -471,6 +599,9 @@ PERMISSION_MIN_RANK: dict[str, int] = {
     "history.write": 20,
     "content.write": 20,
     "flow.write": 20,
+    # 官方工作流案例是平台级资源，只有超级管理员（100）能配置，
+    # 避免管理员（80）在后台给自己勾上后就能改所有用户的官方画布。
+    "flow.manage": 100,
     "docs.write": 20,
     "plugin.write": 20,
     "profile.write": 20,

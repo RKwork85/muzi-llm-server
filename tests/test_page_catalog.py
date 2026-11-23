@@ -41,6 +41,25 @@ def test_page_paths_are_site_absolute() -> None:
         assert spec.path.startswith("/"), spec.key
 
 
+def test_every_page_has_browse_permission() -> None:
+    """所有一级页面都必须有浏览权限码。
+
+    「登录即可进入」的页面等于绕过了页面授权：管理员无法把某个角色收窄成
+    「不能看这一页」。所以清单里不允许出现 access=None，新增页面时漏写浏览码
+    会在这里直接失败，而不是等到线上发现某个页面谁都能进。
+    """
+    missing = [spec.key for spec in PAGE_CATALOG if spec.access is None]
+    assert not missing, "以下页面缺少浏览权限码：" + ", ".join(missing)
+
+
+def test_public_pages_still_have_browse_permission() -> None:
+    """对外公开页面也要有浏览码：未登录放行，登录后仍可被角色收窄。"""
+    for spec in PAGE_CATALOG:
+        if spec.public:
+            assert spec.access, f"{spec.key} 标了 public 却没有浏览码"
+            assert spec.access in PERMISSION_BY_CODE, f"{spec.key}: {spec.access}"
+
+
 def test_access_codes_are_derived_not_handwritten() -> None:
     expected = {spec.access for spec in PAGE_CATALOG if spec.access}
     assert PAGE_ACCESS_CODES == expected

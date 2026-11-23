@@ -167,7 +167,9 @@ python -m alembic upgrade head
 python -m alembic current
 ```
 
-应用启动不会自动执行迁移。`downgrade` 会删表，只在确认目标库后手动执行：
+应用启动时会检测数据库 schema 是否落后：默认（`AUTO_MIGRATE=true`）会自动执行
+`alembic upgrade head`，无需手动操作；生产建议设 `AUTO_MIGRATE=false` 改走独立迁移
+流水线，此时启动只打印醒目警告，仍需手动迁移。`downgrade` 会删表，只在确认目标库后手动执行：
 
 ```bash
 python -m alembic downgrade base
@@ -218,7 +220,7 @@ exec python -m uvicorn app.main:app --host 0.0.0.0 --port 8001
 ## 必要说明
 
 - 缺少 Key 时，响应只有「模型服务配置不完整」，不会回显变量值；日志会抹掉 API Key 和 `Authorization: Bearer`。
-- 数据库不会在应用启动时自动建表，必须先执行 `alembic upgrade head`。
+- 数据库不会在应用启动时自动建表：启动会检测迁移版本，默认（`AUTO_MIGRATE=true`）自动执行 `alembic upgrade head`；设为 `false` 时需先手动 `alembic upgrade head`。
 - Agent 任务保存在进程内存中，生产环境默认使用单进程（单 worker）；需要多 worker 横向扩展时需引入共享存储。
 - 数据与工作区目录不能指向项目根：`DATA_STORE_ROOT` 与 `TOOLS_WORKSPACE_ROOT` 的配置受此限制。
 - 不执行模型给出的任意代码，不提供任意路径的写入、删除或移动。

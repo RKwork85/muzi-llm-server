@@ -63,7 +63,8 @@ async def get_me(
     user: Annotated[User, Depends(get_authenticated_user)],
     session: DbSession,
 ) -> MeResponse:
-    snapshot = await AuthorizationService(session).snapshot(user.id)
+    authz = AuthorizationService(session)
+    snapshot = await authz.snapshot(user.id)
     return MeResponse(
         user=UserOut(
             id=user.id,
@@ -77,6 +78,7 @@ async def get_me(
         roles=list(snapshot.roles),
         permissions=sorted(snapshot.permissions),
         data_scope=snapshot.data_scope,
+        delegatable_permissions=sorted(await authz.get_delegatable_permissions(user.id)),
     )
 
 

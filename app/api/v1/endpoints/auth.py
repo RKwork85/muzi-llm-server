@@ -7,12 +7,16 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from app.api.deps import get_authenticated_user
+from app.api.deps import get_authenticated_user, get_settings_dep
+from app.core.config import Settings
 from app.core.database.deps import DbSession
+from app.core.exceptions import FeatureNotReadyError
 from app.models.tables import User
 from app.schemas.auth import (
     AuthResponse,
     ChangePasswordRequest,
+    DemoAccountOut,
+    DemoAccountRequest,
     EmailSendCodeRequest,
     LoginRequest,
     PhoneLoginRequest,
@@ -85,6 +89,35 @@ async def register(body: RegisterRequest, session: DbSession) -> AuthResponse:
 async def login(body: LoginRequest, session: DbSession) -> AuthResponse:
     issued = await AuthService(session).login(body.email, body.password)
     return _response(issued)
+
+
+@router.post(
+    "/demo-account",
+    response_model=DemoAccountOut,
+    responses={
+        501: {"model": ErrorResponse, "description": "演示账号未开放或角色未初始化"},
+    },
+    summary="随机演示账号（仅开发环境）",
+)
+async def create_demo_account(
+    body: DemoAccountRequest,
+    session: DbSession,
+    settings: Settings = Depends(get_settings_dep),
+) -> DemoAccountOut:
+    """登录页图标彩蛋：创建随机演示账号并回传可登录的凭据。
+
+    生产环境直接拒绝：这是一个免验证的建号入口，不能暴露给线上用户。
+    """
+    if settings.runtime_env.strip().lower() == "production":
+        raise FeatureNotReadyError("演示账号仅在开发环境开放")
+    user, password, role_name = await AuthService(session).create_demo_account(body.role)
+    return DemoAccountOut(
+        email=user.email,
+        username=user.username,
+        password=password,
+        role=body.role,
+        role_name=role_name,
+    )
 
 
 @router.post(

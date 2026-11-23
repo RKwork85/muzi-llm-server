@@ -284,3 +284,45 @@ class FlowImageRef(UUIDPrimaryKeyMixin, CreatedAtMixin, Base):
         nullable=False,
     )
     node_id: Mapped[str] = mapped_column(String(64), nullable=False, default="", server_default="")
+
+
+class FlowOfficialWorkflow(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """官方工作流案例（平台级，全局共享，不由 user_id 隔离）。
+
+    超管（flow.manage）可以创建、删除、调序、导入。画布快照存 ``snapshot``：
+    - 超管新建的空白案例：``snapshot`` 是空画布（nodes/edges 为空）；
+    - 导入的案例：``snapshot`` 是导入文件的画布；
+    - 内置案例（text2image / xhs-note-collect 等）不落这张表，画布仍由前端打包
+      的 demo JSON 提供；本表只存超管新增 / 覆盖的案例。
+    """
+
+    __tablename__ = "flow_official_workflows"
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_key", "workflow_key", name="uq_flow_official_workflows_key"
+        ),
+        Index("ix_flow_official_workflows_ws_order", "workspace_key", "sort_order"),
+        {"comment": "官方工作流案例（超管管理）：元信息 + 画布快照 + 排序。"},
+    )
+
+    workspace_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    workflow_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    icon: Mapped[str] = mapped_column(String(16), nullable=False, default="✧", server_default="✧")
+    accent: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="#6366f1", server_default="#6366f1"
+    )
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+    tags: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=text("'[]'::jsonb")
+    )
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="ready", server_default="ready"
+    )
+    demo: Mapped[str] = mapped_column(String(64), nullable=False, default="blank", server_default="blank")
+    sort_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # 画布快照：{viewport, nodes, edges}。空画布即 nodes=[] / edges=[]。
+    snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

@@ -1,36 +1,38 @@
-"""不需要登录的公开配置与公开内容。
+"""不需要登录的公开配置与（登录后）可读的已出版内容。
 
 前端在启动时要先知道「每个页面需要什么权限进入」，然后才能决定是放行还是跳登录页。
-这些接口必须匿名可访问，所以只暴露权限码与已出版内容，不带任何账号私有数据。
+页面清单与匿名准入接口必须匿名可访问，所以只暴露权限码。
 
 边界（改这里之前先看）：
-- 只有 status='published' 的文章会出现在公开接口里，草稿对匿名一律 404，
-  连「存在但你看不到」都不透露。
+- 文章是账号数据，`/public/docs/{id}` 也要登录：它只用于登录用户打开别人分享的
+  已出版稿件，匿名访客一律 401。不存在「未登录可以浏览全平台文章」的入口。
+- 只有 status='published' 的文章可读，草稿一律 404，连「存在但你看不到」都不透露。
 - 作者只暴露 display_name / username，不返回 user_id 与邮箱。
 """
 
 from __future__ import annotations
 
+from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Query
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends
+from sqlalchemy import select
 
+from app.api.deps import get_authenticated_user
 from app.authorization.application.authorization_service import AuthorizationService
+from app.authorization.domain.catalog import SIDEBAR_PERMISSION_CODES
 from app.authorization.domain.pages import PAGE_ACCESS_CODES, PAGE_CATALOG
 from app.core.database.deps import DbSession
 from app.core.exceptions import DocArticleNotFoundError
 from app.models.rbac import Role
 from app.models.tables import DocArticle, User
-from app.schemas.docs import (
-    PublicDocDetailResponse,
-    PublicDocListItem,
-    PublicDocListResponse,
-)
+from app.schemas.docs import PublicDocDetailResponse
 from app.schemas.rbac import AnonymousAccessOut, PageCatalogOut, PageOut
-from app.services.doc_text import author_name, excerpt
+from app.services.doc_text import author_name
 
 router = APIRouter(prefix="/public", tags=["public"])
+
+AuthenticatedUser = Annotated[User, Depends(get_authenticated_user)]
 
 
 @router.get("/pages", response_model=PageCatalogOut, summary="页面清单：进入条件与该页功能")
@@ -48,6 +50,7 @@ async def get_page_catalog() -> PageCatalogOut:
                 path=spec.path,
                 access=spec.access,
                 features=list(spec.features),
+                public=spec.public,
             )
             for spec in PAGE_CATALOG
         ]
@@ -57,16 +60,19 @@ async def get_page_catalog() -> PageCatalogOut:
 @router.get(
     "/anonymous-access",
     response_model=AnonymousAccessOut,
-    summary="匿名访客的页面浏览权限",
+    summary="匿名访客的页面与侧边栏权限",
 )
 async def get_anonymous_access(session: DbSession) -> AnonymousAccessOut:
-    """未登录访问者的页面准入依据：数据库里 ``anonymous`` 角色的浏览权限。
+    """未登录访问者的页面准入与侧边栏显隐依据：数据库里 ``anonymous`` 角色的权限。
 
     前端路由守卫在「未检测到角色信息」（未登录）时读这份快照，据此判定
     该路由是放行还是跳登录——匿名访客不再写死，而是由后台对该角色的勾选决定。
+    侧边栏入口显隐同样来自这份快照：``sidebar.*`` 码不在里面，游客端就会按
+    「权限未加载」把全部入口画出来，后台取消勾选等于没生效。
     角色不存在或停用时返回空权限，前端只放行 ``meta.public`` 路由。
 
-    只暴露页面浏览码（``*.access``），不携带任何账号私有数据。
+    只暴露页面浏览码（``*.access``）与侧边栏显隐码（``sidebar.*``），
+    不带任何账号私有数据，也不透出写操作 / 管理类权限。
     """
     role = await session.scalar(select(Role).where(Role.code == "anonymous"))
     if role is None:
@@ -74,59 +80,8 @@ async def get_anonymous_access(session: DbSession) -> AnonymousAccessOut:
     if role.status != "active":
         return AnonymousAccessOut(role_name=role.name, active=False, permissions=[])
     granted = await AuthorizationService(session).role_permissions("anonymous")
-    page_perms = sorted(PAGE_ACCESS_CODES & granted)
-    return AnonymousAccessOut(role_name=role.name, active=True, permissions=page_perms)
-
-
-@router.get("/docs", response_model=PublicDocListResponse, summary="列出所有已出版的文档")
-async def list_public_docs(
-    session: DbSession,
-    limit: int = Query(default=50, ge=1, le=200),
-    offset: int = Query(default=0, ge=0),
-) -> PublicDocListResponse:
-    """全平台的公开文章（所有作者的已出版内容），按更新时间倒序。"""
-    # 已停用账号的内容不再对外推荐；否则封禁一个作者后，他的文章还挂在公开列表上。
-    visible = (
-        DocArticle.status == "published",
-        User.status == "active",
-    )
-    stmt = (
-        select(
-            DocArticle.id,
-            DocArticle.title,
-            DocArticle.status,
-            DocArticle.created_at,
-            DocArticle.updated_at,
-            func.left(DocArticle.content, 300).label("excerpt_src"),
-            User.display_name,
-            User.username,
-        )
-        .join(User, User.id == DocArticle.user_id)
-        .where(*visible)
-        .order_by(DocArticle.updated_at.desc())
-        .limit(limit)
-        .offset(offset)
-    )
-    total = await session.scalar(
-        select(func.count())
-        .select_from(DocArticle)
-        .join(User, User.id == DocArticle.user_id)
-        .where(*visible)
-    )
-    rows = await session.execute(stmt)
-    items = [
-        PublicDocListItem(
-            id=row.id,
-            title=row.title or "无标题文档",
-            status=row.status,
-            excerpt=excerpt(row.excerpt_src or ""),
-            author=author_name(row.display_name, row.username),
-            created_at=row.created_at,
-            updated_at=row.updated_at,
-        )
-        for row in rows
-    ]
-    return PublicDocListResponse(items=items, total=total or 0)
+    display_perms = sorted((PAGE_ACCESS_CODES | SIDEBAR_PERMISSION_CODES) & granted)
+    return AnonymousAccessOut(role_name=role.name, active=True, permissions=display_perms)
 
 
 @router.get(
@@ -137,7 +92,13 @@ async def list_public_docs(
 async def get_public_doc(
     article_id: UUID,
     session: DbSession,
+    _user: AuthenticatedUser,
 ) -> PublicDocDetailResponse:
+    """登录用户读取一篇已出版的稿件（用于打开别人分享的链接）。
+
+    曾经这里对匿名开放，结果访客的个人博客里能看到全平台的文章；文档是
+    账号数据，未登录一律 401，别再把「published」当成「对所有人公开」。
+    """
     row = (
         await session.execute(
             select(DocArticle, User.display_name, User.username)

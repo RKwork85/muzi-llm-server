@@ -166,3 +166,50 @@ class FlowImageItem(ApiContract):
     url: str
     mime: str
     bytes: int
+
+
+# ---------------------------------------------------------------------------
+# 官方工作流案例（超管管理）
+# ---------------------------------------------------------------------------
+
+
+class FlowOfficialWorkflowSaveRequest(ApiContract):
+    workspace_key: str = Field(min_length=1, max_length=64)
+    workflow_key: str = Field(min_length=1, max_length=64)
+    name: str = Field(default="", max_length=200)
+    icon: str = Field(default="✧", max_length=16)
+    accent: str = Field(default="#6366f1", max_length=32)
+    description: str = Field(default="", max_length=2000)
+    tags: list[str] = Field(default_factory=list, max_length=8)
+    status: str = Field(default="ready", max_length=16)
+    demo: str = Field(default="blank", max_length=64)
+    # 排序位置：未传（None）表示由后端自动排在末尾或保持原位置。
+    sort_order: int | None = Field(default=None, ge=0)
+    # 画布快照：{viewport, nodes, edges}；空白案例传空画布。
+    snapshot: dict[str, Any] = Field(default_factory=dict)
+
+
+class FlowOfficialWorkflowItem(ApiContract):
+    workspace_key: str
+    workflow_key: str
+    name: str
+    icon: str
+    accent: str
+    description: str
+    tags: list[str]
+    status: str
+    demo: str
+    sort_order: int
+    snapshot: dict[str, Any]
+    created_at: datetime
+    updated_at: datetime
+
+
+class FlowOfficialWorkflowListResponse(ApiContract):
+    items: list[FlowOfficialWorkflowItem] = Field(default_factory=list)
+
+
+class FlowOfficialWorkflowReorderRequest(ApiContract):
+    workspace_key: str = Field(min_length=1, max_length=64)
+    # 排序后的 workflow_key 顺序，前端把「静态内置 + 动态」混合后的完整顺序传回来。
+    workflow_keys: list[str] = Field(default_factory=list)

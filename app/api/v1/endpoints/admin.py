@@ -53,6 +53,12 @@ async def _user_admin_out(
 ) -> UserAdminOut:
     if snapshot is None:
         snapshot = await authz.snapshot(user.id)
+    # 直接授权/拒绝要单独回显：它是「覆盖角色」的显式配置，前端若不展示，
+    # 管理员会以为没设过，保存时又把它们覆盖掉。
+    direct = {
+        code: grant_type
+        for code, grant_type in await UserPermissionService(session).list_user_permissions(user.id)
+    }
     return UserAdminOut(
         id=user.id,
         email=user.email,
@@ -64,6 +70,7 @@ async def _user_admin_out(
         roles=list(snapshot.roles),
         permissions=sorted(snapshot.permissions),
         data_scope=snapshot.data_scope,
+        direct_grants=direct,
     )
 
 
@@ -201,14 +208,49 @@ async def set_user_permissions(
     user = await session.get(User, user_id)
     if user is None:
         raise UserNotFoundError()
+    await _guard_hierarchy(session, actor, user)
+    authz = AuthorizationService(session)
+    grantable = frozenset(await authz.get_delegatable_permissions(actor.id))
     service = UserPermissionService(session)
     for grant in body.grants:
-        await service.set_user_permission(user_id, grant.code, grant.grant_type)
+        await service.set_user_permission(
+            user_id, grant.code, grant.grant_type, grantable=grantable
+        )
     await AuditService(session).record(
         actor.id,
         "permission_grant",
         subject_id=user.id,
         context={g.code: g.grant_type for g in body.grants},
+    )
+    await session.flush()
+    return await _user_admin_out(session, user, AuthorizationService(session))
+
+
+@router.delete(
+    "/users/{user_id}/permissions/{code}",
+    response_model=UserAdminOut,
+    summary="清除用户的直接授权/拒绝",
+)
+async def remove_user_permission(
+    user_id: uuid.UUID,
+    code: str,
+    session: DbSession,
+    actor: Annotated[User, Depends(require_permission("permission.manage"))],
+) -> UserAdminOut:
+    """把某一项直接授权/拒绝清掉，回到「继承角色」。
+
+    收回是收窄权限，不涉及转授权边界，只受分级控制约束：不能动等级更高的用户。
+    """
+    user = await session.get(User, user_id)
+    if user is None:
+        raise UserNotFoundError()
+    await _guard_hierarchy(session, actor, user)
+    await UserPermissionService(session).remove_user_permission(user_id, code)
+    await AuditService(session).record(
+        actor.id,
+        "permission_revoke",
+        subject_id=user.id,
+        context={"code": code},
     )
     await session.flush()
     return await _user_admin_out(session, user, AuthorizationService(session))
@@ -393,7 +435,14 @@ async def set_role_permissions(
     actor: Annotated[User, Depends(require_permission("role.manage"))],
 ) -> list[str]:
     codes = set(body.permission_codes)
-    await RoleService(session).set_role_permissions(role_id, codes)
+    authz = AuthorizationService(session)
+    await RoleService(session).set_role_permissions(
+        role_id,
+        codes,
+        # 分级 + 转授权边界：只能改等级不高于自己的角色，且只能分配自己能转授的权限。
+        grantable=frozenset(await authz.get_delegatable_permissions(actor.id)),
+        actor_rank=await authz.get_max_role_rank(actor.id),
+    )
     await AuditService(session).record(
         actor.id,
         "role_permission_change",

@@ -18,8 +18,10 @@ from app.authorization.domain.catalog import (
     LEGACY_TOOL_PERMISSION_CODES,
     MEMBER_ROLE_CODE,
     PERMISSION_CATALOG,
+    SIDEBAR_PERMISSION_CODES,
     SUPER_ADMIN_ROLE_CODE,
     RoleSpec,
+    sidebar_entry_page_access,
 )
 from app.models.rbac import Permission, Role, RolePermission, UserPermission, UserRole
 
@@ -197,7 +199,73 @@ async def seed_role_permissions(session: AsyncSession, newly_created: set[str] |
             if (role_id, perm_id) not in existing_pairs:
                 session.add(RolePermission(role_id=role_id, permission_id=perm_id))
                 existing_pairs.add((role_id, perm_id))
+    # 侧边栏入口权限是纯展示开关，而且只对「升级前就已经存在的角色」有破坏性：
+    # 上面只覆盖内置角色，自定义角色拿不到新码，侧边栏会在升级那一刻整块消失。
+    # 那不是管理员做的决定，而是升级的副作用，所以新出现的侧边栏码单独补发。
+    await grant_sidebar_permissions(session, newly_created)
     await session.flush()
+
+
+async def grant_sidebar_permissions(session: AsyncSession, created: set[str] | None = None) -> int:
+    """把「本次新增」的侧边栏码补发给所有已有角色，返回新增关联条数。
+
+    为什么只有这一组权限需要跨角色补发：其余权限都是功能/数据授权，新功能对
+    自定义角色默认关闭是安全的（管理员按需开放即可）；而侧边栏码是展示开关，
+    缺了它升级当天所有人的导航会凭空少几项——那是升级造成的回退，不是配置选择。
+
+    补发是有选择性的：某个入口对应的页面这个角色本来就进不去，就不补那个入口，
+    免得后台出现「勾着管理后台入口、却没有 admin.access」这种自相矛盾的配置。
+    跳过超管（隐式全权）；匿名访客也不在这里补——游客侧边栏由后台对 anonymous
+    角色自己的勾选决定（见 /public/anonymous-access），自动补发会把管理员
+    刚关掉的入口又加回来。幂等。
+    """
+    codes = {code for code in (created or set()) if code in SIDEBAR_PERMISSION_CODES}
+    if not codes:
+        return 0
+    perm_ids = {
+        code: perm_id
+        for code, perm_id in (
+            await session.execute(
+                select(Permission.code, Permission.id).where(Permission.code.in_(codes))
+            )
+        ).all()
+    }
+    role_rows = (await session.execute(select(Role.code, Role.id))).all()
+    existing_pairs = {
+        (role_id, perm_id)
+        for role_id, perm_id in (
+            await session.execute(
+                select(RolePermission.role_id, RolePermission.permission_id)
+            )
+        ).all()
+    }
+    role_perms: dict[object, set[str]] = {}
+    for role_id, perm_code in (
+        await session.execute(
+            select(RolePermission.role_id, Permission.code).join(
+                Permission, Permission.id == RolePermission.permission_id
+            )
+        )
+    ).all():
+        role_perms.setdefault(role_id, set()).add(perm_code)
+    skip = {SUPER_ADMIN_ROLE_CODE, "anonymous"}
+    added = 0
+    for role_code, role_id in role_rows:
+        if role_code in skip:
+            continue
+        owned = role_perms.get(role_id, set())
+        for code in codes:
+            perm_id = perm_ids.get(code)
+            if perm_id is None or (role_id, perm_id) in existing_pairs:
+                continue
+            # 入口没有意义时（页面进不去）不补：入口显隐不能凌驾于页面准入之上
+            page_access = sidebar_entry_page_access(code)
+            if page_access is not None and page_access not in owned:
+                continue
+            session.add(RolePermission(role_id=role_id, permission_id=perm_id))
+            existing_pairs.add((role_id, perm_id))
+            added += 1
+    return added
 
 
 async def seed_bootstrap_super_admin(session: AsyncSession) -> None:
@@ -255,4 +323,11 @@ async def seed_authorization(session: AsyncSession) -> None:
     await seed_role_permissions(session, created)
     await seed_default_member_role(session)
     await seed_bootstrap_super_admin(session)
+    # 官方工作流案例的内置数据：与权限 seed 一起补齐，保持启动就绪。
+    try:
+        from app.services.flow_official_seed import seed_official_workflows
+
+        await seed_official_workflows(session)
+    except Exception:  # 表尚未迁移等情况不阻断授权 seed
+        logger.exception("official workflows seed failed")
     logger.info("authorization seed completed")

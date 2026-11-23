@@ -14,7 +14,7 @@ from app.api.deps import get_authenticated_user
 from app.authorization.dependencies import require_permission
 from app.core.database.deps import DbSession
 from app.data.oss_client import OssUploadClient
-from app.models.flow import FlowApp, FlowSession
+from app.models.flow import FlowApp, FlowOfficialWorkflow, FlowSession
 from app.models.tables import User
 from app.schemas.flow import (
     FlowAppItem,
@@ -27,6 +27,10 @@ from app.schemas.flow import (
     FlowDocumentListResponse,
     FlowDocumentSaveRequest,
     FlowImageItem,
+    FlowOfficialWorkflowItem,
+    FlowOfficialWorkflowListResponse,
+    FlowOfficialWorkflowReorderRequest,
+    FlowOfficialWorkflowSaveRequest,
     FlowSessionItem,
     FlowSessionListResponse,
     FlowSessionRenameRequest,
@@ -40,6 +44,8 @@ store_router = APIRouter(prefix="/flow", tags=["flow"])
 AuthenticatedUser = Annotated[User, Depends(get_authenticated_user)]
 # 画布的写操作（保存/删除/上传）统一走这一个依赖；读接口不加，避免每次轮询都查权限。
 FlowWriter = Annotated[User, Depends(require_permission("flow.write"))]
+# 官方工作流案例的写操作：只有超级管理员（flow.manage）能创建/删除/调序/导入。
+OfficialFlowWriter = Annotated[User, Depends(require_permission("flow.manage"))]
 
 
 def _oss_client(request: Request) -> OssUploadClient | None:
@@ -368,3 +374,88 @@ async def upload_flow_image(
         mime=row.mime,
         bytes=row.bytes,
     )
+
+
+# ---------------------------------------------------------------------------
+# 官方工作流案例（超管管理）
+# ---------------------------------------------------------------------------
+
+
+def _official_item(row: FlowOfficialWorkflow) -> FlowOfficialWorkflowItem:
+    return FlowOfficialWorkflowItem(
+        workspace_key=row.workspace_key,
+        workflow_key=row.workflow_key,
+        name=row.name,
+        icon=row.icon,
+        accent=row.accent,
+        description=row.description or "",
+        tags=list(row.tags or []),
+        status=row.status,
+        demo=row.demo,
+        sort_order=row.sort_order,
+        snapshot=dict(row.snapshot or {}),
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+    )
+
+
+@store_router.get(
+    "/official", response_model=FlowOfficialWorkflowListResponse, summary="列出官方工作流案例"
+)
+async def list_official_workflows(
+    session: DbSession,
+    user: AuthenticatedUser,
+    workspace_key: str | None = Query(default=None),
+) -> FlowOfficialWorkflowListResponse:
+    rows = await FlowStoreService(session).list_official_workflows(workspace_key)
+    return FlowOfficialWorkflowListResponse(items=[_official_item(row) for row in rows])
+
+
+@store_router.post(
+    "/official", response_model=FlowOfficialWorkflowItem, summary="创建官方工作流案例（空白或导入）"
+)
+async def create_official_workflow(
+    body: FlowOfficialWorkflowSaveRequest,
+    session: DbSession,
+    user: OfficialFlowWriter,
+) -> FlowOfficialWorkflowItem:
+    row = await FlowStoreService(session).upsert_official_workflow(body.model_dump())
+    return _official_item(row)
+
+
+@store_router.put(
+    "/official/{workflow_key}", response_model=FlowOfficialWorkflowItem, summary="更新官方工作流案例"
+)
+async def update_official_workflow(
+    workflow_key: str,
+    body: FlowOfficialWorkflowSaveRequest,
+    session: DbSession,
+    user: OfficialFlowWriter,
+) -> FlowOfficialWorkflowItem:
+    payload = body.model_dump()
+    payload["workflow_key"] = workflow_key
+    row = await FlowStoreService(session).upsert_official_workflow(payload)
+    return _official_item(row)
+
+
+@store_router.delete("/official/{workflow_key}", summary="删除官方工作流案例")
+async def delete_official_workflow(
+    workflow_key: str,
+    session: DbSession,
+    user: OfficialFlowWriter,
+    workspace_key: str = Query(...),
+) -> dict[str, object]:
+    deleted = await FlowStoreService(session).delete_official_workflow(workspace_key, workflow_key)
+    return {"workflow_key": workflow_key, "deleted": deleted}
+
+
+@store_router.post("/official/reorder", summary="调整官方工作流案例顺序")
+async def reorder_official_workflows(
+    body: FlowOfficialWorkflowReorderRequest,
+    session: DbSession,
+    user: OfficialFlowWriter,
+) -> dict[str, object]:
+    updated = await FlowStoreService(session).reorder_official_workflows(
+        body.workspace_key, body.workflow_keys
+    )
+    return {"workspace_key": body.workspace_key, "updated": updated}

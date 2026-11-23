@@ -118,6 +118,8 @@ class UserAdminOut(UserOut):
     roles: list[str] = Field(default_factory=list)
     permissions: list[str] = Field(default_factory=list)
     data_scope: str = "self"
+    # 用户级直接授权/拒绝：{权限码: "allow" | "deny"}。前端据此回显下拉框。
+    direct_grants: dict[str, str] = Field(default_factory=dict)
 
 
 class QuotaOut(BaseModel):
@@ -175,6 +177,9 @@ class MeResponse(BaseModel):
     roles: list[str] = Field(default_factory=list)
     permissions: list[str] = Field(default_factory=list)
     data_scope: str = "self"
+    # 可以继续授予别人的权限码（转授权边界）。后台据此把「只能自用、不可下放」
+    # 的权限项显示为不可勾选，避免用户点了保存才收到 403。
+    delegatable_permissions: list[str] = Field(default_factory=list)
 
 
 class PageOut(BaseModel):
@@ -191,6 +196,8 @@ class PageOut(BaseModel):
     access: str | None = None
     # 该页面下的功能 / 写操作权限码。
     features: list[str] = Field(default_factory=list)
+    # 对外公开页面：未登录访问放行（分享链接、官网等），登录后仍按 access 判定。
+    public: bool = False
 
 
 class PageCatalogOut(BaseModel):
@@ -200,11 +207,12 @@ class PageCatalogOut(BaseModel):
 
 
 class AnonymousAccessOut(BaseModel):
-    """匿名访客（未登录）的页面浏览权限快照。
+    """匿名访客（未登录）的页面与侧边栏权限快照。
 
-    未登录访问者不属于任何账号，前端路由守卫没有「角色信息」可查；
-    这里把数据库里 ``anonymous`` 角色的页面浏览权限下发，作为未登录时的
-    准入依据。角色不存在或停用则 permissions 为空，前端只放行 meta.public 路由。
+    未登录访问者不属于任何账号，前端路由守卫与侧边栏没有「角色信息」可查；
+    这里把数据库里 ``anonymous`` 角色的页面浏览码（``*.access``）与侧边栏
+    显隐码（``sidebar.*``）下发，作为未登录时的准入与显隐依据。
+    角色不存在或停用则 permissions 为空，前端只放行 meta.public 路由。
     """
 
     role_code: str = "anonymous"

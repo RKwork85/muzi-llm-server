@@ -11,7 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 _HEX_COLOR = r"^#[0-9a-fA-F]{6}$"
 _DATA_URL = re.compile(r"^data:image/(png|jpeg|jpg|webp);base64,([A-Za-z0-9+/=\s]+)$")
 
-DEFAULT_COLOR_CHAT = "#e0f7fa"
+# 默认背景主题：浅灰，与前端预设列表首位保持一致。
+DEFAULT_COLOR_CHAT = "#f8f8f8"
 DEFAULT_COLOR_PRIMARY = "#ffffff"
 
 # 背景图片以 data URL 形式存储，限制原始字节大小，避免 JSONB 无限膨胀。

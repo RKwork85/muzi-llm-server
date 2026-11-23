@@ -1,8 +1,8 @@
-"""匿名访客页面浏览权限接口：未登录时路由守卫的准入依据。
+"""匿名访客权限接口：未登录时路由守卫与侧边栏的判定依据。
 
-后端把数据库里 ``anonymous`` 角色的页面浏览权限（``*.access``）下发，
-前端路由守卫在「未检测到角色信息」时据此判定放行或跳登录。这里覆盖三种
-状态：角色不存在、角色停用、角色启用且有权限（只透出页面浏览码）。
+后端把数据库里 ``anonymous`` 角色的页面浏览码（``*.access``）与侧边栏显隐码
+（``sidebar.*``）下发，前端未登录时据此决定放行/跳登录与入口显隐。这里覆盖三种
+状态：角色不存在、角色停用、角色启用且有权限（只透出这两类展示码）。
 """
 
 from __future__ import annotations
@@ -77,11 +77,19 @@ def test_anonymous_access_when_role_disabled(client: TestClient) -> None:
     assert body["permissions"] == []
 
 
-def test_anonymous_access_filters_to_page_permissions(client: TestClient) -> None:
-    # chat.write / user.read 不是页面浏览码，不应透出给匿名访客。
+def test_anonymous_access_filters_to_display_permissions(client: TestClient) -> None:
+    # 只下发页面浏览码与侧边栏显隐码；chat.write / user.read 这类功能码不透出。
     session = _FakeSession(
         role=_role("active"),
-        perm_rows=["chat.access", "flow.access", "chat.write", "user.read"],
+        perm_rows=[
+            "chat.access",
+            "flow.access",
+            "sidebar.show",
+            "sidebar.entry.chat",
+            "sidebar.entry.admin",
+            "chat.write",
+            "user.read",
+        ],
     )
     response = _get(client, session)
 
@@ -89,7 +97,15 @@ def test_anonymous_access_filters_to_page_permissions(client: TestClient) -> Non
     body = response.json()
     assert body["active"] is True
     assert body["role_name"] == "匿名用户"
-    assert body["permissions"] == ["chat.access", "flow.access"]
+    # 侧边栏入口必须随快照下发：后台给 anonymous 取消勾选后，游客端侧边栏
+    # 要能跟着收起，否则「权限分配」对未登录访客失效。
+    assert body["permissions"] == [
+        "chat.access",
+        "flow.access",
+        "sidebar.entry.admin",
+        "sidebar.entry.chat",
+        "sidebar.show",
+    ]
 
 
 def test_anonymous_access_does_not_require_login(client: TestClient) -> None:

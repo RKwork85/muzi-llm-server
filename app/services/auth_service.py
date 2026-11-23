@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -443,6 +444,50 @@ class AuthService:
         except IntegrityError:
             raise AccountExistsError("该手机号已被使用") from None
         return user
+
+    # ------------------------------------------------------------------
+    # 随机演示账号（登录页图标彩蛋，仅开发环境）
+    # ------------------------------------------------------------------
+
+    async def create_demo_account(self, role_code: str = MEMBER_ROLE_CODE) -> tuple[User, str, str]:
+        """创建一个随机演示账号，返回 ``(用户, 明文密码, 角色名)``。
+
+        与注册共用同一套落库逻辑，只是跳过邮箱验证码：账号标记为邮箱已验证、
+        状态正常，并挂上调用方指定的角色（member / developer），因此登录后的
+        权限与同角色的真实账号完全一致。明文密码只在这里回传给调用方一次，
+        库里仍是哈希。
+        """
+        role = await self.session.scalar(select(Role).where(Role.code == role_code))
+        if role is None:
+            raise FeatureNotReadyError("演示账号暂不可用：角色尚未初始化")
+        suffix = secrets.token_hex(5)
+        email = f"demo_{suffix}@muzi.local"
+        username = f"demo_{suffix}"
+        password = secrets.token_urlsafe(9)
+        user = User(
+            email=email,
+            username=username,
+            display_name=f"演示账号 {suffix[:4]}",
+            status="active",
+            email_verified_at=utcnow(),
+        )
+        self.session.add(user)
+        try:
+            await self.session.flush()
+            self.session.add(
+                UserCredential(
+                    user_id=user.id,
+                    provider="email_password",
+                    provider_uid=email,
+                    password_hash=hash_password(password),
+                )
+            )
+            self.session.add(UserRole(user_id=user.id, role_id=role.id))
+            await self.session.flush()
+            await self._grant_default_quota(user.id)
+        except IntegrityError:
+            raise AccountExistsError("演示账号创建失败，请重试") from None
+        return user, password, role.name
 
     async def _issue(self, user: User) -> IssuedLogin:
         raw, token_hash = generate_refresh_token()

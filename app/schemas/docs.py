@@ -54,28 +54,8 @@ class DocCreatedResponse(ApiContract):
     id: UUID
 
 
-class PublicDocListItem(ApiContract):
-    """公开列表条目：只有已出版文章，且不含 user_id 等账号标识。
-
-    status 恒为 published（查询条件已限定），保留它是为了让阅读页/列表组件
-    在「自己的文档」与「公开文档」两种数据源之间共用同一套渲染逻辑。
-    """
-
-    id: UUID
-    title: str
-    status: DocStatus
-    excerpt: str
-    author: str
-    created_at: datetime
-    updated_at: datetime
-
-
-class PublicDocListResponse(ApiContract):
-    items: list[PublicDocListItem] = Field(default_factory=list)
-    total: int | None = Field(default=None)
-
-
 class PublicDocDetailResponse(ApiContract):
+    """已出版稿件详情：登录后读取他人分享时使用，不含 user_id 等账号标识。"""
     id: UUID
     title: str
     content: str

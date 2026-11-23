@@ -1,8 +1,14 @@
 """内置提示词管理：列出服务端全部系统提示词，并支持启用 / 关闭。
 
-读取只要求登录（提示词内容对排障有用）；写入会改变所有人的对话行为，
-因此要求 ``admin.access``。开关状态落盘在 ``data_store/prompt_settings.json``，
-下一次组装提示词立即生效，不需要重启。
+这些是平台级配置：关掉一条人设或安全约束会改变**所有用户**的每一轮请求，
+所以读写都要求 ``prompt.manage``（80 级管理权限）。
+
+不要用 ``admin.access`` 当门禁：它是「进入管理后台页面」的浏览码，等级 20，
+可以勾给访客或任意自定义角色。把它当写权限用，等于「能进后台」就「能关掉
+所有人的系统提示词」，违背页面准入与页面功能两条边界的约定。
+
+开关状态落盘在 ``data_store/prompt_settings.json``，下一次组装提示词立即生效，
+不需要重启。
 """
 
 from __future__ import annotations
@@ -12,17 +18,14 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from app.api.deps import get_authenticated_user
-from app.authorization.application.authorization_service import AuthorizationService
 from app.authorization.dependencies import require_permission
-from app.core.database.deps import DbSession
 from app.core.exceptions import InvalidRequestError
 from app.models.tables import User
 from app.prompts.catalog import build_catalog
 from app.prompts.settings import disabled_prompts, replace_disabled, set_enabled
 
 router = APIRouter(prefix="/prompts", tags=["prompts"])
-AuthenticatedUser = Annotated[User, Depends(get_authenticated_user)]
+PromptManager = Annotated[User, Depends(require_permission("prompt.manage"))]
 
 
 class PromptItemOut(BaseModel):
@@ -97,19 +100,18 @@ def _known_ids() -> set[str]:
 
 
 @router.get("", response_model=PromptCatalogOut, summary="列出后端内置提示词与开关状态")
-async def list_prompts(
-    user: AuthenticatedUser,
-    session: DbSession,
-) -> PromptCatalogOut:
-    can_manage = await AuthorizationService(session).has_permission(user.id, "admin.access")
-    return _catalog(can_manage)
+async def list_prompts(actor: PromptManager) -> PromptCatalogOut:
+    # 读也只对管理者开放：目录里有全部安全约束与工具 schema 原文，
+    # 普通用户没有使用场景，读出去反而方便构造提示词注入。
+    del actor
+    return _catalog(True)
 
 
 @router.patch("/{prompt_id}", response_model=PromptCatalogOut, summary="启用或关闭单条内置提示词")
 async def toggle_prompt(
     prompt_id: str,
     body: PromptToggleIn,
-    actor: Annotated[User, Depends(require_permission("admin.access"))],
+    actor: PromptManager,
 ) -> PromptCatalogOut:
     del actor
     if prompt_id not in _known_ids():
@@ -121,7 +123,7 @@ async def toggle_prompt(
 @router.put("/state", response_model=PromptCatalogOut, summary="批量设置关闭的内置提示词")
 async def replace_prompt_state(
     body: PromptStateIn,
-    actor: Annotated[User, Depends(require_permission("admin.access"))],
+    actor: PromptManager,
 ) -> PromptCatalogOut:
     del actor
     known = _known_ids()

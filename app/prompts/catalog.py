@@ -196,9 +196,11 @@ def _guard_entries() -> list[PromptEntry]:
 def _tool_entries() -> list[PromptEntry]:
     # 同上：tools 包初始化会加载工具注册表，不能在目录模块顶层 import。
     from app.tools.prompts import all_tool_prompts
+    from app.tools.registry import build_agent_registry
 
+    contents = all_tool_prompts()
     items: list[PromptEntry] = []
-    for name, content in all_tool_prompts().items():
+    for name, content in contents.items():
         items.append(
             _entry(
                 prompt_id=f"tool:{name}",
@@ -206,6 +208,25 @@ def _tool_entries() -> list[PromptEntry]:
                 name=name,
                 summary=_clip(content),
                 source=f"app/prompts/tools.toml · {name}",
+                content=content,
+                effect="关闭后整条工具定义（描述 + 参数 schema）都不再发给模型，重新开启后下一轮立即恢复。",
+            )
+        )
+    # 描述写在代码里的工具（技能发现、待办更新等）同样会作为 schema 下发，
+    # 不补进来用户就没法单独关掉它们，面板上的「工具说明」也会与实际不符。
+    for spec in sorted(build_agent_registry().all_tools(), key=lambda item: item.name):
+        if spec.name in contents:
+            continue
+        content = spec.description.strip()
+        if not content:
+            continue
+        items.append(
+            _entry(
+                prompt_id=f"tool:{spec.name}",
+                category="tool",
+                name=spec.name,
+                summary=_clip(content),
+                source=f"app/tools/registry.py · {spec.name}",
                 content=content,
                 effect="关闭后整条工具定义（描述 + 参数 schema）都不再发给模型，重新开启后下一轮立即恢复。",
             )
