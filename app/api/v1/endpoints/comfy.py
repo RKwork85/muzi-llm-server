@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from app.api.deps import get_authenticated_user
+from app.authorization.application.task_quota_service import task_type_of
 from app.core.config import get_settings
 from app.core.database.deps import DbSession
 from app.core.exceptions import (
@@ -68,8 +69,27 @@ class ComfyJobStatusResponse(BaseModel):
     started_at: float | None = None
     finished_at: float | None = None
     elapsed_ms: int | None = None
+    # 任务类型与本次任务占用的「全局排队」信息（不分用户），由网关下发。
+    task_type: str | None = None
+    quota_limit: int | None = None
+    quota_used: int | None = None
     # 本次任务消耗的额度（token），当前固定 2000，由网关下发、前端展示。
     quota: int | None = None
+
+
+class ComfyTaskQuotaResponse(BaseModel):
+    """查询某工作流所属任务类型的全局排队占用与上限。
+
+    ``queue_limit``：该任务类型的全局排队上限（0 = 不限；正数 = 全局最多同时排队数）。
+    ``queue_used``：当前全局已占用的在途/排队任务数。
+    ``remaining``：剩余可提交数（不限时为 ``None``）。
+    全局维度不分用户：ComfyUI 单实例串行执行，不存在真正并发，占的是全局排队名额。
+    """
+
+    task_type: str
+    queue_limit: int = 0
+    queue_used: int = 0
+    remaining: int | None = None
 
 
 class ComfyWorkflowItem(BaseModel):
@@ -158,6 +178,7 @@ async def submit_comfy_job(
     user: Annotated[User, Depends(get_authenticated_user)],
 ) -> SubmitComfyJobResponse:
     _require_enabled()
+    # 网关按「任务类型全局排队上限」校验准入，主服务不再按用户角色解析额度。
     url = f"{_base_url()}/jobs"
     try:
         async with httpx.AsyncClient(timeout=10) as client:
@@ -260,6 +281,47 @@ async def list_comfy_workflows(
         raise UpstreamError(_upstream_detail(resp, "图像生成服务返回异常"))
 
     return ComfyWorkflowListResponse(**resp.json())
+
+
+@router.get("/task-quota", response_model=ComfyTaskQuotaResponse, summary="查询指定工作流所属任务类型的全局排队占用与上限（登录态）")
+async def get_comfy_task_quota(
+    workflow_id: str,
+    user: Annotated[User, Depends(get_authenticated_user)],
+) -> ComfyTaskQuotaResponse:
+    """前端提交前预检用：拿到该工作流对应的任务类型、全局排队上限与当前全局占用数。
+
+    ``queue_limit=0`` 表示不限；``remaining`` 已扣减当前全局占用数（不限时为 ``None``）。
+    最终能否提交仍以网关原子校验为准。
+    """
+    task_type = task_type_of(workflow_id)
+    queue_limit = 0
+    queue_used = 0
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            resp = await client.get(
+                f"{_base_url()}/jobs/quota-usage",
+                params={"user_id": str(user.id), "workflow_id": workflow_id},
+                headers=_internal_headers(),
+            )
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, dict):
+                queue_limit = int(data.get("queue_limit") or 0)
+                queue_used = int(data.get("queue_used") or 0)
+    except httpx.HTTPError:
+        # 网关不可用时额度展示降级：只回上限，不阻塞前端
+        queue_used = 0
+
+    remaining = None
+    if queue_limit > 0:
+        remaining = max(0, queue_limit - queue_used)
+
+    return ComfyTaskQuotaResponse(
+        task_type=task_type,
+        queue_limit=queue_limit,
+        queue_used=queue_used,
+        remaining=remaining,
+    )
 
 
 @router.get("/jobs/{job_id}/files/{filename}", summary="读取生成产物文件（登录态）")

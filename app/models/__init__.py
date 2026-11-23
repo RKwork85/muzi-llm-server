@@ -62,6 +62,11 @@ from app.models.metering import (  # noqa: F401
     SummaryUpdate,
     ToolUsageRecord,
 )
+from app.models.task_quota import (  # noqa: F401
+    TaskQuotaConfig,
+    TaskQuotaRoleLimit,
+    UserTaskQuotaOverride,
+)
 
 register_redaction_listeners()
 
@@ -116,4 +121,7 @@ __all__ = [
     "UserPermission",
     "UserRole",
     "QuotaAdjustment",
+    "TaskQuotaConfig",
+    "TaskQuotaRoleLimit",
+    "UserTaskQuotaOverride",
 ]
